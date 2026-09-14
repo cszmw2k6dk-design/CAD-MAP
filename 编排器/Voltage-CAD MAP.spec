@@ -10,7 +10,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=binaries,
-    datas=[('C:/Users/szk/Desktop/MAP-CAD/编排器/app_icon.png', '.'), ('C:/Users/szk/Desktop/MAP-CAD/编排器/logo_blue.png', '.'), ('C:/Users/szk/Desktop/MAP-CAD/编排器/PdfLayout_auto.lsp', '.'), ('C:/Users/szk/Desktop/MAP-CAD/编排器/../PdfLayout插件包/PdfLayout.lsp', '.'), ('C:/pybuild/python/Lib/site-packages/PySide6/plugins/platforms', 'PySide6/plugins/platforms'), ('C:/pybuild/python/Lib/site-packages/PySide6/plugins/styles', 'PySide6/plugins/styles')],
+    datas=[('C:/Users/szk/Desktop/MAP-CAD/编排器/app_icon.png', '.'), ('C:/Users/szk/Desktop/MAP-CAD/编排器/logo_blue.png', '.'), ('C:/Users/szk/Desktop/MAP-CAD/编排器/PdfLayout_auto.lsp', '.'), ('C:/Users/szk/Desktop/MAP-CAD/编排器/PdfLayout_ai.lsp', '.'), ('C:/Users/szk/Desktop/MAP-CAD/编排器/../PdfLayout插件包/PdfLayout.lsp', '.'), ('C:/pybuild/python/Lib/site-packages/PySide6/plugins/platforms', 'PySide6/plugins/platforms'), ('C:/pybuild/python/Lib/site-packages/PySide6/plugins/styles', 'PySide6/plugins/styles')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

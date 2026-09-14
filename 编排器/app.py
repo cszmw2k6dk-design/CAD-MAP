@@ -2,15 +2,22 @@
 # Voltage-CAD MAP · PDF 半自动流程编排器（PySide6/Qt 界面）
 # 业务逻辑（扫描/计划/配置/ZWCAD 自动化）与旧 ctypes 版保持一致。
 import os, sys, json, re, tempfile, threading, time, subprocess, shutil
+import urllib.request, urllib.error
 from PySide6.QtCore import Qt, Signal, QObject, QTimer
 from PySide6.QtGui import QColor, QPainter, QIcon, QPixmap
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QLabel, QLineEdit, QPushButton, QProgressBar, QStackedWidget,
                                QScrollArea, QFileDialog, QButtonGroup, QPlainTextEdit,
-                               QFrame, QGridLayout, QCheckBox, QRadioButton, QComboBox)
+                               QFrame, QGridLayout, QCheckBox, QRadioButton, QComboBox,
+                               QMessageBox, QDialog)
 from pypdf import PdfReader
 
 APP_TITLE = "Voltage-CAD MAP"
+APP_VERSION = "2.17.0"
+UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
+UPDATE_ASSET = "Voltage-CAD MAP.exe"
+UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+UPDATE_PAGE = "https://github.com/%s/releases" % UPDATE_REPO
 FIELDS = [
     ("dwg", "目标 DWG 文件"), ("lspPath", "ZWCAD 插件路径(.lsp)"),
     ("pdf", "PDF 文件路径"), ("xlsx", "LBD 名称 Excel"), ("jsonPath", "识别结果 JSON文件"),
@@ -679,6 +686,175 @@ def auto_worker(cfg, ini, prog, bus):
         bus.err.emit("执行出错：" + str(e))
 
 
+def ver_tuple(s):
+    """把 v1.2.3 / 1.2 之类转成可比较的元组。"""
+    nums = re.findall(r"\d+", str(s or ""))
+    return tuple(int(x) for x in nums[:3]) if nums else (0,)
+
+
+def asset_key(name):
+    """附件名归一化：GitHub 会把空格换成点（Voltage-CAD.MAP.exe），所以忽略所有非字母数字。"""
+    return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+
+
+def http_get(url, timeout=15):
+    """带 UA 的 GET（GitHub API 要求 User-Agent）。"""
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "%s/%s" % (APP_TITLE, APP_VERSION),
+        "Accept": "application/vnd.github+json",
+    })
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def fmt_time(iso):
+    """GitHub 的 ISO 时间 -> 本地 2026-09-14 20:05。"""
+    import datetime
+    s = str(iso or "").strip()
+    if not s:
+        return ""
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return s
+
+
+def fetch_release():
+    """查 GitHub 最新 release。返回 (info, 错误)；info=None 表示查不到。
+    info = {version, notes, url, published, page}；version 为空表示仓库还没发过版本。"""
+    try:
+        with http_get(UPDATE_API) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            # 还没发布过任何版本：视作“已是最新”，不报错
+            return {"version": "", "notes": "", "url": "", "published": "", "page": UPDATE_PAGE}, ""
+        return None, "检查更新失败：HTTP %s" % e.code
+    except Exception as e:
+        return None, "检查更新失败（网络或仓库不可达）：%s" % e
+    tag = (data.get("tag_name") or "").strip()
+    notes = (data.get("body") or "").strip()
+    url = ""
+    want = asset_key(UPDATE_ASSET)
+    for a in (data.get("assets") or []):
+        if asset_key(a.get("name")) == want:
+            url = a.get("browser_download_url") or ""
+            break
+    if not url:
+        for a in (data.get("assets") or []):
+            if (a.get("name") or "").lower().endswith(".exe"):
+                url = a.get("browser_download_url") or ""
+                break
+    return ({
+        "version": tag,
+        "notes": notes,
+        "url": url,
+        "published": fmt_time(data.get("published_at")),
+        "page": (data.get("html_url") or UPDATE_PAGE),
+    }, "")
+
+
+def download_file(url, dest, progress=None):
+    """下载到 dest，progress(百分比) 回调可选。"""
+    with http_get(url, timeout=120) as r:
+        try:
+            total = int(r.headers.get("Content-Length") or 0)
+        except Exception:
+            total = 0
+        got = 0
+        with open(dest, "wb") as f:
+            while True:
+                chunk = r.read(262144)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                if progress and total:
+                    progress(int(got * 100 / total))
+    return dest
+
+
+def update_check_worker(bus):
+    info, err = fetch_release()
+    if err or not info:
+        bus.upd_error.emit(err)
+        return
+    tag = info.get("version") or ""
+    if tag and ver_tuple(tag) > ver_tuple(APP_VERSION):
+        bus.upd_found.emit(tag, info.get("notes") or "", info.get("url") or "",
+                           info.get("published") or "")
+    else:
+        bus.upd_none.emit(tag or ("v" + APP_VERSION), info.get("notes") or "",
+                          info.get("published") or "")
+
+
+def update_notes_worker(bus):
+    """只看更新日志（不关心要不要更新）。"""
+    info, err = fetch_release()
+    if err or not info:
+        bus.upd_error.emit(err)
+        return
+    tag = info.get("version") or ""
+    bus.upd_notes.emit(tag, info.get("notes") or "", info.get("published") or "",
+                       bool(tag) and ver_tuple(tag) > ver_tuple(APP_VERSION))
+
+
+def update_download_worker(url, bus):
+    try:
+        d = os.path.join(tempfile.gettempdir(), "VCADMAP_update")
+        os.makedirs(d, exist_ok=True)
+        dest = os.path.join(d, UPDATE_ASSET)
+        if os.path.exists(dest):
+            os.remove(dest)
+        download_file(url, dest, progress=lambda p: bus.upd_progress.emit(p))
+        bus.upd_ready.emit(dest)
+    except Exception as e:
+        bus.upd_error.emit("下载更新失败：%s" % e)
+
+
+def apply_update(new_exe):
+    """写一个替换脚本：等本程序退出 -> 覆盖原 exe -> 重启。返回 (是否已启动, 提示)。"""
+    if not getattr(sys, "frozen", False):
+        return False, ("当前是源码方式运行，不能自动替换程序。\n"
+                       "可以手动下载新版本：\n%s\n%s" % (new_exe, UPDATE_PAGE))
+    target = os.path.abspath(sys.executable)
+    bat = os.path.join(tempfile.gettempdir(), "vcadmap_apply_update.bat")
+    lines = [
+        "@echo off",
+        "setlocal",
+        'set "TARGET=%~1"',
+        'set "NEW=%~2"',
+        "ping -n 3 127.0.0.1 >nul",
+        "set /a N=0",
+        ":retry",
+        "set /a N+=1",
+        'copy /y "%NEW%" "%TARGET%" >nul 2>&1',
+        "if not errorlevel 1 goto ok",
+        "if %N% GEQ 60 goto fail",
+        "timeout /t 1 /nobreak >nul",
+        "goto retry",
+        ":ok",
+        'start "" "%TARGET%"',
+        "goto end",
+        ":fail",
+        'echo [update] failed, new exe kept at: "%NEW%"',
+        "pause",
+        ":end",
+        'del "%~f0"',
+    ]
+    try:
+        with open(bat, "w", encoding="ascii", errors="ignore", newline="\r\n") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception as e:
+        return False, "写更新脚本失败：%s" % e
+    try:
+        subprocess.Popen(["cmd", "/c", bat, target, new_exe],
+                         creationflags=0x00000008 | 0x00000200, close_fds=True)
+    except Exception as e:
+        return False, "启动更新脚本失败：%s" % e
+    return True, ""
+
+
 def save_worker(path, bus):
     """把当前 CAD 图纸另存到用户选的路径（连回 ZWCAD/AutoCAD 执行 SAVEAS）。"""
     pythoncom = None
@@ -725,6 +901,12 @@ QFrame#Header { background-color: #131415; border-bottom: 1px solid #2a2c2e; }
 QFrame#Footer { background-color: #17181a; border-top: 1px solid #2a2c2e; }
 QLabel#Logo { color: #0432FA; font-size: 30px; font-weight: 800; background: transparent; }
 QLabel#AppTitle { color: #DADFE3; font-size: 17px; font-weight: 600; background: transparent; }
+QLabel#VerLabel { color: #727577; background: transparent; }
+QLabel#UpdLabel { color: #F5A800; background: transparent; }
+QPushButton#UpdBtn { background-color: rgba(255,255,255,0.06); color: #DADFE3;
+  border: 1px solid rgba(255,255,255,0.10); border-radius: 6px; padding: 4px 12px; }
+QPushButton#UpdBtn:hover { background-color: rgba(255,255,255,0.12); }
+QPushButton#UpdBtn:disabled { color: #5c6064; border: 1px solid rgba(255,255,255,0.06); }
 QFrame#Sidebar { background-color: #131415; border-right: 1px solid #2a2c2e; }
 QPushButton#Nav { background-color: transparent; color: #B9BEC3; border: none; border-radius: 8px;
   text-align: left; padding-left: 8px; }
@@ -750,6 +932,11 @@ QPlainTextEdit#Log { background-color: #101113; color: #a8adb2; border: 1px soli
   border-radius: 8px; font-family: Consolas, 'Microsoft YaHei'; }
 QFrame#FinishBox { background-color: #17181a; border: 1px solid #2a2c2e; border-radius: 10px; }
 QLabel#FinishTitle { color: #DADFE3; font-size: 15px; font-weight: 600; background: transparent; }
+QDialog { background-color: #131415; }
+QLabel#UpdTitle { color: #DADFE3; font-size: 16px; font-weight: 600; background: transparent; }
+QLabel#UpdSub { color: #727577; background: transparent; }
+QPlainTextEdit#Notes { background-color: #101113; color: #c9ced3; border: 1px solid #2a2c2e;
+  border-radius: 8px; font-family: Consolas, 'Microsoft YaHei'; }
 QScrollArea { border: none; background: transparent; }
 QCheckBox, QRadioButton { background: transparent; color: #DADFE3; }
 QPushButton:disabled { background-color: rgba(255,255,255,0.03); color: #5c6064;
@@ -763,6 +950,12 @@ class Bus(QObject):
     done = Signal(str)
     status = Signal(str)
     save_result = Signal(bool, str)
+    upd_found = Signal(str, str, str, str)
+    upd_none = Signal(str, str, str)
+    upd_notes = Signal(str, str, str, bool)
+    upd_error = Signal(str)
+    upd_progress = Signal(int)
+    upd_ready = Signal(str)
 
 
 class DrawGrid(QWidget):
@@ -815,6 +1008,59 @@ class DrawGrid(QWidget):
         p.end()
 
 
+class UpdateDialog(QDialog):
+    """更新日志 / 发现新版本的对话框。mode: "update" | "log"。"""
+
+    def __init__(self, version, notes, published, mode, parent=None):
+        super().__init__(parent)
+        self.chosen = "close"
+        self.setWindowTitle("发现新版本" if mode == "update" else "更新日志")
+        self.setMinimumSize(640, 470)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 18, 20, 16)
+        v.setSpacing(10)
+
+        if mode == "update":
+            head = "发现新版本 %s（当前 v%s）" % (version or "-", APP_VERSION)
+        else:
+            head = "更新日志 %s（当前 v%s）" % (version or "-", APP_VERSION)
+        ttl = QLabel(head)
+        ttl.setObjectName("UpdTitle")
+        v.addWidget(ttl)
+
+        sub = "%s 发布" % published if published else ""
+        lab = QLabel(sub)
+        lab.setObjectName("UpdSub")
+        v.addWidget(lab)
+
+        self.notes = QPlainTextEdit()
+        self.notes.setObjectName("Notes")
+        self.notes.setReadOnly(True)
+        self.notes.setPlainText(notes or "（这个版本没有写更新说明）")
+        v.addWidget(self.notes, 1)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        if mode == "update":
+            later = QPushButton("稍后")
+            later.clicked.connect(self.reject)
+            row.addWidget(later)
+            go = QPushButton("下载并安装")
+            go.setObjectName("Primary")
+            go.clicked.connect(self._on_go)
+            row.addWidget(go)
+        else:
+            close = QPushButton("关闭")
+            close.setObjectName("Primary")
+            close.clicked.connect(self.reject)
+            row.addWidget(close)
+        v.addLayout(row)
+
+    def _on_go(self):
+        self.chosen = "download"
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -824,6 +1070,12 @@ class MainWindow(QMainWindow):
         self.bus.done.connect(self.on_done)
         self.bus.status.connect(self.on_status)
         self.bus.save_result.connect(self.on_save_result)
+        self.bus.upd_found.connect(self.on_upd_found)
+        self.bus.upd_none.connect(self.on_upd_none)
+        self.bus.upd_notes.connect(self.on_upd_notes)
+        self.bus.upd_error.connect(self.on_upd_error)
+        self.bus.upd_progress.connect(self.on_upd_progress)
+        self.bus.upd_ready.connect(self.on_upd_ready)
         self.edits = {}
         self.checkbox = {}
         self.combo = {}
@@ -833,6 +1085,10 @@ class MainWindow(QMainWindow):
         self._finish_ready = False
         self._ai_step = False
         self._phase = ""
+        self._upd_url = ""
+        self._upd_tag = ""
+        self._upd_install = False
+        self._upd_silent = False
         self.total = 0
         self.done_n = 0
         self.run_status = ""
@@ -846,8 +1102,10 @@ class MainWindow(QMainWindow):
             _w = self.edits.get(_k)
             if _w:
                 _w.editingFinished.connect(self._recalc_count_from_range)
-        self.setWindowTitle(APP_TITLE)
+        self.setWindowTitle("%s v%s" % (APP_TITLE, APP_VERSION))
         self.resize(1120, 720)
+        # 启动后静默查一次更新（只有发现新版才会提示）
+        QTimer.singleShot(2500, lambda: self.on_check_update(silent=True))
 
     def _build_ui(self):
         central = QWidget()
@@ -869,6 +1127,24 @@ class MainWindow(QMainWindow):
         hl.addSpacing(10)
         hl.addWidget(ttl)
         hl.addStretch(1)
+        # 顶部栏右侧：当前版本 + 在线更新
+        self.upd_label = QLabel("")
+        self.upd_label.setObjectName("UpdLabel")
+        hl.addWidget(self.upd_label)
+        ver = QLabel("v%s" % APP_VERSION)
+        ver.setObjectName("VerLabel")
+        hl.addWidget(ver)
+        hl.addSpacing(8)
+        self.upd_btn = QPushButton("检查更新")
+        self.upd_btn.setObjectName("UpdBtn")
+        self.upd_btn.setFixedHeight(28)
+        self.upd_btn.clicked.connect(self.on_upd_click)
+        hl.addWidget(self.upd_btn)
+        self.notes_btn = QPushButton("更新日志")
+        self.notes_btn.setObjectName("UpdBtn")
+        self.notes_btn.setFixedHeight(28)
+        self.notes_btn.clicked.connect(self.on_show_notes)
+        hl.addWidget(self.notes_btn)
         root.addWidget(header)
         # 主体：侧边栏 + 内容
         body = QHBoxLayout()
@@ -1387,6 +1663,111 @@ class MainWindow(QMainWindow):
             self.finish_title.setText("保存失败")
             self.finish_hint.setText(msg)
             self.log_msg("保存失败：" + msg)
+
+    # ---------------- 在线更新 ----------------
+    def on_upd_click(self):
+        if self._upd_install:
+            self.start_update_download()
+        else:
+            self.on_check_update()
+
+    def on_check_update(self, silent=False):
+        self._upd_silent = bool(silent)
+        if not silent:
+            self.upd_label.setText("正在检查更新…")
+        self.upd_btn.setEnabled(False)
+        self._upd_install = False
+        threading.Thread(target=update_check_worker, args=(self.bus,), daemon=True).start()
+
+    def on_show_notes(self):
+        self.upd_label.setText("正在读取更新日志…")
+        self.notes_btn.setEnabled(False)
+        threading.Thread(target=update_notes_worker, args=(self.bus,), daemon=True).start()
+
+    def on_upd_found(self, tag, notes, url, published):
+        self.upd_btn.setEnabled(True)
+        self._upd_url = url
+        self._upd_tag = tag
+        self._upd_install = True
+        self.upd_btn.setText("下载并安装 %s" % tag)
+        self.upd_label.setText("发现新版 %s" % tag)
+        self.log_msg("== 发现新版本 %s（当前 v%s%s）==" % (
+            tag, APP_VERSION, ("，%s 发布" % published) if published else ""))
+        if notes:
+            self.log_msg(notes[:2000])
+        if not url:
+            self.log_msg("该版本没有可下载的 exe 附件，请打开：%s" % UPDATE_PAGE)
+        dlg = UpdateDialog(tag, notes, published, "update", self)
+        dlg.exec()
+        if dlg.chosen != "download":
+            return
+        if not url:
+            QMessageBox.information(self, "没有附件",
+                                    "这个版本没有 exe 附件，请到发布页下载：\n%s" % UPDATE_PAGE)
+            return
+        self.start_update_download()
+
+    def on_upd_none(self, tag, notes, published):
+        self.upd_btn.setEnabled(True)
+        self.upd_btn.setText("检查更新")
+        self._upd_install = False
+        self.upd_label.setText("已是最新 v%s" % APP_VERSION)
+        self.log_msg("检查更新：已是最新（远端 %s%s）" % (
+            tag, ("，%s 发布" % published) if published else ""))
+        if notes and not self._upd_silent:
+            self.log_msg(notes[:2000])
+        QTimer.singleShot(4000, lambda: self.upd_label.setText(""))
+
+    def on_upd_notes(self, version, notes, published, newer):
+        self.notes_btn.setEnabled(True)
+        self.upd_label.setText("")
+        if not version:
+            QMessageBox.information(self, "更新日志", "仓库里还没有发布过任何版本。")
+            return
+        self.log_msg("更新日志 %s%s%s" % (
+            version, ("（%s 发布）" % published) if published else "",
+            "（有新版本）" if newer else "（与当前版本相同或更旧）"))
+        dlg = UpdateDialog(version, notes, published, "log", self)
+        dlg.exec()
+
+    def on_upd_error(self, msg):
+        self.upd_btn.setEnabled(True)
+        if not self._upd_install:
+            self.upd_btn.setText("检查更新")
+        self.upd_label.setText("检查更新失败")
+        self.log_msg(msg)
+        QTimer.singleShot(6000, lambda: self.upd_label.setText(""))
+
+    def start_update_download(self):
+        if not self._upd_url:
+            self.log_msg("没有可下载的更新地址，请到发布页手工下载：%s" % UPDATE_PAGE)
+            return
+        self.upd_btn.setEnabled(False)
+        self.upd_btn.setText("正在下载…")
+        self.upd_label.setText("正在下载 0%")
+        self.log_msg("开始下载更新 %s…" % self._upd_tag)
+        threading.Thread(target=update_download_worker,
+                         args=(self._upd_url, self.bus), daemon=True).start()
+
+    def on_upd_progress(self, pct):
+        self.upd_label.setText("正在下载 %d%%" % pct)
+        if pct and pct % 10 == 0:
+            self.log_msg("下载更新 %d%%" % pct)
+
+    def on_upd_ready(self, path):
+        self.upd_label.setText("下载完成")
+        self.upd_btn.setEnabled(True)
+        ok, msg = apply_update(path)
+        if not ok:
+            self.upd_btn.setText("检查更新")
+            self.log_msg(msg)
+            QMessageBox.warning(self, "无法自动更新", msg)
+            return
+        self.log_msg("更新包已就绪：%s" % path)
+        QMessageBox.information(self, "更新就绪",
+                                "新版本已下载完成。\n点确定后程序会关闭，几秒内自动替换并重新打开。")
+        self.log_msg("正在退出以便替换程序…")
+        QApplication.quit()
 
     def _poll_prog(self):
         p = getattr(self, "_prog_path", None)
