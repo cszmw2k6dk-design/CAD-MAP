@@ -6,6 +6,7 @@
 # ---- 根目录放行 ----
 !/.gitignore
 !/README*
+!/同步.bat
 !/yolov8n.pt
 !/qttest.spec
 !/qtprobe.spec
