@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
 from pypdf import PdfReader
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.17.2"
+APP_VERSION = "2.17.3"
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
@@ -1708,6 +1708,11 @@ class MainWindow(QMainWindow):
             self.log_msg(notes[:2000])
         if not url:
             self.log_msg("该版本没有可下载的 exe 附件，请打开：%s" % UPDATE_PAGE)
+        if self._upd_silent:
+            # 启动时的自动检查：只在顶部栏提示，不弹窗（避免和手动「检查更新」弹两次）
+            self.log_msg("（启动自动检查发现新版，点顶部栏「下载并安装 %s」即可；" 
+                         "想看说明点「更新日志」）" % tag)
+            return
         dlg = UpdateDialog(tag, notes, published, "update", self)
         dlg.exec()
         if dlg.chosen != "download":
