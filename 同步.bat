@@ -4,6 +4,27 @@ chcp 936 >nul
 cd /d "%~dp0"
 title MAP-CAD 同步到 GitHub
 
+rem ---- 找 git：PATH -> 常见安装位置 -> Codex 自带的 git ----
+set "GIT=git"
+where git >nul 2>&1
+if errorlevel 1 (
+  set "GIT="
+  if exist "%ProgramFiles%\Git\cmd\git.exe" set "GIT=%ProgramFiles%\Git\cmd\git.exe"
+  if not defined GIT if exist "%ProgramFiles(x86)%\Git\cmd\git.exe" set "GIT=%ProgramFiles(x86)%\Git\cmd\git.exe"
+  if not defined GIT if exist "%ProgramFiles%\Git\bin\git.exe" set "GIT=%ProgramFiles%\Git\bin\git.exe"
+  if not defined GIT if exist "%LOCALAPPDATA%\Programs\Git\cmd\git.exe" set "GIT=%LOCALAPPDATA%\Programs\Git\cmd\git.exe"
+  if not defined GIT for /d %%d in ("%LOCALAPPDATA%\GitHubDesktop\app-*") do if exist "%%d\resources\app\git\cmd\git.exe" set "GIT=%%d\resources\app\git\cmd\git.exe"
+  if not defined GIT for /d %%d in ("%USERPROFILE%\.cache\codex-runtimes\*") do if exist "%%d\dependencies\native\git\cmd\git.exe" set "GIT=%%d\dependencies\native\git\cmd\git.exe"
+)
+if not defined GIT (
+  echo [错误] 找不到 git.exe。请确认装了 Git for Windows，
+  echo        或把 git 的 cmd 目录加进系统 PATH，然后重开窗口再双击本脚本。
+  echo.
+  pause
+  exit /b 1
+)
+if /i not "%GIT%"=="git" echo 用 git: %GIT%
+
 set "VER="
 for /f "tokens=3" %%v in ('findstr /b /c:"APP_VERSION = " "编排器\app.py"') do set "VER=%%v"
 if defined VER set VER=%VER:"=%
@@ -18,7 +39,7 @@ echo   时间: %STAMP%
 echo ============================================
 echo.
 
-git rev-parse --is-inside-work-tree >nul 2>&1
+"%GIT%" rev-parse --is-inside-work-tree >nul 2>&1
 if errorlevel 1 (
   echo [错误] 这里不是 git 仓库。请把本脚本放在 MAP-CAD 目录里再双击。
   echo.
@@ -45,22 +66,22 @@ if defined PROXY (
 
 echo.
 echo [1/3] 检查改动...
-git add -A
-git diff --cached --quiet
+"%GIT%" add -A
+"%GIT%" diff --cached --quiet
 if errorlevel 1 goto commit
 echo       没有需要提交的改动。
 goto push
 
 :commit
 echo [2/3] 提交...
-git commit -q -m "同步 %STAMP% (v%VER%)"
+"%GIT%" commit -q -m "同步 %STAMP% (v%VER%)"
 if errorlevel 1 (
   echo.
   echo [错误] 提交失败，请看上面的提示。
   pause
   exit /b 1
 )
-git log --oneline -1
+"%GIT%" log --oneline -1
 echo.
 goto push
 
@@ -69,7 +90,7 @@ set /a TRY=0
 :pushtry
 set /a TRY+=1
 echo [3/3] 推送到 GitHub ... 第 !TRY! 次
-git -c http.version=HTTP/1.1 push
+"%GIT%" -c http.version=HTTP/1.1 push
 if not errorlevel 1 goto ok
 if !TRY! GEQ 3 goto pushfail
 echo       这次连不上，等 8 秒重试 ...

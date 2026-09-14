@@ -32,8 +32,41 @@ DRY = "--dry" in sys.argv
 ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
 WANT_VER = ARGS[0].lstrip("v") if ARGS else ""
 
-GIT = ["git", "-c", "safe.directory=" + ROOT.replace("\\", "/")]
 PROXY_PORTS = (7890, 7897, 10809, 10808, 1080, 2080, 33210, 8889)
+
+
+def find_git():
+    """git 不一定在 PATH 里（安装时选了 Git Bash only 就会这样），逐个常见位置找。"""
+    cands = ["git"]
+    home = os.path.expanduser("~")
+    local = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+    pfs = [os.environ.get("ProgramFiles") or r"C:\Program Files",
+           os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"]
+    for base in pfs:
+        cands += [os.path.join(base, "Git", "cmd", "git.exe"),
+                  os.path.join(base, "Git", "bin", "git.exe")]
+    cands.append(os.path.join(local, "Programs", "Git", "cmd", "git.exe"))
+    import glob
+    cands += sorted(glob.glob(os.path.join(local, "GitHubDesktop", "app-*",
+                                           "resources", "app", "git", "cmd", "git.exe")),
+                    reverse=True)
+    # Codex 自带的 git（没装 Git for Windows 时用它兜底）
+    cands += sorted(glob.glob(os.path.join(home, ".cache", "codex-runtimes", "*",
+                                           "dependencies", "native", "git", "cmd", "git.exe")),
+                    reverse=True)
+    for c in cands:
+        try:
+            p = subprocess.run([c, "--version"], capture_output=True, timeout=30)
+            if p.returncode == 0:
+                return c
+        except Exception:
+            continue
+    raise SystemExit("找不到 git.exe。\n"
+                     "请确认装了 Git for Windows；或把 git 的 cmd 目录加到系统 PATH 后重开窗口。\n"
+                     "常见位置：C:\\Program Files\\Git\\cmd\\git.exe")
+
+
+GIT = [find_git(), "-c", "safe.directory=" + ROOT.replace("\\", "/")]
 
 
 def log(msg):
