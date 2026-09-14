@@ -1,0 +1,61 @@
+# ============================================================
+#  只上传“实际用到的功能文件”：默认全部忽略，再逐项放行
+# ============================================================
+/*
+
+# ---- 根目录放行 ----
+!/.gitignore
+!/README*
+!/yolov8n.pt
+!/qttest.spec
+!/qtprobe.spec
+!/qt_app_*.png
+!/ui_mockup_preview.png
+!/编排器/
+!/PdfLayout插件包/
+!/frame_detect/
+
+# ---- 编排器：打包产物 / 缓存 / 旧存档 ----
+/编排器/build/
+/编排器/dist/
+/编排器/__pycache__/
+/编排器/_web版_存档/
+
+# ---- 插件包：Python 运行时 / 旧打包 / 旧 git 目录备份 ----
+/PdfLayout插件包/.git_backup_*/
+/PdfLayout插件包/python/
+/PdfLayout插件包/PdfLayout.bundle/Contents/python/
+/PdfLayout插件包/发布版/python/
+/PdfLayout插件包/发布版.zip
+
+# ---- frame_detect：数据集 / 训练输出 / 中间产物，只留脚本 + 在用的权重 ----
+/frame_detect/tiles/
+/frame_detect/batch007/
+/frame_detect/dataset/
+/frame_detect/flatford/
+/frame_detect/flatford_test/
+/frame_detect/norton_test/
+/frame_detect/steel_river/
+/frame_detect/steel_river_label/
+/frame_detect/steelriver_full/
+/frame_detect/for_label/
+/frame_detect/output_run/
+/frame_detect/yolo_config/
+/frame_detect/runs/*
+!/frame_detect/runs/frames/
+/frame_detect/runs/frames/*
+!/frame_detect/runs/frames/weights/
+/frame_detect/runs/frames/weights/*
+!/frame_detect/runs/frames/weights/best.pt
+/frame_detect/**/*.png
+/frame_detect/**/*.jpg
+/frame_detect/**/*.jpeg
+/frame_detect/**/*.log
+/frame_detect/**/*.txt
+/frame_detect/**/*.zip
+
+# ---- 通用 ----
+__pycache__/
+*.pyc
+*.tmp
+~$*
