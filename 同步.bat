@@ -4,6 +4,9 @@ chcp 936 >nul
 cd /d "%~dp0"
 title MAP-CAD 同步到 GitHub
 
+set "REPO=%~dp0"
+set "REPO=%REPO:~0,-1%"
+
 rem ---- 找 git：PATH -> 常见安装位置 -> Codex 自带的 git ----
 set "GIT=git"
 where git >nul 2>&1
@@ -24,6 +27,7 @@ if not defined GIT (
   exit /b 1
 )
 if /i not "%GIT%"=="git" echo 用 git: %GIT%
+set "GITOPT=-c safe.directory=%REPO%"
 
 set "VER="
 for /f "tokens=3" %%v in ('findstr /b /c:"APP_VERSION = " "编排器\app.py"') do set "VER=%%v"
@@ -36,13 +40,16 @@ echo ============================================
 echo   同步到 GitHub
 echo   版本: v%VER%
 echo   时间: %STAMP%
+echo   目录: %REPO%
 echo ============================================
 echo.
 
-"%GIT%" rev-parse --is-inside-work-tree >nul 2>&1
+"%GIT%" %GITOPT% rev-parse --is-inside-work-tree >"%TEMP%\vcadmap_gitcheck.txt" 2>&1
 if errorlevel 1 (
-  echo [错误] 这里不是 git 仓库。请把本脚本放在 MAP-CAD 目录里再双击。
+  echo [错误] 这里不是可用的 git 仓库。git 的原话是：
+  type "%TEMP%\vcadmap_gitcheck.txt"
   echo.
+  echo 提示：请确认本脚本和 .git 都在 %REPO% 下。
   pause
   exit /b 1
 )
@@ -66,22 +73,22 @@ if defined PROXY (
 
 echo.
 echo [1/3] 检查改动...
-"%GIT%" add -A
-"%GIT%" diff --cached --quiet
+"%GIT%" %GITOPT% add -A
+"%GIT%" %GITOPT% diff --cached --quiet
 if errorlevel 1 goto commit
 echo       没有需要提交的改动。
 goto push
 
 :commit
 echo [2/3] 提交...
-"%GIT%" commit -q -m "同步 %STAMP% (v%VER%)"
+"%GIT%" %GITOPT% commit -q -m "同步 %STAMP% (v%VER%)"
 if errorlevel 1 (
   echo.
   echo [错误] 提交失败，请看上面的提示。
   pause
   exit /b 1
 )
-"%GIT%" log --oneline -1
+"%GIT%" %GITOPT% log --oneline -1
 echo.
 goto push
 
@@ -90,7 +97,7 @@ set /a TRY=0
 :pushtry
 set /a TRY+=1
 echo [3/3] 推送到 GitHub ... 第 !TRY! 次
-"%GIT%" -c http.version=HTTP/1.1 push
+"%GIT%" %GITOPT% -c http.version=HTTP/1.1 push
 if not errorlevel 1 goto ok
 if !TRY! GEQ 3 goto pushfail
 echo       这次连不上，等 8 秒重试 ...

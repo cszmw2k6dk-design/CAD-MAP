@@ -66,7 +66,15 @@ def find_git():
                      "常见位置：C:\\Program Files\\Git\\cmd\\git.exe")
 
 
-GIT = [find_git(), "-c", "safe.directory=" + ROOT.replace("\\", "/")]
+GIT = []  # main() 里先打印一行再去找 git，避免窗口看着像卡住
+
+
+def init_git():
+    global GIT
+    if not GIT:
+        log("      找 git ...")
+        GIT = [find_git(), "-c", "safe.directory=" + ROOT.replace("\\", "/")]
+    return GIT
 
 
 def log(msg):
@@ -144,9 +152,9 @@ def collect_notes():
         if body:
             log("  更新说明来自 更新日志.md")
             return body
-    last = run(GIT + ["describe", "--tags", "--abbrev=0"], check=False).out.strip()
+    last = run(init_git() + ["describe", "--tags", "--abbrev=0"], check=False).out.strip()
     rng = "%s..HEAD" % last if last else "HEAD"
-    out = run(GIT + ["log", "--pretty=format:%s", rng], check=False).out.splitlines()
+    out = run(init_git() + ["log", "--pretty=format:%s", rng], check=False).out.splitlines()
     items = []
     for line in out:
         s = line.strip()
@@ -166,7 +174,7 @@ def collect_notes():
 
 def get_token():
     env = git_env()
-    p = subprocess.run(GIT + ["credential", "fill"],
+    p = subprocess.run(init_git() + ["credential", "fill"],
                        input="protocol=https\nhost=github.com\n\n",
                        capture_output=True, text=True, timeout=120, env=env)
     for line in (p.stdout or "").splitlines():
@@ -187,10 +195,13 @@ def api(url, token, data=None, method="GET", ctype="application/json"):
 
 
 def main():
+    log("MAP-CAD 一键发版：版本号 +1 -> 打包 -> 提交推送 -> 建 Release -> 传附件")
+    log("")
     text, cur = read_version()
     new = WANT_VER or bump(cur)
     tag = "v" + new
     log("当前版本 v%s  ->  新版本 %s" % (cur, tag))
+    init_git()
 
     log("[1/5] 生成更新说明...")
     notes = collect_notes()
@@ -208,20 +219,26 @@ def main():
     with open(APP_PY, "wb") as f:
         f.write(text2.encode("utf-8"))
 
-    log("[3/5] 打包（build_exe.bat，约 1 分钟）...")
-    p = run(["cmd", "/c", BUILD_BAT], cwd=os.path.dirname(BUILD_BAT), check=False)
+    log("[3/5] 打包（build_exe.bat，约 1 分钟，下面是 PyInstaller 的实时输出）...")
+    # 打包过程不截获输出：直接显示在窗口里，免得看着像卡住
+    p = subprocess.run(["cmd", "/c", BUILD_BAT], cwd=os.path.dirname(BUILD_BAT))
+    log("")
     if p.returncode != 0 or not os.path.exists(EXE):
-        raise SystemExit("打包失败：\n%s\n%s" % (p.out[-2000:], p.err[-2000:]))
+        # 打包失败就把版本号改回去，免得下次发版号白涨
+        with open(APP_PY, "wb") as f:
+            f.write(text.encode("utf-8"))
+        raise SystemExit("打包失败（退出码 %s），版本号已改回 v%s。请把上面的日志发给开发者。"
+                         % (p.returncode, cur))
     log("  产出：%s（%.1f MB）" % (EXE, os.path.getsize(EXE) / 1048576.0))
 
     log("[4/5] 提交并推送源码...")
     env = git_env()
-    run(GIT + ["add", "-A"], env=env)
-    run(GIT + ["commit", "-q", "-m", "发版 %s" % tag], env=env)
+    run(init_git() + ["add", "-A"], env=env)
+    run(init_git() + ["commit", "-q", "-m", "发版 %s" % tag], env=env)
     last_err = ""
     for i in range(1, 4):
         log("  推送第 %d 次..." % i)
-        pr = run(GIT + ["-c", "http.version=HTTP/1.1", "push"], env=env, check=False)
+        pr = run(init_git() + ["-c", "http.version=HTTP/1.1", "push"], env=env, check=False)
         if pr.returncode == 0:
             break
         last_err = (pr.out + pr.err).strip()
