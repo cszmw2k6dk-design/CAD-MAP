@@ -7,6 +7,9 @@
 !/.gitignore
 !/README*
 !/同步.bat
+!/发版.bat
+!/发版.py
+!/更新日志.md
 !/yolov8n.pt
 !/qttest.spec
 !/qtprobe.spec
