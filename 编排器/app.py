@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
 from pypdf import PdfReader
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.17.1"
+APP_VERSION = "2.17.2"
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
@@ -824,21 +824,25 @@ def apply_update(new_exe):
         "setlocal",
         'set "TARGET=%~1"',
         'set "NEW=%~2"',
-        "ping -n 3 127.0.0.1 >nul",
+        'echo [update] %DATE% %TIME% start > "%~dp0vcadmap_update_log.txt"',
+        # 用 ping 等待（timeout 会弹出控制台窗口，一次重试跳一个，很难看）
+        "ping -n 4 127.0.0.1 >nul",
         "set /a N=0",
         ":retry",
         "set /a N+=1",
         'copy /y "%NEW%" "%TARGET%" >nul 2>&1',
         "if not errorlevel 1 goto ok",
-        "if %N% GEQ 60 goto fail",
-        "timeout /t 1 /nobreak >nul",
+        "if %N% GEQ 40 goto fail",
+        "ping -n 2 127.0.0.1 >nul",
         "goto retry",
         ":ok",
-        'start "" "%TARGET%"',
+        'echo [update] ok after %N% tries >> "%~dp0vcadmap_update_log.txt"',
+        # 交给资源管理器启动：父进程是 explorer，避免从隐藏控制台直接拉起的那些安全校验问题
+        "ping -n 3 127.0.0.1 >nul",
+        'explorer.exe "%TARGET%"',
         "goto end",
         ":fail",
-        'echo [update] failed, new exe kept at: "%NEW%"',
-        "pause",
+        'echo [update] FAILED after %N% tries, new exe kept at: "%NEW%" >> "%~dp0vcadmap_update_log.txt"',
         ":end",
         'del "%~f0"',
     ]
@@ -849,7 +853,8 @@ def apply_update(new_exe):
         return False, "写更新脚本失败：%s" % e
     try:
         subprocess.Popen(["cmd", "/c", bat, target, new_exe],
-                         creationflags=0x00000008 | 0x00000200, close_fds=True)
+                         # CREATE_NO_WINDOW：整个过程不弹黑窗（原来 detached 时 timeout 会跳窗）
+                         creationflags=0x08000000 | 0x00000200, close_fds=True)
     except Exception as e:
         return False, "启动更新脚本失败：%s" % e
     return True, ""
@@ -1130,19 +1135,25 @@ class MainWindow(QMainWindow):
         # 顶部栏右侧：当前版本 + 在线更新
         self.upd_label = QLabel("")
         self.upd_label.setObjectName("UpdLabel")
+        self.upd_label.setFixedWidth(190)          # 固定宽度：进度数字变化时不再顶动旁边的控件
+        self.upd_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         hl.addWidget(self.upd_label)
         ver = QLabel("v%s" % APP_VERSION)
         ver.setObjectName("VerLabel")
+        ver.setFixedWidth(58)
+        ver.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         hl.addWidget(ver)
         hl.addSpacing(8)
         self.upd_btn = QPushButton("检查更新")
         self.upd_btn.setObjectName("UpdBtn")
         self.upd_btn.setFixedHeight(28)
+        self.upd_btn.setFixedWidth(160)            # 「检查更新 / 下载并安装 v2.17.1 / 正在下载…」宽度一致
         self.upd_btn.clicked.connect(self.on_upd_click)
         hl.addWidget(self.upd_btn)
         self.notes_btn = QPushButton("更新日志")
         self.notes_btn.setObjectName("UpdBtn")
         self.notes_btn.setFixedHeight(28)
+        self.notes_btn.setFixedWidth(88)
         self.notes_btn.clicked.connect(self.on_show_notes)
         hl.addWidget(self.notes_btn)
         root.addWidget(header)
@@ -1750,7 +1761,7 @@ class MainWindow(QMainWindow):
                          args=(self._upd_url, self.bus), daemon=True).start()
 
     def on_upd_progress(self, pct):
-        self.upd_label.setText("正在下载 %d%%" % pct)
+        self.upd_label.setText("正在下载 %3d%%" % pct)   # 补空格，位数固定，不会左右跳
         if pct and pct % 10 == 0:
             self.log_msg("下载更新 %d%%" % pct)
 
@@ -1765,7 +1776,8 @@ class MainWindow(QMainWindow):
             return
         self.log_msg("更新包已就绪：%s" % path)
         QMessageBox.information(self, "更新就绪",
-                                "新版本已下载完成。\n点确定后程序会关闭，几秒内自动替换并重新打开。")
+                                "新版本已下载完成。\n点确定后程序会关闭，几秒内自动替换并重新打开"
+                                "（替换过程在后台进行，不会弹黑窗口）。")
         self.log_msg("正在退出以便替换程序…")
         QApplication.quit()
 
