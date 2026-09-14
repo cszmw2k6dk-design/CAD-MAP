@@ -1,6 +1,5 @@
 @echo off
 setlocal
-chcp 936 >nul
 cd /d "%~dp0"
 title MAP-CAD 一键发版
 
@@ -15,11 +14,11 @@ if not exist "%PY%" (
 
 echo ============================================
 echo   MAP-CAD 一键发版
-echo   版本号自动 +1 -> 打包 -> 提交推送 -> 建 Release -^> 传附件
-echo   想先预演不发布：发版.bat --dry
+echo   版本号自动 +1 然后打包、提交推送、建 Release、传附件
+echo   只想预演不发布：先开个命令行窗口执行  发版.bat --dry
 echo ============================================
 echo.
 
-"%PY%" "发版.py" %*
+"%PY%" "release.py" %*
 echo.
 pause

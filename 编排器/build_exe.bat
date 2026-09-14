@@ -1,23 +1,22 @@
 @echo off
-chcp 65001 >nul
-rem MAP æ–‡ä»¶å·¥å…·ç®± Â· PDF åŠè‡ªåŠ¨æµç¨‹ç¼–æ’å™¨ æ‰“åŒ…è„šæœ¬
-rem éœ€å·²è£…å¥½å®Œæ•´ Python(å¸¦ tkinter + pip)ã€‚æ³¨æ„ï¼šè·¯å¾„ç”¨çº¯è‹±æ–‡ ASCIIï¼Œ
-rem å¦åˆ™ PyInstaller çš„ tkinter é’©å­ä¼šæ”¶ä¸è¿›å»(æŠ¥ No module named 'tkinter')ã€‚
+rem MAP ÎÄ¼ş¹¤¾ßÏä ¡¤ PDF °ë×Ô¶¯Á÷³Ì±àÅÅÆ÷ ´ò°ü½Å±¾
+rem ĞèÒÑ×°ºÃÍêÕû Python(´ø tkinter + pip)¡£×¢Òâ£ºÂ·¾¶ÓÃ´¿Ó¢ÎÄ ASCII£¬
+rem ·ñÔò PyInstaller µÄ tkinter ¹³×Ó»áÊÕ²»½øÈ¥(±¨ No module named 'tkinter')¡£
 set "PY=C:\pybuild\python\python.exe"
 if not exist "%PY%" (
-  echo [é”™è¯¯] æœªæ‰¾åˆ°å·¥å…·é“¾ Pythonï¼š%PY%
-  echo è¯·å…ˆå®‰è£…å« tkinter/pip çš„å®Œæ•´ Python åˆ° C:\pybuild\pythonã€‚
+  echo [´íÎó] Î´ÕÒµ½¹¤¾ßÁ´ Python£º%PY%
+  echo ÇëÏÈ°²×°º¬ tkinter/pip µÄÍêÕû Python µ½ C:\pybuild\python¡£
   pause
   exit /b 1
 )
 cd /d "%~dp0"
 "%PY%" make_icon.py
-rem ç”Ÿæˆ Voltage-CAD MAP åº”ç”¨ï¼ˆexe åç§°æ²¿ç”¨äº§å“åï¼‰
-rem æ‰“åŒ… PySide6/Qtï¼šå¿…é¡»ç”¨ --collect-binaries æŠŠ Qt DLL å’Œæ’ä»¶æ‰“è¿›å»ï¼Œå¦åˆ™è¿è¡ŒæŠ¥ DLL load failedã€‚
+rem Éú³É Voltage-CAD MAP Ó¦ÓÃ£¨exe Ãû³ÆÑØÓÃ²úÆ·Ãû£©
+rem ´ò°ü PySide6/Qt£º±ØĞëÓÃ --collect-binaries °Ñ Qt DLL ºÍ²å¼ş´ò½øÈ¥£¬·ñÔòÔËĞĞ±¨ DLL load failed¡£
 set "PYSP=Lib\site-packages\PySide6\plugins"
-rem Qt ä¾èµ–ï¼šMSVC è¿è¡Œæ—¶ä¹Ÿé¡»åŸæ ·å¸¦å…¥ï¼Œå¦åˆ™è¿è¡ŒæŠ¥ DLL load failed / æ‰¾ä¸åˆ°æŒ‡å®šçš„ç¨‹åºã€‚
-"%PY%" -m PyInstaller --onefile --windowed --icon app.ico --name "Voltage-CAD MAP" --add-data "%~dp0app_icon.png;." --add-data "%~dp0logo_blue.png;." --add-data "%~dp0PdfLayout_auto.lsp;." --add-data "%~dp0PdfLayout_ai.lsp;." --add-data "%~dp0..\PdfLayoutæ’ä»¶åŒ…\PdfLayout.lsp;." --collect-binaries PySide6 --collect-binaries shiboken6 --add-data "C:\pybuild\python\%PYSP%\platforms;PySide6\plugins\platforms" --add-data "C:\pybuild\python\%PYSP%\styles;PySide6\plugins\styles" --add-binary "C:\pybuild\python\VCRUNTIME140.dll;." --add-binary "C:\pybuild\python\VCRUNTIME140_1.dll;." --add-binary "C:\pybuild\python\msvcp140.dll;." --add-binary "C:\pybuild\python\concrt140.dll;." --exclude-module PIL --clean --noconfirm app.py
+rem Qt ÒÀÀµ£ºMSVC ÔËĞĞÊ±Ò²ĞëÔ­Ñù´øÈë£¬·ñÔòÔËĞĞ±¨ DLL load failed / ÕÒ²»µ½Ö¸¶¨µÄ³ÌĞò¡£
+"%PY%" -m PyInstaller --onefile --windowed --icon app.ico --name "Voltage-CAD MAP" --add-data "%~dp0app_icon.png;." --add-data "%~dp0logo_blue.png;." --add-data "%~dp0PdfLayout_auto.lsp;." --add-data "%~dp0PdfLayout_ai.lsp;." --add-data "%~dp0..\PdfLayout²å¼ş°ü\PdfLayout.lsp;." --collect-binaries PySide6 --collect-binaries shiboken6 --add-data "C:\pybuild\python\%PYSP%\platforms;PySide6\plugins\platforms" --add-data "C:\pybuild\python\%PYSP%\styles;PySide6\plugins\styles" --add-binary "C:\pybuild\python\VCRUNTIME140.dll;." --add-binary "C:\pybuild\python\VCRUNTIME140_1.dll;." --add-binary "C:\pybuild\python\msvcp140.dll;." --add-binary "C:\pybuild\python\concrt140.dll;." --exclude-module PIL --clean --noconfirm app.py
 copy /y "%~dp0PdfLayout_auto.lsp" "%~dp0dist\PdfLayout_auto.lsp" >nul
 echo.
-echo æ‰“åŒ…å®Œæˆï¼š%~dp0dist\Voltage-CAD MAP.exe
+echo ´ò°üÍê³É£º%~dp0dist\Voltage-CAD MAP.exe
 pause

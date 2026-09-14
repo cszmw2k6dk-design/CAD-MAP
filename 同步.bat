@@ -1,6 +1,5 @@
 @echo off
 setlocal enabledelayedexpansion
-chcp 936 >nul
 cd /d "%~dp0"
 title MAP-CAD Í¬²½µ½ GitHub
 
