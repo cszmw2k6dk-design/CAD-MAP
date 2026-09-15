@@ -125,7 +125,15 @@ def main():
             args += ["--add-binary", data(p)]
         else:
             log("  提示：没找到 %s，跳过（系统一般自带）" % dll)
+    # 生成的 .spec 丢到 build\ 里：PyInstaller 默认会按 exe 名在 cwd 生成 spec，
+    # 仓库里正好有同名的 Voltage-CAD MAP.spec，会被它覆盖成本机绝对路径（提交上去就是噪音）。
+    spec_dir = os.path.join(HERE, "build")
+    try:
+        os.makedirs(spec_dir, exist_ok=True)
+    except Exception:
+        spec_dir = HERE
     args += ["--exclude-module", "PIL", "--clean", "--noconfirm",
+             "--specpath", spec_dir,
              os.path.join(HERE, "app.py")]
     p = subprocess.run(args, cwd=HERE, env=build_env())
     log("")
