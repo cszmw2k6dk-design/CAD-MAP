@@ -568,7 +568,13 @@ def build_extract_file(cfg, out_path, prog_path=None):
         return False, "没能生成任何标签行：%s" % why, detail
     tip = ""
     if pgmap:
-        tip = "；识别到 %d 页图纸，已按底图顺序重编号 1~%d" % (len(pgmap), len(pgmap))
+        _pgs = sorted(pgmap)
+        if _pgs[-1] - _pgs[0] + 1 == len(_pgs):
+            _rng = "PDF 第 %d~%d 页" % (_pgs[0], _pgs[-1])
+        else:
+            _rng = "%d 页（PDF 第 %d~%d 页，中间有跳页）" % (len(_pgs), _pgs[0], _pgs[-1])
+        tip = "；识别到 %d 页图纸（%s），已按底图顺序重编号 1~%d —— 请确认 CAD 里正好是这些页、顺序一致" \
+              % (len(pgmap), _rng, len(pgmap))
     return True, ("标签 %d 行：LBD %d 个（Python 从 PDF 文字层识别）"
                   " + 支架号 %d 个（按 LBD 分组行优先编号）%s"
                   % (detail["lbd"] + detail["str"], detail["lbd"], detail["str"], tip)), detail
