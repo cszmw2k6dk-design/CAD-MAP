@@ -470,6 +470,220 @@ def extract_lbd_typical(json_path, out_dir, csv_encoding="utf-8-sig", want_symbo
     }
 
 
+def sniff_json_kind(path):
+    """看这份 JSON 是哪种：'debug'(识别结果) / 'anylabeling'(标注结果) / ''(认不出)。
+
+    逐块扫文件找关键键名，不整份 load —— 识别结果 debug JSON 动辄几百 MB。
+    """
+    debug_key = b'"yolo_tracker_detection_results"'
+    anno_key = b'"shapes"'
+    found = set()
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(4 << 20)
+                if not chunk:
+                    break
+                if debug_key in chunk:
+                    found.add("debug")
+                if anno_key in chunk:
+                    found.add("anylabeling")
+                if found:
+                    break
+    except Exception:
+        return ""
+    if "debug" in found:
+        return "debug"
+    if "anylabeling" in found:
+        return "anylabeling"
+    return ""
+
+
+def _row_major(items, med_h):
+    """行优先排序：先按 y 分带，带内按 x 从左到右（和 frame_detect/map_lbd_str.py 同一套）。"""
+    if not items:
+        return []
+
+    def band(vals, tol):
+        vals = sorted(vals)
+        out, cur = [], [vals[0]]
+        for v in vals[1:]:
+            if v - cur[-1] <= tol:
+                cur.append(v)
+            else:
+                out.append(sum(cur) / len(cur))
+                cur = [v]
+        out.append(sum(cur) / len(cur))
+        return out
+
+    yb = band([it[1] for it in items], max(1.0, med_h * 0.6))
+    ri = lambda y: min(range(len(yb)), key=lambda i: abs(yb[i] - y))     # noqa: E731
+    return sorted(items, key=lambda it: (ri(it[1]), it[0]))
+
+
+def rack_lines_from_debug(json_path, prefix="STR", digits=2):
+    """识别结果 debug JSON -> 支架号行（L 行：页号 fx fy STRxx 角度 字高占页比）。
+
+    按所属 LBD 区域(Node 框) 分组、组内行优先（上→下、左→右）编号，每组从 01 起；
+    竖条 90°、横条 0°，字高按框短边。没落在任何 LBD 区域里的支架不编号 ——
+    和 frame_detect/map_lbd_str.py 的规则一致（那种框视为干扰）。
+
+    返回 (行列表, 支架数, 有支架的页数)。
+    """
+    with open(json_path, encoding="utf-8") as f:
+        doc = json.load(f)
+    page_size = {}
+    for pg in (doc.get("input_data") or {}).get("pages") or []:
+        page_size[pg.get("page_number")] = (pg.get("width") or 0, pg.get("height") or 0)
+    trk = {p.get("page_number"): (p.get("data") or {})
+           for p in doc.get("yolo_tracker_detection_results") or []}
+    digits = max(1, int(digits or 2))
+
+    lines, n_str, n_pages = [], 0, 0
+    for pg in sorted(p for p in trk if isinstance(p, int)):
+        W, H = page_size.get(pg, (0, 0))
+        if not W or not H:
+            continue
+        nodes, typs = [], []
+        for d in (trk.get(pg) or {}).get("detections") or []:
+            b = d.get("bbox") or {}
+            if not all(k in b for k in ("x1", "y1", "x2", "y2")):
+                continue
+            lab = (d.get("label") or "").strip().lower()
+            if lab == "node":
+                nodes.append({"bbox": b})
+            elif lab in ("tracker", "typical"):
+                typs.append({"bbox": b})
+        if not typs or not nodes:
+            continue
+        n_pages += 1
+
+        groups, heights = {}, []
+        for t in typs:
+            b = t["bbox"]
+            heights.append(b["y2"] - b["y1"])
+            p = _assign_parent(b, nodes)
+            if p is None:
+                continue                      # 不在任何 LBD 区域内：不编号
+            cx, cy = _center(b)
+            groups.setdefault(nodes.index(p), []).append((cx, cy, b))
+        heights.sort()
+        med_h = heights[len(heights) // 2] if heights else 1.0
+        for _key, items in groups.items():
+            for k, (cx, cy, b) in enumerate(_row_major(items, med_h), 1):
+                nm = "%s%s" % (prefix, str(k).zfill(digits))
+                bw, bh = b["x2"] - b["x1"], b["y2"] - b["y1"]
+                ang = 90 if bh > bw else 0
+                lines.append("L\t%d\t%.6f\t%.6f\t%s\t%d\t%.6f"
+                             % (pg, cx / float(W), 1.0 - cy / float(H), nm, ang,
+                                min(bw, bh) / float(H)))
+                n_str += 1
+    return lines, n_str, n_pages
+
+
+def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2):
+    """识别结果 debug JSON -> CAD 读的 L 行（和 X-AnyLabeling 那条路输出同一套格式）。
+
+        L <页号> <fx> <fy> <名称> <角度> <字高占页比>      fx/fy 归一化、y 从下往上
+
+    - LBD 区域(Node 框)：名称取 OCR 的最终名（如 INV11A101-LBD-05），角度 0、字高 0；
+      CAD 侧拿这个名字去 Excel 分表里找要填的正式名称。
+    - 支架(Tracker 框)：按所属 LBD 分组、组内行优先编号 STR01、STR02…（和
+      frame_detect/map_lbd_str.py 的规则一致）；竖条 90°、横条 0°，字高按框短边。
+      没落在任何 LBD 区域里的支架视为干扰，不编号（和 map_lbd_str.py 一样）。
+
+    返回 dict：{ok, lines, lbd, str, pages} 或 {ok: False, error}。
+    """
+    try:
+        with open(json_path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except Exception as e:
+        return {"ok": False, "error": "读取识别结果失败：%s" % e}
+
+    page_size = {}
+    for pg in (doc.get("input_data") or {}).get("pages") or []:
+        page_size[pg.get("page_number")] = (pg.get("width") or 0, pg.get("height") or 0)
+    ocr = {p.get("page_number"): (p.get("data") or [])
+           for p in doc.get("ocr_node_name_results") or []}
+    trk = {p.get("page_number"): (p.get("data") or {})
+           for p in doc.get("yolo_tracker_detection_results") or []}
+    if not trk:
+        return {"ok": False, "error": "这份 JSON 里没有 yolo_tracker_detection_results，"
+                                      "不是识别结果 debug JSON"}
+
+    digits = max(1, int(digits or 2))
+    lines, n_lbd, n_str, n_pages = [], 0, 0, 0
+    for pg in sorted(p for p in trk if isinstance(p, int)):
+        W, H = page_size.get(pg, (0, 0))
+        if not W or not H:
+            continue
+        dets = (trk.get(pg) or {}).get("detections") or []
+        nodes, typs = [], []
+        for d in dets:
+            b = d.get("bbox") or {}
+            if not all(k in b for k in ("x1", "y1", "x2", "y2")):
+                continue
+            lab = (d.get("label") or "").strip().lower()
+            if lab == "node":
+                nodes.append({"bbox": b})
+            elif lab in ("tracker", "typical"):
+                typs.append({"bbox": b})
+        if not nodes and not typs:
+            continue
+        n_pages += 1
+
+        # Node 名称：OCR 结果按 node_bbox 对上（坐标一致，做了 0.1 像素取整）
+        name_by_key = {}
+        for r in ocr.get(pg) or []:
+            nb = r.get("node_bbox") or {}
+            if not all(k in nb for k in ("x1", "y1", "x2", "y2")):
+                continue
+            key = (round(nb["x1"], 1), round(nb["y1"], 1),
+                   round(nb["x2"], 1), round(nb["y2"], 1))
+            name_by_key[key] = (r.get("final_node_name")
+                                or r.get("preliminary_node_name") or "").strip()
+        for n in nodes:
+            b = n["bbox"]
+            key = (round(b["x1"], 1), round(b["y1"], 1),
+                   round(b["x2"], 1), round(b["y2"], 1))
+            n["name"] = name_by_key.get(key, "")
+            if not n["name"]:
+                continue
+            cx, cy = _center(b)
+            lines.append("L\t%d\t%.6f\t%.6f\t%s\t0\t0.000000"
+                         % (pg, cx / float(W), 1.0 - cy / float(H), n["name"]))
+            n_lbd += 1
+
+        groups, heights = {}, []
+        for t in typs:
+            b = t["bbox"]
+            heights.append(b["y2"] - b["y1"])
+            p = _assign_parent(b, nodes)
+            if p is None or not p.get("name"):
+                continue
+            cx, cy = _center(b)
+            groups.setdefault(p["name"], []).append((cx, cy, b))
+        heights.sort()
+        med_h = heights[len(heights) // 2] if heights else 1.0
+        for _grp, items in groups.items():
+            for k, (cx, cy, b) in enumerate(_row_major(items, med_h), 1):
+                nm = "%s%s" % (prefix, str(k).zfill(digits))
+                bw, bh = b["x2"] - b["x1"], b["y2"] - b["y1"]
+                ang = 90 if bh > bw else 0
+                lines.append("L\t%d\t%.6f\t%.6f\t%s\t%d\t%.6f"
+                             % (pg, cx / float(W), 1.0 - cy / float(H), nm, ang,
+                                min(bw, bh) / float(H)))
+                n_str += 1
+
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + ("\n" if lines else ""))
+    except Exception as e:
+        return {"ok": False, "error": "写提取文件失败：%s" % e}
+    return {"ok": True, "lines": len(lines), "lbd": n_lbd, "str": n_str,
+            "pages": n_pages, "path": os.path.abspath(out_path)}
+
+
 def page_region_bounds(json_path):
     """JSON -> 每页 LBD 区域(Node 大框) 的合并范围。
 

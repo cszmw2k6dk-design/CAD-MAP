@@ -131,11 +131,38 @@
   (princ)
 )
 
-(defun PdfLayout_AiAutoRun (/ labels doc blk txtH rad m ins i lay pt name it ang hgt autoH usedH oldBg oldGap)
-  (princ "[AI] read-labels...")
-  (setq labels (PdfLayout_AiReadLabels *PdfLayout_GridAutoFile* *PdfLayout_AiPage*))
+;; 读某一页的标签, 底图框由外面传进来(多页模式要按每张底图自己的框换算坐标)
+(defun PdfLayout_AiReadLabelsIn (path page box / f line parts pmin pmax dx dy fx fy pgs out ang hgt)
+  (if (not box)
+    (progn (princ "\n[AI] no underlay.") nil)
+    (progn
+      (setq pmin (car box) pmax (cadr box))
+      (setq dx (- (car pmax) (car pmin)) dy (- (cadr pmax) (cadr pmin)))
+      (setq *PdfLayout_AiBoxW* dx *PdfLayout_AiBoxH* dy)
+      (setq *PdfLayout_AiBoxMin* pmin)
+      (setq pgs (if (numberp page) (itoa (fix page)) "1"))
+      (setq out nil)
+      (setq f (open path "r"))
+      (while (and f (setq line (read-line f)))
+        (setq parts (PdfLayout_AiSplitTab line))
+        (if (and (> (length parts) 4) (= (car parts) "L") (= (nth 1 parts) pgs))
+          (progn
+            (setq fx (atof (nth 2 parts)) fy (atof (nth 3 parts)))
+            (setq ang (if (> (length parts) 5) (atof (nth 5 parts)) *PdfLayout_AiRot*))
+            (setq hgt (if (and (> (length parts) 6) (> (atof (nth 6 parts)) 0.0))
+                        (atof (nth 6 parts)) nil))
+            (if (> (strlen (nth 4 parts)) 0)
+              (setq out (append out (list (list (nth 4 parts)
+                                  (+ (car pmin) (* fx dx))
+                                  (+ (cadr pmin) (* fy dy))
+                                  ang hgt))))))))
+      (if f (close f))
+      out)))
+
+;; 画一批标签(坐标已经是模型空间坐标), 返回实际画了几个
+(defun PdfLayout_AiDrawLabels (labels / doc blk lay txtH rad m i pt name it ang hgt autoH usedH oldBg oldGap)
   (if (not labels)
-    (princ "\n[AI] no labels.")
+    nil
     (progn
       (princ "[AI] draw...")
       (vl-catch-all-apply 'PdfLayout_Prog
@@ -199,23 +226,81 @@
               (vl-catch-all-apply 'PdfLayout_Prog
                 (list (strcat "AI_LABEL " (itoa i)))))
           )))
-      (vl-catch-all-apply 'PdfLayout_Prog (list (strcat "AI_DONE " (itoa i))))
-      (princ (strcat "\n[AI] 底图框 左下="
-                     (rtos (car *PdfLayout_AiBoxMin*) 2 3) ","
-                     (rtos (cadr *PdfLayout_AiBoxMin*) 2 3)
-                     "  W=" (rtos *PdfLayout_AiBoxW* 2 3)
-                     " H=" (rtos *PdfLayout_AiBoxH* 2 3)))
       (if (and autoH usedH)
         (princ (strcat "\n[AI] 支架推算字高=" (rtos autoH 2 6)
                        "  实际字高=" (rtos usedH 2 6))))
       i)))
+
+;; 模型空间里的底图类对象（PDF 引用 / DWG 底图 / 光栅图 / 图片），按创建顺序
+(defun PdfLayout_AiUnderlays (/ doc ms out obj nm)
+  (setq doc (vla-get-ActiveDocument (vlax-get-Acad-Object)))
+  (setq ms (vla-get-ModelSpace doc))
+  (setq out nil)
+  (vlax-for obj ms
+    (setq nm (strcase (vla-get-ObjectName obj)))
+    (if (or (vl-string-search "UNDERLAY" nm)
+            (vl-string-search "PDFREFERENCE" nm)
+            (vl-string-search "RASTER" nm)
+            (vl-string-search "IMAGE" nm))
+      (setq out (append out (list obj)))
+    )
+  )
+  out
+)
+
+(defun PdfLayout_AiAutoRunAll (/ underlays u i box labs total nU)
+  ;; 逐页画 STR 号: 第 i 张底图 = 提取文件里的第 i 页(和布局、底图顺序一致)
+  (setq underlays (PdfLayout_AiUnderlays))
+  (if (not underlays)
+    (progn (princ "\n[AI] no underlay.") nil)
+    (progn
+      (setq nU (length underlays) i 0 total 0)
+      (foreach u underlays
+        (setq box (PdfLayout_GetExtentsSafeObj u))
+        (if box
+          (progn
+            (setq labs (PdfLayout_AiReadLabelsIn *PdfLayout_GridAutoFile* (1+ i) box))
+            (if labs (setq total (+ total (PdfLayout_AiDrawLabels labs))))
+          )
+        )
+        (setq i (1+ i))
+      )
+      (vl-catch-all-apply 'PdfLayout_Prog (list (strcat "AI_DONE " (itoa total))))
+      (princ (strcat "\n[AI] 逐页画 STR 号: 底图 " (itoa nU) " 张, 共画 " (itoa total) " 个。"))
+      total
+    )
+  )
+)
+
+(defun PdfLayout_AiAutoRun (/ labels i)
+  (princ "[AI] read-labels...")
+  (if (and (numberp *PdfLayout_AiPage*) (> *PdfLayout_AiPage* 0))
+    ;; 单页模式(老行为): 只画 *PdfLayout_AiPage* 这一页, 底图用面积最大的那张
+    (progn
+      (setq labels (PdfLayout_AiReadLabels *PdfLayout_GridAutoFile* *PdfLayout_AiPage*))
+      (if (not labels)
+        (progn (princ "\n[AI] no labels.") nil)
+        (progn
+          (setq i (PdfLayout_AiDrawLabels labels))
+          (princ (strcat "\n[AI] 底图框 左下="
+                         (rtos (car *PdfLayout_AiBoxMin*) 2 3) ","
+                         (rtos (cadr *PdfLayout_AiBoxMin*) 2 3)
+                         "  W=" (rtos *PdfLayout_AiBoxW* 2 3)
+                         " H=" (rtos *PdfLayout_AiBoxH* 2 3)))
+          i)))
+    ;; *PdfLayout_AiPage* = 0/nil: 逐页画(编排器默认走这条)
+    (PdfLayout_AiAutoRunAll))
+)
 
 (defun c:pdfgridai (/ r)
   (PdfLayout_LoadSettings)
   (setq r (vl-catch-all-apply 'PdfLayout_AiAutoRun nil))
   (if (vl-catch-all-error-p r)
     (princ (strcat "\n[AI] ERR: " (vl-catch-all-error-message r)))
-    (if r (princ (strcat "\n[AI] 已绘制 " (itoa (fix r)) " 个标签。"))))
+    (if (numberp r)
+      (princ (strcat "\n[AI] 已绘制 " (itoa (fix r)) " 个标签。"))
+      (princ "\n[AI] 这次没有可画的标签（STR 号）。")
+    ))
   (princ)
 )
 

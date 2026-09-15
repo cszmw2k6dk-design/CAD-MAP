@@ -18,16 +18,21 @@ try:
                              region_out_dir as _lr_out_dir,
                              page_region_bounds as _lr_page_bounds,
                              write_region_file as _lr_write_regions,
+                             sniff_json_kind as _lr_json_kind,
+                             extract_lines_from_debug as _lr_extract_debug,
+                             rack_lines_from_debug as _lr_rack_lines,
                              rack_types_from_json as _lr_rack_types,
                              rack_types_text as _lr_rack_text,
                              summary_text as _lr_summary)
 except Exception:                    # 模块缺失时不阻塞主程序
     _lr_extract = _lr_candidates = _lr_out_dir = None
     _lr_page_bounds = _lr_write_regions = None
+    _lr_json_kind = _lr_extract_debug = None
+    _lr_rack_lines = None
     _lr_rack_types = _lr_rack_text = _lr_summary = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.17.7"
+APP_VERSION = "2.17.8"
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
@@ -454,6 +459,101 @@ def write_auto_ini(cfg, ini_path):
             f.write("%s=%s\n" % (k, 1 if v is True else (0 if v is False else v)))
 
 
+def build_extract_file(cfg, out_path, prog_path=None):
+    """生成 CAD 读的标签提取文件（P/L 行）。返回 (ok, 说明, 明细)。
+
+    按手上有什么自动选：
+      1) 标注/编号结果 JSON（X-AnyLabeling，有 shapes）：LBD 名称和支架号都在里面，直接转；
+      2) 识别结果 debug JSON（有 Node/Tracker 框，但没有 LBD 文字的坐标）：
+         LBD 行仍由 Python 从 **PDF 文字层**提取（老流程 pdf_extract.py 那套，exe 里内置），
+         支架号 STRxx 由 debug JSON 按 LBD 分组现编，追加到同一个文件里；
+      3) 没给 JSON / 给的不顶用：退回纯 PDF 文字层提取（只有 LBD 行）。
+    """
+    jp = (cfg.get("jsonPath") or "").strip()
+    pdf = (cfg.get("pdf") or "").strip()
+    try:
+        p0 = int(cfg.get("pageStart") or 1)
+    except Exception:
+        p0 = 1
+    try:
+        p1 = int(cfg.get("importPages") or 0) or int(cfg.get("pageEnd") or 0)
+    except Exception:
+        p1 = 0
+    pre = rack_prefix(cfg)
+    detail = {"kind": "", "lbd": 0, "str": 0, "pdf_lbd": False}
+
+    def _count(prefix):
+        try:
+            with open(out_path, "r", encoding="utf-8") as f:
+                return sum(1 for ln in f if ln.startswith(prefix))
+        except Exception:
+            return 0
+
+    kind = ""
+    if jp and os.path.exists(jp) and _lr_json_kind is not None:
+        try:
+            kind = _lr_json_kind(jp)
+        except Exception:
+            kind = ""
+    detail["kind"] = kind
+
+    # 1) 标注/编号结果：LBD 名称 + 支架号都在 JSON 里
+    if kind == "anylabeling":
+        n, nn, nt = json_to_extract(jp, out_path, pre)
+        detail.update(lbd=nn, str=nt)
+        return True, ("标注结果 JSON：标签 %d 行（LBD %d / 支架 %d，前缀 %s）"
+                      % (n, nn, nt, pre)), detail
+
+    # 2)/3) LBD 行：Python 从 PDF 文字层提（位置就是图纸上 LBD 文字的位置）
+    pdf_err = ""
+    if pdf and os.path.exists(pdf):
+        ok, err = extract_lbd(pdf, out_path, p0, p1, prog=prog_path)
+        if ok:
+            detail["pdf_lbd"] = True
+            detail["lbd"] = _count("L\t")
+        else:
+            pdf_err = err
+
+    # 支架号：debug JSON 现编（按 LBD 分组、组内行优先，每组从 01 起）
+    rack_err = ""
+    if kind == "debug" and _lr_rack_lines is not None:
+        try:
+            rl, nstr, _np = _lr_rack_lines(jp, pre)
+        except Exception as e:
+            rl, nstr, rack_err = [], 0, str(e)
+        if rl:
+            try:
+                tail = ""
+                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    with open(out_path, "r", encoding="utf-8") as f:
+                        tail = f.read()[-1:]
+                with open(out_path, "a", encoding="utf-8") as f:
+                    if tail and tail not in ("\n", "\r"):
+                        f.write("\n")
+                    f.write("\n".join(rl) + "\n")
+                detail["str"] = nstr
+            except Exception as e:
+                rack_err = str(e)
+
+    # 兜底：PDF 文字层没给出 LBD 行（无文字层的扫描件等），用 debug JSON 的区域中心
+    if detail["lbd"] == 0 and kind == "debug" and _lr_extract_debug is not None:
+        r = _lr_extract_debug(jp, out_path, prefix=pre)
+        if r.get("ok"):
+            detail["lbd"], detail["str"] = r["lbd"], r["str"]
+            return True, ("识别结果 JSON：%d 页、LBD %d 个（按区域中心）、支架号 %d 个"
+                          "（PDF 文字层没读到 LBD 文字，位置按区域中心放）"
+                          % (r["pages"], r["lbd"], r["str"])), detail
+        pdf_err = pdf_err or (r.get("error") or "")
+
+    if detail["lbd"] == 0 and detail["str"] == 0:
+        why = pdf_err or rack_err or ("这份 JSON 不是识别结果，也不是标注结果（没有 Node/Tracker 也没有 shapes）"
+                                      if jp else "没有 PDF、也没有识别结果 JSON")
+        return False, "没能生成任何标签行：%s" % why, detail
+    return True, ("标签 %d 行：LBD %d 个（Python 从 PDF 文字层识别）"
+                  " + 支架号 %d 个（按 LBD 分组行优先编号）"
+                  % (detail["lbd"] + detail["str"], detail["lbd"], detail["str"])), detail
+
+
 def prepare_region_file(cfg, extra_dirs=()):
     """按识别结果写「每页 LBD 区域上下限」文件，给 CAD 侧生成布局后对准视口用。
 
@@ -634,10 +734,10 @@ def auto_worker(cfg, ini, prog, bus):
             if _jp and os.path.exists(_jp):
                 try:
                     bus.prog.emit("0/4 读取识别结果 JSON…")
-                    _n, _nn, _nt = json_to_extract(_jp, lbd_out, rack_prefix(cfg))
-                    ok, err = True, ""
-                    bus.prog.emit("0/4 JSON标签 %d 个 (LBD %d / 支架 %d，前缀 %s)"
-                                  % (_n, _nn, _nt, rack_prefix(cfg)))
+                    bus.prog.emit("0/4 正在生成标签（LBD 文字从 PDF 里识别，支架号按 LBD 分组编号）…")
+                    ok, _emsg, _edet = build_extract_file(cfg, lbd_out, progx)
+                    bus.prog.emit("0/4 " + _emsg)
+                    err = "" if ok else _emsg
                 except Exception as e:
                     ok, err = False, "JSON解析失败:" + str(e)
             elif str(cfg.get("useAI", "0")) in ("1", "True", "true"):
@@ -785,7 +885,9 @@ def auto_worker(cfg, ini, prog, bus):
 
         ai = ensure_ai_lsp()
         _lbdout = (cfg.get("lbdOut") or "").strip()
-        _pg = str(cfg.get("pageStart") or "1").strip() or "1"
+        # *PdfLayout_AiPage* = 0 → CAD 侧逐页画 STR 号（第 i 张底图配第 i 页）；
+        # 以前这里传的是起始页，结果只有一页会画上支架号。
+        _pg = "0"
         if ai:
             # STR 号背景填充：UI 设置 -> LISP 全局变量(*PdfLayout_AiStrBgOn/Color/Gap)
             _sbg_on = "nil" if str(cfg.get("strBgOn", "1")).strip() in ("0", "", "关", "否", "off", "false", "False") else "T"
