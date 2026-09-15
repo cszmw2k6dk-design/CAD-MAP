@@ -13,10 +13,43 @@ HERE = os.path.dirname(os.path.abspath(__file__))     # ...\MAP-CAD\编排器
 ROOT = os.path.dirname(HERE)                          # ...\MAP-CAD
 PY = sys.executable
 PYDIR = os.path.dirname(PY)
-PYSP = os.path.join(PYDIR, "Lib", "site-packages", "PySide6", "plugins")
 DIST = os.path.join(HERE, "dist")
 EXE = os.path.join(DIST, "Voltage-CAD MAP.exe")
 SEP = os.pathsep
+
+
+def pyside_plugins():
+    """PySide6 的 plugins 目录：按实际安装位置找，兼容虚拟环境和 C:\\pybuild\\python。"""
+    import importlib.util
+    spec = importlib.util.find_spec("PySide6")
+    if not spec or not spec.submodule_search_locations:
+        raise SystemExit("找不到 PySide6，请先在打包用的 Python 里装好 PySide6")
+    return os.path.join(list(spec.submodule_search_locations)[0], "plugins")
+
+
+def find_dll(name):
+    """VC 运行库 DLL：必须整套同源，不能新老混用。
+
+    PySide6 自带一套配套的 VC 运行库（版本比 Python 目录里的新），Qt6 就是按它编译的，
+    所以优先用 PySide6 里那一套；混用会报「DLL load failed while importing QtCore:
+    找不到指定的程序」。找不到才回退到 Python 目录 / 系统目录。
+    """
+    import importlib.util
+    cands = []
+    pys = importlib.util.find_spec("PySide6")
+    if pys and pys.submodule_search_locations:
+        cands.append(list(pys.submodule_search_locations)[0])
+    cands += [PYDIR, sys.base_prefix, os.path.join(sys.base_prefix, "DLLs")]
+    windir = os.environ.get("WINDIR") or r"C:\Windows"
+    cands += [os.path.join(windir, "System32"), os.path.join(windir, "SysWOW64")]
+    for d in cands:
+        p = os.path.join(d, name)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+PYSP = pyside_plugins()
 
 
 def log(msg):
@@ -29,6 +62,28 @@ def log(msg):
 
 def data(src):
     return src + SEP + "."
+
+
+def build_env():
+    """打包用的环境：临时剔除 PATH 里带第三方 icuuc.dll 的目录。
+
+    Qt（PySide6）在 Windows 上用系统 ICU（System32\\icuuc.dll，符号带 _72 之类版本后缀）。
+    如果 PATH 里另有别的 ICU（例如 poppler / 其它 Qt 运行时的 icuuc.dll 78），
+    PyInstaller 会把它打进包里，运行时 Qt6Core 找不到自己需要的符号，导入就报
+    「DLL load failed while importing QtCore: 找不到指定的程序」。所以这里避开它。
+    """
+    windir = (os.environ.get("WINDIR") or r"C:\Windows").lower()
+    keep, dropped = [], []
+    for d in (os.environ.get("PATH") or "").split(SEP):
+        if not d:
+            continue
+        if os.path.exists(os.path.join(d, "icuuc.dll")) and not d.lower().startswith(windir):
+            dropped.append(d)
+        else:
+            keep.append(d)
+    if dropped:
+        log("  已临时从 PATH 剔除带第三方 ICU 的目录：%s" % "; ".join(dropped))
+    return dict(os.environ, PYTHONIOENCODING="utf-8", PATH=SEP.join(keep))
 
 
 def main():
@@ -63,14 +118,16 @@ def main():
             "--add-data", os.path.join(PYSP, "platforms") + SEP +
             os.path.join("PySide6", "plugins", "platforms"),
             "--add-data", os.path.join(PYSP, "styles") + SEP +
-            os.path.join("PySide6", "plugins", "styles"),
-            "--add-binary", data(os.path.join(PYDIR, "VCRUNTIME140.dll")),
-            "--add-binary", data(os.path.join(PYDIR, "VCRUNTIME140_1.dll")),
-            "--add-binary", data(os.path.join(PYDIR, "msvcp140.dll")),
-            "--add-binary", data(os.path.join(PYDIR, "concrt140.dll")),
-            "--exclude-module", "PIL", "--clean", "--noconfirm",
-            os.path.join(HERE, "app.py")]
-    p = subprocess.run(args, cwd=HERE, env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+            os.path.join("PySide6", "plugins", "styles")]
+    for dll in ("VCRUNTIME140.dll", "VCRUNTIME140_1.dll", "msvcp140.dll", "concrt140.dll"):
+        p = find_dll(dll)
+        if p:
+            args += ["--add-binary", data(p)]
+        else:
+            log("  提示：没找到 %s，跳过（系统一般自带）" % dll)
+    args += ["--exclude-module", "PIL", "--clean", "--noconfirm",
+             os.path.join(HERE, "app.py")]
+    p = subprocess.run(args, cwd=HERE, env=build_env())
     log("")
     if p.returncode != 0 or not os.path.exists(EXE):
         log("[失败] 打包没成功（退出码 %s），旧 exe 已保留为 %s" % (p.returncode, old))

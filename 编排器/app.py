@@ -12,8 +12,19 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QMessageBox, QDialog)
 from pypdf import PdfReader
 
+try:
+    from lbd_regions import (extract_lbd_typical as _lr_extract,
+                             candidate_debug_jsons as _lr_candidates,
+                             region_out_dir as _lr_out_dir,
+                             rack_types_from_json as _lr_rack_types,
+                             rack_types_text as _lr_rack_text,
+                             summary_text as _lr_summary)
+except Exception:                    # 模块缺失时不阻塞主程序
+    _lr_extract = _lr_candidates = _lr_out_dir = None
+    _lr_rack_types = _lr_rack_text = _lr_summary = None
+
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.17.3"
+APP_VERSION = "2.17.6"
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
@@ -21,30 +32,30 @@ UPDATE_PAGE = "https://github.com/%s/releases" % UPDATE_REPO
 FIELDS = [
     ("dwg", "目标 DWG 文件"), ("lspPath", "ZWCAD 插件路径(.lsp)"),
     ("pdf", "PDF 文件路径"), ("xlsx", "LBD 名称 Excel"), ("jsonPath", "识别结果 JSON文件"),
-    ("outputDir", "默认保存目录(可空)"),
+    ("outputDir", "默认保存目录(可空)"), ("regionOut", "区域范围输出目录(可空)"),
     ("newName", "新文件名(可空)"), ("pageStart", "起始页"), ("pageEnd", "结束页(0=全部)"),
     ("importPages", "导入页码(0=全部)"), ("templateLayout", "模板布局名(留空=自动)"),
     ("filter", "标记块名(竖线)"), ("count", "复制数量(0=按识别)"),
     ("textHeight", "标签高度(0=自动)"), ("labelBgColor", "标签背景色"),
     ("labelBgGap", "背景遮挡间隙(倍)"),
+    ("rackPrefix", "支架命名前缀"),
     ("rackTypes", "支架类型"), ("rackSplit", "拆不拆"), ("rackStringLen", "单串长度(FT)"),
     ("strBgOn", "STR背景填充"), ("strBgColor", "STR背景色"), ("strBgGap", "STR遮挡间隙"),
     ("margin", "视口边距(mm)"),
-    ("gridRows", "网格行数"), ("gridCols", "网格列数"), ("gridRowSp", "网格行距"),
-    ("gridColSp", "网格列距"), ("gridPrefix", "网格前缀"), ("gridStartN", "网格起始号"),
-    ("gridDigits", "网格位数"),
 ]
-BROWSE_KEYS = ("dwg", "lspPath", "pdf", "xlsx", "jsonPath", "outputDir")
+BROWSE_KEYS = ("dwg", "lspPath", "pdf", "xlsx", "jsonPath", "outputDir", "regionOut")
+NAME_PREVIEW_COLS = 5          # 「生成计划」里布局名预览每行几个（网格编号已从界面移除，固定按 5 个折行）
 DEFAULTS = {
     "dwg": "", "lspPath": "",
     "pdf": "", "xlsx": "", "jsonPath": "", "outputDir": "", "newName": "MAP文件",
+    "regionOut": "", "regionAuto": True,
     "pageStart": "1", "pageEnd": "0", "templateLayout": "", "count": "0", "filter": "pdf",
     "margin": "5",
     "textHeight": "0.15", "labelBgColor": "1", "labelBgGap": "1.0",
+    "rackPrefix": "STR",
     "rackTypes": "", "rackSplit": "不拆", "rackStringLen": "",
+    "rackAuto": True, "rackSplitByType": "",
     "strBgOn": "1", "strBgColor": "1", "strBgGap": "1.0",
-    "gridRows": "4", "gridCols": "5", "gridRowSp": "10",
-    "gridColSp": "20", "gridPrefix": "CIR", "gridStartN": "1", "gridDigits": "2",
     "lockViewport": False, "overwrite": False, "labelWhere": "M", "filterCluster": True,
     "useAI": False,
     "aiPython": r"C:\Users\szk\Desktop\MAP-CAD\_pyinstaller_tool\python\python.exe",
@@ -59,6 +70,7 @@ SECTIONS = [
                   ("pdf", "PDF 文件路径"), ("xlsx", "LBD 名称 Excel"),
                   ("jsonPath", "识别结果 JSON文件"),
                   ("outputDir", "默认保存目录(可空)"),
+                  ("regionOut", "区域范围输出目录(可空)"),
                   ("newName", "新文件名(可空)")]),
     ("PDF 与标签", [("pageStart", "起始页"), ("pageEnd", "结束页(0=全部)"),
                   ("importPages", "导入页码(0=全部)"), ("templateLayout", "模板布局名(留空=自动)"),
@@ -66,16 +78,13 @@ SECTIONS = [
                   ("textHeight", "标签高度(0=自动)"), ("labelBgColor", "标签背景色"),
                   ("labelBgGap", "背景遮挡间隙(倍)"),
                   ("margin", "视口边距(mm)")]),
-    ("支架", [("rackTypes", "支架类型(串数:长度FT)"),
+    ("支架", [("rackPrefix", "命名前缀(支架号)"),
+            ("rackTypes", "支架类型(串数:长度FT)"),
             ("rackSplit", "拆不拆"),
             ("rackStringLen", "单串长度(FT,可空)"),
             ("strBgOn", "STR背景填充"),
             ("strBgColor", "STR背景色"),
             ("strBgGap", "STR遮挡间隙(倍)")]),
-    ("网格编号", [("gridRows", "网格行数"), ("gridCols", "网格列数"),
-                ("gridRowSp", "网格行距"), ("gridColSp", "网格列距"),
-                ("gridPrefix", "网格前缀"), ("gridStartN", "网格起始号"),
-                ("gridDigits", "网格位数")]),
     ("选项", []),
 ]
 FIELDS_INDEX = {k: i for i, (k, _) in enumerate(FIELDS)}
@@ -341,10 +350,22 @@ def extract_lbd(pdf, out, pageStart, pageEnd, prog=None):
     return True, ""
 
 
-def json_to_extract(json_path, out_path):
+def rack_prefix(cfg):
+    """支架号命名前缀（界面「支架」页）。留空按 STR。
+
+    支架号在 CAD 里长这样：前缀 + 位数编号，例如 STR01、STR02 …
+    （CIR 是网格编号 PDFGRID 用的前缀，不是支架号的，网格编号已在 CAD 插件里单独设。）
+    """
+    p = str(cfg.get("rackPrefix", "STR") or "").strip().upper()
+    return p or "STR"
+
+
+def json_to_extract(json_path, out_path, prefix="STR"):
     """读取识别结果 JSON(X-AnyLabeling 格式) -> 输出 L 行(页号 fx fy 标签) 供 CAD 读取。
-    Node 框= LBD 区域, Typical 框= 支架(STR号)。页号取文件名里的 _pNNN。"""
+    Node 框= LBD 区域, Typical 框= 支架(STR号)。页号取文件名里的 _pNNN。
+    prefix = 支架号命名前缀：识别结果里是 STRxx 时按这个前缀改名（默认 STR，等于不改）。"""
     import re as _re
+    pre = (str(prefix or "STR").strip() or "STR").upper()
     d = json.load(open(json_path, "r", encoding="utf-8"))
     W = d.get("imageWidth") or 1
     H = d.get("imageHeight") or 1
@@ -364,12 +385,15 @@ def json_to_extract(json_path, out_path):
         # 注意: LBD 行必须保留 —— PdfLayout_auto.lsp 靠这些行拿到 LBD 的
         # 位置和编号, 再用 Excel 里的名称去填写。这里只是不再让 AI 画它们(见 PdfLayout_ai.lsp)。
         up = lab.upper()
+        if pre != "STR" and up.startswith("STR"):
+            lab = pre + lab[3:]          # 支架号改名：STR01 -> <前缀>01
+            up = lab.upper()
         fx = ((bx1 + bx2) / 2.0) / W
         fy = 1.0 - (((by1 + by2) / 2.0) / H)
         # STR 号: 角度按支架框长宽比自动(竖条=90,横条=0); 字高按框短边(占页高比例,
         # CAD 端再乘 *PdfLayout_AiStrScale*)。其它标签(LBD)角度 0、字高用默认值。
         bw, bh = bx2 - bx1, by2 - by1
-        if up.startswith("STR"):
+        if up.startswith(pre):
             ang = 90 if bh > bw else 0
             hgt = min(bw, bh) / float(H)
         else:
@@ -378,11 +402,52 @@ def json_to_extract(json_path, out_path):
         lines.append("L\t%d\t%.6f\t%.6f\t%s\t%d\t%.6f" % (page, fx, fy, lab, ang, hgt))
         if "-LBD-" in up:
             nodes += 1
-        elif up.startswith("STR"):
+        elif up.startswith(pre):
             typs += 1
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     return len(lines), nodes, typs
+
+
+def export_region_ranges(cfg, extra_dirs=()):
+    """识别 debug JSON -> LBD 区域范围 + Typical(支架)范围。
+
+    自动找 JSON(界面选的识别结果 / AI 输出目录 / 提取文件所在目录),
+    输出 lbd_regions.csv / typicals.csv / lbd_symbols.csv / pages.csv / lbd_typical.json。
+    返回 dict(ok / msg / rack_types / rack_types_text / out_dir), 不抛异常。
+    """
+    if _lr_extract is None:
+        return {"ok": False, "msg": "区域范围导出失败：缺少 lbd_regions.py（与 app.py 同目录）"}
+    try:
+        cands = _lr_candidates(cfg, extra_paths=extra_dirs)
+    except Exception as e:
+        return {"ok": False, "msg": "区域范围导出失败：查找识别 JSON 出错 %s" % e}
+    if not cands:
+        return {"ok": False, "msg": ("未找到识别 debug JSON，跳过区域范围导出"
+                                     "（可在「识别结果 JSON文件」里指定，"
+                                     "或把 AI 输出目录指到识别结果所在目录）。")}
+    r, last_err = None, ""
+    for jp in cands:                    # 依次试, 挑第一份能导出成功的
+        try:
+            r = _lr_extract(jp, _lr_out_dir(cfg, jp))
+        except Exception as e:
+            r, last_err = {"ok": False, "error": str(e)}, str(e)
+            continue
+        if r.get("ok"):
+            break
+        last_err = "%s（%s）" % (r.get("error"), jp)
+    if not r or not r.get("ok"):
+        return {"ok": False, "msg": "区域范围导出失败：%s" % (last_err or "未知原因")}
+    return {"ok": True, "msg": _lr_summary(r), "out_dir": r.get("out_dir"),
+            "rack_types": r.get("rack_types") or [],
+            "rack_types_text": r.get("rack_types_text") or ""}
+
+
+def write_auto_ini(cfg, ini_path):
+    """把界面配置写成 LSP 读的 ini（on_run 与后台线程补写支架类型都用这个）。"""
+    with open(ini_path, "w", encoding="gbk") as f:
+        for k, v in cfg.items():
+            f.write("%s=%s\n" % (k, 1 if v is True else (0 if v is False else v)))
 
 
 def read_xlsx_sheet_names(path):
@@ -427,14 +492,8 @@ def plan_names(cfg):
 def build_plan(cfg):
     def g(k, d=""):
         return str(cfg.get(k, d))
-    try:
-        rows = max(1, int(g("gridRows", "4")))
-        cols = max(1, int(g("gridCols", "5")))
-    except Exception:
-        rows, cols = 4, 5
-    gp = g("gridPrefix", "CIR")
-    gsn = g("gridStartN", "1")
-    gd = g("gridDigits", "2")
+    rp = rack_prefix(cfg)
+    cols = NAME_PREVIEW_COLS
     names, name_msg = plan_names(cfg)
     total = len(names)
     grid = ["布局名(Excel 分表名, 行优先, 每行 %d 个):" % cols]
@@ -446,15 +505,14 @@ def build_plan(cfg):
         "1. 打开目标 DWG：%s；模板布局（用于复制）：%s" % (g("dwg", "(未选择)"), g("templateLayout", "(未选择)")),
         "2. 导入/附着 PDF：%s（页码范围 %s–%s）" % (g("pdf", "(未选择)"), g("pageStart", "1"), g("pageEnd") or "末尾"),
         "3. LBD 标签识别：%s" % g("xlsx", "(未使用)"),
-        "4. 支架类型：%s；拆不拆：%s；单串长度：%s；STR背景填充：%s 色号%s 间隙%s" % (
-            g("rackTypes", "(未填)"), g("rackSplit", "不拆"), g("rackStringLen", "(未填)"),
+        "4. 支架号命名前缀：%s（形如 %s01）；支架类型：%s；拆不拆：%s；单串长度：%s；"
+        "STR背景填充：%s 色号%s 间隙%s" % (
+            rp, rp, g("rackTypes", "(未填)"), g("rackSplit", "不拆"), g("rackStringLen", "(未填)"),
             ("开" if g("strBgOn", "1").strip() not in ("0", "", "关", "否") else "关"),
             g("strBgColor", "1"), g("strBgGap", "1.0")),
-        "5. PDFGRID 网格编号：%s 行 × %s 列，行距 %s、列距 %s；前缀 %s、起始 %s、%s 位（共 %d 格）"
-        % (g("gridRows", "4"), g("gridCols", "5"), g("gridRowSp", "10"), g("gridColSp", "20"), gp, gsn, gd, rows * cols),
-        "6. PDFLAYOUT 批量布局：按 LBD Excel 分表名命名，布局 %d 个（%s）" % (total, name_msg or "—"),
-        "7. 视口自动对准每张图（显示锁定：%s）" % ("是" if cfg.get("lockViewport") else "否"),
-        "8. 执行完成后在界面选择保存位置（不再自动保存；默认目录：%s）" % g("outputDir", "(未设置)"),
+        "5. PDFLAYOUT 批量布局：按 LBD Excel 分表名命名，布局 %d 个（%s）" % (total, name_msg or "—"),
+        "6. 视口自动对准每张图（显示锁定：%s）" % ("是" if cfg.get("lockViewport") else "否"),
+        "7. 执行完成后在界面选择保存位置（不再自动保存；默认目录：%s）" % g("outputDir", "(未设置)"),
     ] + grid
 
 
@@ -541,9 +599,10 @@ def auto_worker(cfg, ini, prog, bus):
             if _jp and os.path.exists(_jp):
                 try:
                     bus.prog.emit("0/4 读取识别结果 JSON…")
-                    _n, _nn, _nt = json_to_extract(_jp, lbd_out)
+                    _n, _nn, _nt = json_to_extract(_jp, lbd_out, rack_prefix(cfg))
                     ok, err = True, ""
-                    bus.prog.emit("0/4 JSON标签 %d 个 (LBD %d / STR %d)" % (_n, _nn, _nt))
+                    bus.prog.emit("0/4 JSON标签 %d 个 (LBD %d / 支架 %d，前缀 %s)"
+                                  % (_n, _nn, _nt, rack_prefix(cfg)))
                 except Exception as e:
                     ok, err = False, "JSON解析失败:" + str(e)
             elif str(cfg.get("useAI", "0")) in ("1", "True", "true"):
@@ -573,6 +632,26 @@ def auto_worker(cfg, ini, prog, bus):
                         f.write(err)
                 except Exception:
                     pass
+        # 自动导出 LBD 区域范围 + Typical(支架)范围，供下游程序/报表直接读。
+        # 只在“可能拿得到识别 JSON”时执行，纯 PDF 抽文字的流程不打扰。
+        _rauto = str(cfg.get("regionAuto", "1")).strip() not in ("0", "", "关", "否", "off", "false", "False")
+        _rready = (bool((cfg.get("jsonPath") or "").strip())
+                   or str(cfg.get("useAI", "0")) in ("1", "True", "true")
+                   or bool((cfg.get("aiOutdir") or "").strip()))
+        if _rauto and _rready:
+            bus.prog.emit("0/4 导出 LBD 区域 / 支架范围…")
+            _rres = export_region_ranges(cfg, extra_dirs=[lbd_out])
+            bus.prog.emit(_rres["msg"])
+            _rt = _rres.get("rack_types") or []
+            if _rt:
+                bus.racks.emit(_rt)              # 界面「支架」页明细行自动填上
+                if str(cfg.get("rackAuto", "1")).strip() not in ("0", "", "关", "否",
+                                                                 "off", "false", "False"):
+                    cfg["rackTypes"] = _rres.get("rack_types_text") or cfg.get("rackTypes", "")
+                    try:
+                        write_auto_ini(cfg, ini)  # 补写 ini, LSP 这一次就能读到支架类型
+                    except Exception as e:
+                        bus.prog.emit("支架类型写入 ini 失败：" + str(e))
         import pythoncom
         import win32com.client as win32
         pythoncom.CoInitialize()
@@ -665,9 +744,12 @@ def auto_worker(cfg, ini, prog, bus):
                 _sbg_g = float(str(cfg.get("strBgGap", "1.0")).strip() or 1.0)
             except Exception:
                 _sbg_g = 1.0
+            _rp = rack_prefix(cfg).replace('"', "")      # 支架号前缀：LISP 端按它认支架号
             _strbg = ("(setq *PdfLayout_AiStrBgOn* %s)\n"
                       "(setq *PdfLayout_AiStrBgColor* %s)\n"
-                      "(setq *PdfLayout_AiStrBgGap* %s)\n" % (_sbg_on, _sbg_c, _sbg_g))
+                      "(setq *PdfLayout_AiStrBgGap* %s)\n"
+                      "(setq *PdfLayout_AiStrPrefix* \"%s\")\n"
+                      % (_sbg_on, _sbg_c, _sbg_g, _rp))
             cmd = ("(load %s)\n(load %s)\n(load %s)\n"
                    "(setq *PdfLayout_GridAutoFile* %s)\n(setq *PdfLayout_AiPage* %s)\n"
                    "%s"
@@ -954,6 +1036,7 @@ class Bus(QObject):
     err = Signal(str)
     done = Signal(str)
     status = Signal(str)
+    racks = Signal(list)          # 支架类型明细（后台线程解析完推给界面）
     save_result = Signal(bool, str)
     upd_found = Signal(str, str, str, str)
     upd_none = Signal(str, str, str)
@@ -1071,6 +1154,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.bus = Bus()
         self.bus.prog.connect(self.on_prog)
+        self.bus.racks.connect(self.on_rack_types)
         self.bus.err.connect(self.on_err)
         self.bus.done.connect(self.on_done)
         self.bus.status.connect(self.on_status)
@@ -1084,8 +1168,6 @@ class MainWindow(QMainWindow):
         self.edits = {}
         self.checkbox = {}
         self.combo = {}
-        self.rbM = None
-        self.rbL = None
         self.run_active = False
         self._finish_ready = False
         self._ai_step = False
@@ -1180,6 +1262,7 @@ class MainWindow(QMainWindow):
         actions.setSpacing(8)
         for t, cb in [("载入配置", self.on_load), ("保存配置", self.on_save),
                       ("扫描", self.on_scan), ("生成计划", self.on_plan),
+                      ("导出区域范围", self.on_export_regions),
                       ("执行输出", self.on_run)]:
             b = QPushButton(t)
             if t == "执行输出":
@@ -1245,32 +1328,37 @@ class MainWindow(QMainWindow):
         form = QGridLayout()
         form.setHorizontalSpacing(14)
         form.setVerticalSpacing(10)
+        rack_panel = None
         if sec_title == "选项":
             r = 0
             for key, txt, init in [("lockViewport", "锁定视口显示", False),
                                    ("overwrite", "覆盖同名布局", False),
                                    ("filterCluster", "排除集中干扰标号", True),
-                                   ("useAI", "使用AI自动识别(无需手动框)", False)]:
+                                   ("useAI", "使用AI自动识别(无需手动框)", False),
+                                   ("regionAuto", "生成时自动导出 LBD区域/支架范围", True),
+                                   ("rackAuto", "支架类型自动读识别结果(免手填)", True)]:
                 cb = QCheckBox(txt)
                 cb.setChecked(init)
                 self.checkbox[key] = cb
                 form.addWidget(cb, r, 0, 1, 2)
                 r += 1
-            form.addWidget(QLabel("标签位置:"), r, 0)
-            self.rbM = QRadioButton("模型空间")
-            self.rbL = QRadioButton("当前布局")
-            self.rbM.setChecked(True)
-            hb = QHBoxLayout()
-            hb.setSpacing(10)
-            hb.addWidget(self.rbM)
-            hb.addWidget(self.rbL)
-            form.addLayout(hb, r, 1)
+            # 标签位置固定模型空间：CAD 侧「填到布局」要按当前布局的最大视口把模型坐标
+            # 换成图纸坐标，多布局/视口不止一个时容易错位（STR 号本来也一直画在模型空间）。
+            pos = QLabel("标签位置：模型空间（固定）—— 「填到布局」要按当前布局的视口换算坐标，"
+                         "布局多了或视口不规则会错位，所以不再给选。")
+            pos.setObjectName("Hint")
+            pos.setWordWrap(True)
+            form.addWidget(pos, r, 0, 1, 2)
         elif sec_title == "支架":
             # 支架类型 + 拆不拆：程序按 行长度÷单串长度 得每行串数，
             # 再按"拆成几行"把相邻各行归成一张支架，串数取和。
             HINTS = {
-                "rackTypes": "每类写成 串数:长度FT，逗号分隔。例：1:100.3, 2:214.3, 3:320.0",
-                "rackSplit": "填 不拆 / 2行 / 3行；也可按 LBD 写：LBD-01..12=3行, 其余=不拆",
+                "rackPrefix": "支架号前缀，默认 STR：编号长这样 STR01、STR02…（CIR 是网格编号 PDFGRID 用的前缀，"
+                              "不是支架号的；网格编号在 CAD 插件里单独设，本程序不再设它）。"
+                              "改了前缀，识别结果里的 STR 号会按新前缀写进 CAD。",
+                "rackTypes": "一般不用手填：下面明细行会自动读识别结果（填了明细行就以下面为准）",
+                "rackSplit": "全部按同一规则时填这里：不拆 / 2行 / 3行；也可按 LBD 写。"
+                             "要每个支架类型分开设，用下面的明细行",
                 "rackStringLen": "可留空。填了按 行长度÷单串长度 反推串数，再和支架类型核对",
                 "strBgOn": "STR 号是否加背景填充（遮掉底图线条）。默认开",
                 "strBgColor": "背景填充颜色，下拉选择 ACI 色号",
@@ -1310,6 +1398,7 @@ class MainWindow(QMainWindow):
                 hint.setWordWrap(True)
                 form.addWidget(hint, r, 1)
                 r += 1
+            rack_panel = self._build_rack_panel()
         else:
             for row, (key, label) in enumerate(keys):
                 lb = QLabel(label)
@@ -1334,6 +1423,8 @@ class MainWindow(QMainWindow):
                     bb.clicked.connect(lambda _=False, k=key: self.browse(k))
                     form.addWidget(bb, row, 2)
         outer.addLayout(form)
+        if rack_panel is not None:
+            outer.addWidget(rack_panel)
         outer.addStretch(1)
         sc = QScrollArea()
         sc.setWidgetResizable(True)
@@ -1341,7 +1432,151 @@ class MainWindow(QMainWindow):
         sc.setWidget(page)
         return sc
 
+    def _build_rack_panel(self):
+        """支架类型明细：每个支架类型单独一行；类型自动来自识别结果，拆不拆手工选。"""
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 10, 0, 0)
+        v.setSpacing(6)
+        t = QLabel("支架类型明细 —— 每类一行，类型自动读识别结果，长度/拆不拆可自己改")
+        t.setObjectName("Hint")
+        t.setWordWrap(True)
+        v.addWidget(t)
+        self.rack_grid = QGridLayout()
+        self.rack_grid.setHorizontalSpacing(16)
+        self.rack_grid.setVerticalSpacing(6)
+        v.addLayout(self.rack_grid)
+        hb = QHBoxLayout()
+        hb.setSpacing(8)
+        self.rack_refresh_btn = QPushButton("从识别结果刷新支架类型")
+        self.rack_refresh_btn.clicked.connect(self.on_refresh_rack_types)
+        hb.addWidget(self.rack_refresh_btn)
+        hb.addStretch(1)
+        v.addLayout(hb)
+        self.rack_rows = []          # [(串数, 长度QLineEdit, 拆不拆QComboBox)]
+        self._rack_types = []        # 当前明细对应的支架类型(来自识别结果)
+        self._rack_len_pref = {}     # 串数 -> 长度文本(用户填过/配置里带的)
+        self._rack_split_pref = {}   # 串数 -> 拆不拆
+        self.refresh_rack_rows([])
+        return box
+
+    def _stash_rack_rows(self):
+        """把当前明细行里填的长度/拆分记下来，重建行时不丢。"""
+        for key, le, cb in self.rack_rows:
+            txt = le.text().strip()
+            if txt:
+                self._rack_len_pref[key] = txt
+            else:
+                self._rack_len_pref.pop(key, None)
+            self._rack_split_pref[key] = cb.currentText()
+
+    def refresh_rack_rows(self, types, stash=True):
+        """按支架类型列表重建明细行；已填的长度和拆分选择保留。
+        stash=False 用于「刚读回配置」的场景，避免用空行覆盖配置里的值。"""
+        if stash:
+            self._stash_rack_rows()
+        self._rack_types = list(types or [])
+        while self.rack_grid.count():
+            it = self.rack_grid.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self.rack_rows = []
+        for col, head in enumerate(("支架类型", "串数", "长度FT", "数量", "拆不拆")):
+            lb = QLabel(head)
+            lb.setObjectName("FieldLabel")
+            self.rack_grid.addWidget(lb, 0, col)
+        if not types:
+            empty = QLabel("（还没读到识别结果：指定「识别结果 JSON文件」或跑一次「执行输出」后，这里会自动列出）")
+            empty.setObjectName("Hint")
+            empty.setWordWrap(True)
+            self.rack_grid.addWidget(empty, 1, 0, 1, 5)
+            return
+        for i, tp in enumerate(types):
+            key = str(tp.get("strings"))
+            name = QLabel(tp.get("code") or ("%s 串" % key))
+            self.rack_grid.addWidget(name, i + 1, 0)
+            num = QLabel(key)
+            self.rack_grid.addWidget(num, i + 1, 1)
+            le = QLineEdit()
+            le.setObjectName("Field")
+            le.setMinimumWidth(110)
+            le.setPlaceholderText("长度FT")
+            pref = self._rack_len_pref.get(key)
+            if pref:
+                le.setText(pref)
+            elif tp.get("length_ft"):
+                le.setText("%g" % tp["length_ft"])
+            self.rack_grid.addWidget(le, i + 1, 2)
+            cnt = tp.get("total_count")
+            cl = QLabel(str(cnt) if cnt is not None else "—")
+            self.rack_grid.addWidget(cl, i + 1, 3)
+            cb = QComboBox()
+            cb.setObjectName("Field")
+            cb.setMinimumWidth(90)
+            for opt in ("不拆", "2行", "3行"):
+                cb.addItem(opt, opt)
+            want = self._rack_split_pref.get(key, "不拆")
+            idx = cb.findData(want)
+            cb.setCurrentIndex(idx if idx >= 0 else 0)
+            self.rack_grid.addWidget(cb, i + 1, 4)
+            self.rack_rows.append((key, le, cb))
+
+    def _rack_types_current(self):
+        return list(self._rack_types or [])
+
+    def rack_row_values(self):
+        return [(k, le.text().strip(), cb.currentText()) for k, le, cb in self.rack_rows]
+
+    def on_rack_types(self, rows):
+        """后台线程解析出支架类型后（bus.racks 信号）自动填进明细行。"""
+        try:
+            self.refresh_rack_rows(rows or [])
+            if rows:
+                txt = _lr_rack_text(rows) if _lr_rack_text else ""
+                self.log_msg("支架类型已自动填入 %d 类：%s（拆不拆请在「支架」页选）"
+                             % (len(rows), txt))
+        except Exception as e:
+            self.log_msg("支架类型填入失败：" + str(e))
+
+    def on_refresh_rack_types(self):
+        """手动刷新：从识别结果重新读支架类型。"""
+        cfg = self.cfg()
+        self.log_msg("正在从识别结果读取支架类型…")
+        threading.Thread(target=self._rack_fill_worker, args=(cfg, True), daemon=True).start()
+
+    def _rack_fill_worker(self, cfg, announce=True):
+        if _lr_rack_types is None:
+            if announce:
+                self.bus.prog.emit("支架类型读取失败：缺少 lbd_regions.py")
+            return None
+        rows, src = [], ""
+        for cand in (_lr_candidates(cfg) if _lr_candidates else []):
+            try:
+                r = _lr_rack_types(cand)
+            except Exception:
+                r = []
+            if r:
+                rows, src = r, cand
+                break
+        if rows:
+            self.bus.racks.emit(rows)
+            if announce:
+                self.bus.prog.emit("支架类型来自 %s" % os.path.basename(src))
+        elif announce:
+            self.bus.prog.emit("未在识别结果里读到支架类型（支架页保持手填）。")
+        return rows
+
+    def auto_fill_rack_types_async(self, cfg, announce=True):
+        """能自动填就自动填；解析放在后台线程，不卡界面。"""
+        if _lr_rack_types is None or not cfg.get("rackAuto", True):
+            return
+        threading.Thread(target=self._rack_fill_worker, args=(cfg, announce), daemon=True).start()
+
     def _build_status_page(self):
+        page = QWidget()
+        v = QVBoxLayout(page)
         page = QWidget()
         v = QVBoxLayout(page)
         v.setContentsMargins(30, 28, 30, 28)
@@ -1406,7 +1641,17 @@ class MainWindow(QMainWindow):
         c["overwrite"] = self.checkbox["overwrite"].isChecked()
         c["filterCluster"] = self.checkbox["filterCluster"].isChecked()
         c["useAI"] = self.checkbox["useAI"].isChecked()
-        c["labelWhere"] = "M" if self.rbM.isChecked() else "L"
+        c["regionAuto"] = self.checkbox["regionAuto"].isChecked()
+        c["rackAuto"] = self.checkbox["rackAuto"].isChecked()
+        c["labelWhere"] = "M"          # 固定模型空间（界面不再给「当前布局」选项）
+        # 支架类型明细行(每类一行)优先：类型自动来自识别结果，拆不拆按行选；
+        # 没有明细行时保留手填的 rackTypes/rackSplit。
+        rows = self.rack_row_values()
+        if rows:
+            c["rackTypes"] = ", ".join(("%s:%s" % (k, l)) if l else k for k, l, _s in rows)
+            c["rackSplitByType"] = "; ".join("%s=%s" % (k, s) for k, _l, s in rows)
+        else:
+            c["rackSplitByType"] = ""
         return c
 
     def set_cfg(self, c):
@@ -1423,15 +1668,30 @@ class MainWindow(QMainWindow):
         self.checkbox["overwrite"].setChecked(bool(c.get("overwrite")))
         self.checkbox["filterCluster"].setChecked(bool(c.get("filterCluster")))
         self.checkbox["useAI"].setChecked(bool(c.get("useAI")))
-        m = c.get("labelWhere", "M") != "L"
-        self.rbM.setChecked(m)
-        self.rbL.setChecked(not m)
+        self.checkbox["regionAuto"].setChecked(bool(c.get("regionAuto", True)))
+        self.checkbox["rackAuto"].setChecked(bool(c.get("rackAuto", True)))
+        # 记忆每个支架类型的长度/拆分，明细行重建时套用
+        self._rack_len_pref = {}
+        self._rack_split_pref = {}
+        for part in re.split(r"[;,]", str(c.get("rackSplitByType") or "")):
+            if "=" in part:
+                _k, _v = part.split("=", 1)
+                if _k.strip():
+                    self._rack_split_pref[_k.strip()] = _v.strip()
+        for part in re.split(r"[,;]", str(c.get("rackTypes") or "")):
+            if ":" in part:
+                _k, _v = part.split(":", 1)
+                if _k.strip() and _v.strip():
+                    self._rack_len_pref[_k.strip()] = _v.strip()
+        self.refresh_rack_rows(self._rack_types_current(), stash=False)
+        # labelWhere 固定模型空间：老配置里是 "L" 也忽略（界面已无此选项）
 
     def log_msg(self, text):
         self.log.appendPlainText(text)
 
     def on_scan(self):
         self.log_msg("正在扫描 PDF…")
+        self.auto_fill_rack_types_async(self.cfg(), announce=True)
         threading.Thread(target=self._scan_worker, args=(self.cfg(),), daemon=True).start()
 
     def _scan_worker(self, cfg):
@@ -1446,6 +1706,27 @@ class MainWindow(QMainWindow):
                             pp or "\n（未发现 LBD 文字）"))
         else:
             self.log_msg("扫描失败：" + r.get("error", "未知错误"))
+
+    def on_export_regions(self):
+        """手动导出一次：识别 debug JSON -> LBD 区域 + 支架范围 + 支架类型。"""
+        cfg = self.cfg()
+        try:
+            _d = load_config()
+            for _k in ("aiOutdir", "regionOut"):
+                cfg[_k] = (_d.get(_k) or "").strip() or DEFAULTS.get(_k, "")
+        except Exception:
+            pass
+        self.log_msg("正在导出 LBD 区域 / 支架范围…")
+        threading.Thread(target=self._export_regions_worker, args=(cfg,), daemon=True).start()
+
+    def _export_regions_worker(self, cfg):
+        try:
+            res = export_region_ranges(cfg)
+        except Exception as e:
+            res = {"ok": False, "msg": "导出出错：" + str(e)}
+        self.log_msg(res.get("msg", ""))
+        if res.get("rack_types"):
+            self.bus.racks.emit(res["rack_types"])
 
     @staticmethod
     def _range_count_from_input(cfg):
@@ -1487,9 +1768,10 @@ class MainWindow(QMainWindow):
     def on_load(self):
         self.set_cfg(load_config())
         self.log_msg("已载入配置。")
+        self.auto_fill_rack_types_async(self.cfg(), announce=True)
 
     def browse(self, key):
-        if key == "outputDir":
+        if key in ("outputDir", "regionOut"):
             d = QFileDialog.getExistingDirectory(self, "选择输出目录")
             if d:
                 self.set_text(key, d)
@@ -1504,6 +1786,8 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "选择文件", "", filt)
         if path:
             self.set_text(key, path)
+            if key == "jsonPath":
+                self.auto_fill_rack_types_async(self.cfg(), announce=True)
 
     def on_run(self):
         cfg = self.cfg()
@@ -1545,16 +1829,14 @@ class MainWindow(QMainWindow):
         # 读取配置里的 AI 自动识别参数
         try:
             _d = load_config()
-            for _k in ("aiPython", "aiScript", "aiModel", "aiOutdir"):
+            for _k in ("aiPython", "aiScript", "aiModel", "aiOutdir", "regionOut"):
                 cfg[_k] = (_d.get(_k) or "").strip() or DEFAULTS.get(_k, "")
         except Exception:
             pass
         ini = os.path.join(tempfile.gettempdir(), "pdfauto.ini")
         prog = os.path.join(tempfile.gettempdir(), "pdfauto_prog.txt")
         try:
-            with open(ini, "w", encoding="gbk") as f:
-                for k, v in cfg.items():
-                    f.write("%s=%s\n" % (k, 1 if v is True else (0 if v is False else v)))
+            write_auto_ini(cfg, ini)
             open(prog, "w").close()
         except Exception as e:
             self.log_msg("写入执行配置失败：" + str(e))
@@ -1581,7 +1863,9 @@ class MainWindow(QMainWindow):
     def on_prog(self, msg):
         self.log_msg(msg)
         up = msg.upper()
-        if "0/4" in msg:
+        if "区域" in msg and "支架范围" in msg:
+            self.run_status = "正在导出 LBD 区域 / 支架范围…"
+        elif "0/4" in msg:
             self.run_status = "正在提取 PDF LBD 标签…"
         elif "1/4" in msg or "连接" in msg or "启动" in msg:
             self.run_status = "正在连接 / 启动 ZWCAD…（可能需 10-30 秒，请切到 ZWCAD）"

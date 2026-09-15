@@ -19,6 +19,7 @@
 (setq *PdfLayout_AiStrBgOn* T)      ; T = STR label background fill (nil = off)
 (setq *PdfLayout_AiStrBgColor* 1)   ; STR background fill color (ACI)
 (setq *PdfLayout_AiStrBgGap* 1.0)   ; STR background fill gap factor
+(setq *PdfLayout_AiStrPrefix* "STR") ; rack label prefix (orchestrator sets it; CIR belongs to PDFGRID)
 (setq *PdfLayout_AiSkipLbd* T)        ; T = 不画识别出的 LBD 标签(改由 Excel 导入)
 (setq *PdfLayout_AiBoxW* 0.0)
 (setq *PdfLayout_AiBoxH* 0.0)
@@ -178,7 +179,7 @@
             (if (/= rad 0.0) (vl-catch-all-apply 'vla-put-Rotation (list m rad)))
             (if lay (vl-catch-all-apply 'vla-put-Layer (list m *PdfLayout_AiLayer*)))
             ;; STR 背景填充: 先走 ActiveX, 再用 DXF(兼容 ZWCAD 无 BackgroundFillColor 接口)
-            (if (and *PdfLayout_AiStrBgOn* (wcmatch (strcase name) "STR*"))
+            (if (and *PdfLayout_AiStrBgOn* (wcmatch (strcase name) (strcat (strcase (if *PdfLayout_AiStrPrefix* *PdfLayout_AiStrPrefix* "STR")) "*")))
               (progn
                 (vl-catch-all-apply 'vla-put-BackgroundFill (list m :vlax-true))
                 (vl-catch-all-apply '(lambda () (vlax-put-property m 'BackgroundFillUseDrawingBackgroundColor :vlax-false)) nil)

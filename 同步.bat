@@ -1,6 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
+chcp 936 >nul 2>&1
 title MAP-CAD Í¬²½µ½ GitHub
 
 set "REPO=%~dp0"

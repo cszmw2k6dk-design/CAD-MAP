@@ -1,16 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_dynamic_libs
 
-binaries = [('C:/pybuild/python/VCRUNTIME140.dll', '.'), ('C:/pybuild/python/VCRUNTIME140_1.dll', '.'), ('C:/pybuild/python/msvcp140.dll', '.'), ('C:/pybuild/python/concrt140.dll', '.')]
+binaries = [('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/.build-venv/Lib/site-packages/PySide6/VCRUNTIME140.dll', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/.build-venv/Lib/site-packages/PySide6/VCRUNTIME140_1.dll', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/.build-venv/Lib/site-packages/PySide6/msvcp140.dll', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/.build-venv/Lib/site-packages/PySide6/concrt140.dll', '.')]
 binaries += collect_dynamic_libs('PySide6')
 binaries += collect_dynamic_libs('shiboken6')
 
 
 a = Analysis(
-    ['C:/Users/szk/Desktop/MAP-CAD/编排器/app.py'],
+    ['C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/CAD-MAP-main/编排器/app.py'],
     pathex=[],
     binaries=binaries,
-    datas=[('C:/Users/szk/Desktop/MAP-CAD/编排器/app_icon.png', '.'), ('C:/Users/szk/Desktop/MAP-CAD/编排器/logo_blue.png', '.'), ('C:/Users/szk/Desktop/MAP-CAD/编排器/PdfLayout_auto.lsp', '.'), ('C:/Users/szk/Desktop/MAP-CAD/编排器/PdfLayout_ai.lsp', '.'), ('C:/Users/szk/Desktop/MAP-CAD/PdfLayout插件包/PdfLayout.lsp', '.'), ('C:/pybuild/python/Lib/site-packages/PySide6/plugins/platforms', 'PySide6/plugins/platforms'), ('C:/pybuild/python/Lib/site-packages/PySide6/plugins/styles', 'PySide6/plugins/styles')],
+    datas=[('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/CAD-MAP-main/编排器/app_icon.png', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/CAD-MAP-main/编排器/logo_blue.png', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/CAD-MAP-main/编排器/PdfLayout_auto.lsp', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/CAD-MAP-main/编排器/PdfLayout_ai.lsp', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/CAD-MAP-main/PdfLayout插件包/PdfLayout.lsp', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/.build-venv/Lib/site-packages/PySide6/plugins/platforms', 'PySide6/plugins/platforms'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/.build-venv/Lib/site-packages/PySide6/plugins/styles', 'PySide6/plugins/styles')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -40,5 +40,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['C:/Users/szk/Desktop/MAP-CAD/编排器/app.ico'],
+    icon=['C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/CAD-MAP-main/编排器/app.ico'],
 )

@@ -16,11 +16,5 @@
   "groupStart": "1",
   "lockViewport": false,
   "overwrite": false,
-  "gridRows": "4",
-  "gridCols": "5",
-  "gridRowSp": "10",
-  "gridColSp": "20",
-  "gridPrefix": "CIR",
-  "gridStartN": "1",
-  "gridDigits": "2"
+  "rackPrefix": "STR"
 }

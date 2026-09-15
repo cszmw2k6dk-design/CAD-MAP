@@ -1,6 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+chcp 936 >nul 2>&1
 title MAP-CAD ´ò°ü
 
 set "PY=C:\pybuild\python\python.exe"
