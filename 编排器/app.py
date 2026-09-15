@@ -16,15 +16,18 @@ try:
     from lbd_regions import (extract_lbd_typical as _lr_extract,
                              candidate_debug_jsons as _lr_candidates,
                              region_out_dir as _lr_out_dir,
+                             page_region_bounds as _lr_page_bounds,
+                             write_region_file as _lr_write_regions,
                              rack_types_from_json as _lr_rack_types,
                              rack_types_text as _lr_rack_text,
                              summary_text as _lr_summary)
 except Exception:                    # 模块缺失时不阻塞主程序
     _lr_extract = _lr_candidates = _lr_out_dir = None
+    _lr_page_bounds = _lr_write_regions = None
     _lr_rack_types = _lr_rack_text = _lr_summary = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.17.6"
+APP_VERSION = "2.17.7"
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
@@ -57,6 +60,7 @@ DEFAULTS = {
     "rackAuto": True, "rackSplitByType": "",
     "strBgOn": "1", "strBgColor": "1", "strBgGap": "1.0",
     "lockViewport": False, "overwrite": False, "labelWhere": "M", "filterCluster": True,
+    "regionFit": True,
     "useAI": False,
     "aiPython": r"C:\Users\szk\Desktop\MAP-CAD\_pyinstaller_tool\python\python.exe",
     "aiScript": r"C:\Users\szk\Desktop\MAP-CAD\frame_detect\run_detect.py",
@@ -450,6 +454,35 @@ def write_auto_ini(cfg, ini_path):
             f.write("%s=%s\n" % (k, 1 if v is True else (0 if v is False else v)))
 
 
+def prepare_region_file(cfg, extra_dirs=()):
+    """按识别结果写「每页 LBD 区域上下限」文件，给 CAD 侧生成布局后对准视口用。
+
+    返回 (文件路径, 一行说明)。拿不到识别结果时路径是空串，CAD 侧就按整页对准。
+    """
+    if _lr_write_regions is None:
+        return "", "区域对准：缺少 lbd_regions.py，视口按整页对准"
+    try:
+        cands = _lr_candidates(cfg, extra_paths=extra_dirs)
+    except Exception as e:
+        return "", "区域对准：查找识别结果出错 %s（视口按整页对准）" % e
+    if not cands:
+        return "", "区域对准：没找到识别结果 JSON，视口按整页对准"
+    out = os.path.join(tempfile.gettempdir(), "pdflbd_regions.txt")
+    last_err = ""
+    for jp in cands:                       # 依次试，挑第一份能读出来的
+        try:
+            r = _lr_write_regions(jp, out, page_start=cfg.get("pageStart", 1),
+                                  count=cfg.get("count", 0))
+        except Exception as e:
+            last_err = str(e)
+            continue
+        if r.get("ok"):
+            return out, ("区域对准：%d 页，其中 %d 页有 LBD 区域 → 生成布局后按区域上下限调视口大小"
+                         % (r["pages"], r["with_region"]))
+        last_err = r.get("error") or last_err
+    return "", "区域对准：%s（视口按整页对准）" % (last_err or "读取失败")
+
+
 def read_xlsx_sheet_names(path):
     """按表顺序读出 LBD Excel 的分表名（xlsx 的工作表名）。
     只解压 xl/workbook.xml，不依赖 Excel 或第三方库，用于界面预览。"""
@@ -511,7 +544,9 @@ def build_plan(cfg):
             ("开" if g("strBgOn", "1").strip() not in ("0", "", "关", "否") else "关"),
             g("strBgColor", "1"), g("strBgGap", "1.0")),
         "5. PDFLAYOUT 批量布局：按 LBD Excel 分表名命名，布局 %d 个（%s）" % (total, name_msg or "—"),
-        "6. 视口自动对准每张图（显示锁定：%s）" % ("是" if cfg.get("lockViewport") else "否"),
+        "6. 视口自动对准每张图（显示锁定：%s；%s）"
+        % ("是" if cfg.get("lockViewport") else "否",
+           "生成布局后按 LBD 区域上下限再对准一次" if cfg.get("regionFit", True) else "按整页对准"),
         "7. 执行完成后在界面选择保存位置（不再自动保存；默认目录：%s）" % g("outputDir", "(未设置)"),
     ] + grid
 
@@ -652,6 +687,18 @@ def auto_worker(cfg, ini, prog, bus):
                         write_auto_ini(cfg, ini)  # 补写 ini, LSP 这一次就能读到支架类型
                     except Exception as e:
                         bus.prog.emit("支架类型写入 ini 失败：" + str(e))
+
+        # 布局生成后按 LBD 区域上下限对准视口：先把区域范围文件写出来，再补写一次 ini
+        _rfile = ""
+        if cfg.get("regionFit", True):
+            _rfile, _rmsg = prepare_region_file(cfg, extra_dirs=[lbd_out])
+            bus.prog.emit(_rmsg)
+        cfg["regionFile"] = _rfile
+        try:
+            write_auto_ini(cfg, ini)
+        except Exception as e:
+            bus.prog.emit("区域范围写入 ini 失败：" + str(e))
+
         import pythoncom
         import win32com.client as win32
         pythoncom.CoInitialize()
@@ -1348,6 +1395,7 @@ class MainWindow(QMainWindow):
                                    ("filterCluster", "排除集中干扰标号", True),
                                    ("useAI", "使用AI自动识别(无需手动框)", False),
                                    ("regionAuto", "生成时自动导出 LBD区域/支架范围", True),
+                                   ("regionFit", "生成布局后按 LBD 区域上下限对准视口", True),
                                    ("rackAuto", "支架类型自动读识别结果(免手填)", True)]:
                 cb = QCheckBox(txt)
                 cb.setChecked(init)
@@ -1654,6 +1702,7 @@ class MainWindow(QMainWindow):
         c["filterCluster"] = self.checkbox["filterCluster"].isChecked()
         c["useAI"] = self.checkbox["useAI"].isChecked()
         c["regionAuto"] = self.checkbox["regionAuto"].isChecked()
+        c["regionFit"] = self.checkbox["regionFit"].isChecked()
         c["rackAuto"] = self.checkbox["rackAuto"].isChecked()
         c["labelWhere"] = "M"          # 固定模型空间（界面不再给「当前布局」选项）
         # 支架类型明细行(每类一行)优先：类型自动来自识别结果，拆不拆按行选；
@@ -1681,6 +1730,7 @@ class MainWindow(QMainWindow):
         self.checkbox["filterCluster"].setChecked(bool(c.get("filterCluster")))
         self.checkbox["useAI"].setChecked(bool(c.get("useAI")))
         self.checkbox["regionAuto"].setChecked(bool(c.get("regionAuto", True)))
+        self.checkbox["regionFit"].setChecked(bool(c.get("regionFit", True)))
         self.checkbox["rackAuto"].setChecked(bool(c.get("rackAuto", True)))
         # 记忆每个支架类型的长度/拆分，明细行重建时套用
         self._rack_len_pref = {}
@@ -2146,6 +2196,9 @@ class MainWindow(QMainWindow):
                 self.run_status = "正在写 LBD 标签 %d / %d" % (self.done_n, self.total)
             elif self._phase == "AI":
                 self.run_status = "正在画 STR 号 %d / %d" % (self.done_n, self.total)
+        # 布局建完后会按 LBD 区域上下限再对准一次视口（CAD 侧写 REGION_FIT n）
+        if "REGION_FIT" in up and "STEP_LBD" not in up:
+            self.run_status = "正在按 LBD 区域上下限对准视口…"
         finished = False
         # 完成标记：CAD 侧在最后一步（AI 画完 STR）之后写 RUN_DONE
         run_done = "RUN_DONE" in up

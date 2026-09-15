@@ -281,6 +281,96 @@
   (if best (car best) "")
 )
 
+;;;-------------------------------------------------------------
+;;; 布局生成后：按识别结果里 LBD 区域的上下限对准视口（缩放 + 居中）
+;;; 区域范围文件由编排器写入 %TEMP%\pdflbd_regions.txt，每行:
+;;;   R <序号> <fx1> <fy1> <fx2> <fy2>
+;;; 归一化 0~1，x 从左往右、y 从下往上（和提取文件 L 行 fx/fy 同一套坐标）；
+;;; 序号 1 = 第 1 个布局 / 第 1 张图纸，依次往下。没有区域数据的页写整页(0,0,1,1)。
+;;;-------------------------------------------------------------
+(defun PdfLayout_AutoTabSplit (s / out tmp i c)
+  (setq out nil tmp "" i 1)
+  (while (<= i (strlen s))
+    (setq c (substr s i 1))
+    (if (= c (chr 9))
+      (progn (setq out (append out (list tmp))) (setq tmp ""))
+      (setq tmp (strcat tmp c))
+    )
+    (setq i (1+ i))
+  )
+  (if (/= tmp "") (setq out (append out (list tmp))))
+  out
+)
+
+(defun PdfLayout_AutoReadRegions (path / f line parts out)
+  (setq out nil)
+  (if (and path (/= path "") (findfile path))
+    (progn
+      (setq f (open path "r"))
+      (while (and f (setq line (read-line f)))
+        (setq parts (PdfLayout_AutoTabSplit line))
+        (if (and parts (= (strcase (car parts)) "R") (>= (length parts) 6))
+          (setq out (append out (list (list (atoi (nth 1 parts))
+                                            (atof (nth 2 parts)) (atof (nth 3 parts))
+                                            (atof (nth 4 parts)) (atof (nth 5 parts))))))
+        )
+      )
+      (if f (close f))
+    )
+  )
+  out
+)
+
+;; 归一化区域范围 -> 模型空间 bbox（按底图范围换算，和画 STR 号用的是同一套映射）
+(defun PdfLayout_AutoRegionBox (bb r / pmin pmax dx dy fx1 fy1 fx2 fy2)
+  (setq pmin (car bb) pmax (cadr bb))
+  (setq dx (- (car pmax) (car pmin)) dy (- (cadr pmax) (cadr pmin)))
+  (setq fx1 (nth 1 r) fy1 (nth 2 r) fx2 (nth 3 r) fy2 (nth 4 r))
+  (list (list (+ (car pmin) (* fx1 dx)) (+ (cadr pmin) (* fy1 dy)) 0.0)
+        (list (+ (car pmin) (* fx2 dx)) (+ (cadr pmin) (* fy2 dy)) 0.0))
+)
+
+(defun PdfLayout_AutoRegionFit (cfg names lockVp / regs draws i n bb r box vps vpObj k vp)
+  (setq regs (PdfLayout_AutoReadRegions (PdfLayout_ACfg cfg "regionFile" "")))
+  (if (and regs names)
+    (progn
+      (setq draws (PdfLayout_ScanMarkerDrawings (PdfLayout_ACfg cfg "filter" "pdf")))
+      (setq i 0 k 0)
+      (foreach n names
+        (setq bb (nth i draws) r (nth i regs))
+        (if (and bb r (PdfLayout_GetLayoutObj n))
+          (progn
+            (setq box (PdfLayout_AutoRegionBox bb r))
+            (command ".-LAYOUT" "_S" n "")
+            (setq vps (PdfLayout_GetLayoutViewports n))
+            (if vps
+              (progn
+                (setq vp (car (PdfLayout_StableSort vps 'PdfLayout_CmpVpArea)))
+                (setq vpObj (car vp))
+                ;; 先解锁：上一轮对准时如果锁了显示，这里就改不动了
+                (vl-catch-all-apply 'vla-put-DisplayLocked (list vpObj :vlax-false))
+                (PdfLayout_FitViewport vpObj box lockVp)
+                (setq k (1+ k))
+              )
+            )
+          )
+        )
+        (setq i (1+ i))
+      )
+      (if (> k 0)
+        (progn
+          (if (car names) (command ".-LAYOUT" "_S" (car names) ""))
+          (PdfLayout_Prog (strcat "REGION_FIT " (itoa k)))
+          (princ (strcat "\n[区域对准] 已按 LBD 区域上下限调好 " (itoa k) " 个布局的视口。"))
+        )
+        (princ "\n[区域对准] 没有可用区域范围，视口保持整页对准。")
+      )
+    )
+    (princ "\n[区域对准] 没有区域范围文件，视口保持整页对准。")
+  )
+  (princ)
+)
+
 (defun PdfLayout_AutoRun (iniPath progPath / cfg tmpl2 names2 xlsx2 pdf outdir newname base fname newpath py nUnder countVal bgc gapc)
   (setq *PdfLayout_ProgPath* progPath)
   (setq *PdfLayout_NoAlert* T)
@@ -332,6 +422,11 @@
         )
       )
       (vl-catch-all-apply 'PdfLayout_Execute nil)
+      ;; 布局建好后按识别到的 LBD 区域上下限再对准一次视口（不是按整页）
+      (if (and names2 (= (PdfLayout_ACfg cfg "regionFit" "1") "1"))
+        (vl-catch-all-apply 'PdfLayout_AutoRegionFit
+          (list cfg names2 (= (PdfLayout_ACfg cfg "lockViewport" "0") "1")))
+      )
     )
   )
   (PdfLayout_Prog "STEP_LBD")

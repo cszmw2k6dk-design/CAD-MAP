@@ -470,6 +470,94 @@ def extract_lbd_typical(json_path, out_dir, csv_encoding="utf-8-sig", want_symbo
     }
 
 
+def page_region_bounds(json_path):
+    """JSON -> 每页 LBD 区域(Node 大框) 的合并范围。
+
+    返回 [(page, fx1, fy1, fx2, fy2), ...]，按页码升序：
+    归一化 0~1，x 从左往右、y 从下往上（和提取文件 L 行的 fx/fy 同一套坐标系）。
+    页面尺寸取 input_data.pages；没有 LBD 区域的页不会出现在结果里。
+    """
+    with open(json_path, encoding="utf-8") as f:
+        doc = json.load(f)
+    page_size = {}
+    for pg in (doc.get("input_data") or {}).get("pages") or []:
+        page_size[pg.get("page_number")] = (pg.get("width") or 0, pg.get("height") or 0)
+
+    box = {}                      # page -> [x1, y1, x2, y2] (原图像素)
+    for p in doc.get("yolo_tracker_detection_results") or []:
+        pg = p.get("page_number")
+        dets = (p.get("data") or {}).get("detections") or []
+        for det in dets:
+            if (det.get("label") or "").strip().lower() != "node":
+                continue
+            b = det.get("bbox") or {}
+            if not all(k in b for k in ("x1", "y1", "x2", "y2")):
+                continue
+            try:
+                x1, y1, x2, y2 = (float(b["x1"]), float(b["y1"]),
+                                  float(b["x2"]), float(b["y2"]))
+            except Exception:
+                continue
+            cur = box.get(pg)
+            if cur is None:
+                box[pg] = [x1, y1, x2, y2]
+            else:
+                cur[0] = min(cur[0], x1)
+                cur[1] = min(cur[1], y1)
+                cur[2] = max(cur[2], x2)
+                cur[3] = max(cur[3], y2)
+
+    rows = []
+    for pg in sorted(p for p in box if isinstance(p, int)):
+        W, H = page_size.get(pg, (0, 0))
+        if not W or not H:
+            continue
+        x1, y1, x2, y2 = box[pg]
+        rows.append((pg, x1 / float(W), 1.0 - y2 / float(H),
+                     x2 / float(W), 1.0 - y1 / float(H)))
+    return rows
+
+
+def write_region_file(json_path, out_path, page_start=1, count=0):
+    """按识别结果写「每页 LBD 区域上下限」文件，给 CAD 侧对准视口用。
+
+    每行 `R <序号> <fx1> <fy1> <fx2> <fy2>`（归一化，y 从下往上），序号从 1 开始、
+    与布局/图纸的先后顺序一一对应；某页没有区域数据就写整页(0,0,1,1)，等于不缩放。
+    """
+    try:
+        by_page = {pg: (a, b, c, d) for (pg, a, b, c, d) in page_region_bounds(json_path)}
+    except Exception as e:
+        return {"ok": False, "error": "读取识别结果失败：%s" % e}
+    if not by_page:
+        return {"ok": False, "error": "识别结果里没有 LBD 区域（Node 框）"}
+
+    try:
+        count = int(count or 0)
+    except Exception:
+        count = 0
+    try:
+        page_start = int(page_start or 1)
+    except Exception:
+        page_start = 1
+    want = list(range(page_start, page_start + count)) if count > 0 else sorted(by_page)
+
+    lines, hit = [], 0
+    for i, pg in enumerate(want, 1):
+        v = by_page.get(pg)
+        if v is None:
+            lines.append("R\t%d\t0.000000\t0.000000\t1.000000\t1.000000" % i)
+        else:
+            hit += 1
+            lines.append("R\t%d\t%.6f\t%.6f\t%.6f\t%.6f" % ((i,) + v))
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception as e:
+        return {"ok": False, "error": "写区域范围文件失败：%s" % e}
+    return {"ok": True, "path": os.path.abspath(out_path),
+            "pages": len(lines), "with_region": hit}
+
+
 def summary_text(r):
     """把 extract_lbd_typical 的结果转成一行给人看的说明。"""
     if not r.get("ok"):
