@@ -164,7 +164,7 @@
           (setq vp (PdfLayout_LayoutBiggestVp actLay)))
         (progn (setq blk ms) (setq vp nil))
       )
-      (setq i 0 nDone 0 nSeen 0)
+      (setq i 0 nDone 0 nSeen 0 statNoSheet 0 statNoLabel 0)
       (PdfLayout_Prog (strcat "LBD_TOTAL " (itoa (length validItems))))
       (foreach u underlays
         (setq pgnum (1+ i))
@@ -204,6 +204,7 @@
                       (setq mx (+ (car pmin) (* fx bw)))
                       (setq my (+ (cadr pmin) (* fy bh)))
                       (setq shN (PdfLayout_LbdSheetFromText stext))
+                      (if (not shN) (setq statNoSheet (1+ statNoSheet)))
                       (setq sheetLabels (if shN (cdr (assoc shN sheetMap)) nil))
                       (setq labels (if sheetLabels (cdr (assoc num sheetLabels)) nil))
                       ;; LBD 标签只认 Excel 映射: 查不到就不画, 不用 PDF 原文兜底, 也不编造 "LBD-xx"
@@ -265,6 +266,7 @@
         (PdfLayout_Prog (strcat "LBD_PAGE " (itoa pgnum)))
       )
       (PdfLayout_Prog (strcat "LBD_DONE " (itoa nDone)))
+      (PdfLayout_Prog (strcat "LBD_STAT 匹配到页=" (itoa nSeen) " 分表名没认出=" (itoa statNoSheet) " 编号表里没有=" (itoa statNoLabel) " 分表数=" (itoa (length sheetMap))))
       (princ (strcat "\n[PDFAUTO] LBD 已填写 " (itoa nDone) " 个标签。"))
       T
     )

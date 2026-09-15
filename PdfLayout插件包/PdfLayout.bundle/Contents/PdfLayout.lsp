@@ -3846,23 +3846,33 @@
   )
 )
 
-(defun PdfLayout_LbdSheetFromText (s / i c1 c2 c3 out)
-  ;; 从片段文本提取分表名：如 "INV01A01-LBD-01-POS" 或 "LBD-01INV01A01" -> "INV01A01"
+(defun PdfLayout_LbdSheetFromText (s / i n out tok nd nl)
+  ;; 从片段文本提取分表名：INV + 数字段 + 一个字母 + 数字段（每段位数不固定）
+  ;;   "INV01A01-LBD-14"   -> "INV01A01"
+  ;;   "INV11A101-LBD-05"  -> "INV11A101"
+  ;; （以前写死 2 位数字段，3 位的会被截成 INV11A10，对不上分表名 → 一个标签都填不上）
   (setq i 1 out nil)
   (while (and (<= i (strlen s)) (not out))
-    (if (and (>= (strlen s) (+ i 7)) (= (substr s i 3) "INV"))
+    (if (and (>= (strlen s) (+ i 2)) (= (strcase (substr s i 3)) "INV"))
       (progn
-        (setq c1 (substr s (+ i 3) 2))
-        (setq c2 (substr s (+ i 5) 1))
-        (setq c3 (substr s (+ i 6) 2))
-        (if (and (= (strlen c1) 2)
-                 (= (PdfLayout_CharKind (substr c1 1 1)) "D")
-                 (= (PdfLayout_CharKind (substr c1 2 1)) "D")
-                 (member c2 '("A" "B"))
-                 (= (strlen c3) 2)
-                 (= (PdfLayout_CharKind (substr c3 1 1)) "D")
-                 (= (PdfLayout_CharKind (substr c3 2 1)) "D"))
-          (setq out (strcat "INV" c1 c2 c3))
+        (setq n (+ i 3) tok "" nd 0 nl 0)
+        (while (and (<= n (strlen s)) (= (PdfLayout_CharKind (substr s n 1)) "D"))
+          (setq tok (strcat tok (substr s n 1)) n (1+ n) nd (1+ nd))
+        )
+        (if (> nd 0)
+          (progn
+            (if (and (<= n (strlen s)) (= (PdfLayout_CharKind (substr s n 1)) "L"))
+              (progn (setq tok (strcat tok (substr s n 1))) (setq n (1+ n)) (setq nl 1))
+            )
+            (if (= nl 1)
+              (progn
+                (while (and (<= n (strlen s)) (= (PdfLayout_CharKind (substr s n 1)) "D"))
+                  (setq tok (strcat tok (substr s n 1)) n (1+ n))
+                )
+                (setq out (strcat "INV" (strcase tok)))
+              )
+            )
+          )
         )
       )
     )
@@ -3870,7 +3880,6 @@
   )
   out
 )
-
 (defun PdfLayout_ReadExtractFile (path / f line parts pages items)
   ;; 读取 pdf_extract.py 的输出：P 行=页信息，L 行=LBD片段
   ;; 返回 (pages items)；pages=((页号 . 标题)...)，items=((页号 fx fy 文字)...)
