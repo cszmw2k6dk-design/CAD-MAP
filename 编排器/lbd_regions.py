@@ -603,7 +603,7 @@ def rack_lines_from_debug(json_path, prefix="STR", digits=2, page_map=None):
     return lines, n_str, n_pages
 
 
-def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2):
+def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_map=None):
     """识别结果 debug JSON -> CAD 读的 L 行（和 X-AnyLabeling 那条路输出同一套格式）。
 
         L <页号> <fx> <fy> <名称> <角度> <字高占页比>      fx/fy 归一化、y 从下往上
@@ -639,6 +639,9 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2):
         W, H = page_size.get(pg, (0, 0))
         if not W or not H:
             continue
+        pg_out = pg if page_map is None else page_map.get(pg)
+        if pg_out is None:
+            continue
         dets = (trk.get(pg) or {}).get("detections") or []
         nodes, typs = [], []
         for d in dets:
@@ -673,7 +676,7 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2):
                 continue
             cx, cy = _center(b)
             lines.append("L\t%d\t%.6f\t%.6f\t%s\t0\t0.000000"
-                         % (pg, cx / float(W), 1.0 - cy / float(H), n["name"]))
+                         % (pg_out, cx / float(W), 1.0 - cy / float(H), n["name"]))
             n_lbd += 1
 
         groups, heights = {}, []
@@ -693,7 +696,7 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2):
                 bw, bh = b["x2"] - b["x1"], b["y2"] - b["y1"]
                 ang = 90 if bh > bw else 0
                 lines.append("L\t%d\t%.6f\t%.6f\t%s\t%d\t%.6f"
-                             % (pg, cx / float(W), 1.0 - cy / float(H), nm, ang,
+                             % (pg_out, cx / float(W), 1.0 - cy / float(H), nm, ang,
                                 min(bw, bh) / float(H)))
                 n_str += 1
 

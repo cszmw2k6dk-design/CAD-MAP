@@ -169,7 +169,11 @@ def main():
     except Exception as e:
         log("  复制附属 lsp 失败（不影响 exe）：%s" % e)
     if os.path.exists(old):
-        os.remove(old)
+        try:
+            os.remove(old)
+        except Exception:
+            log("  提示：旧的 %s 删不掉（程序还在运行会锁住它），下次打包会再清一次。"
+                % os.path.basename(old))
     log("打包完成：%s（%.1f MB）" % (EXE, os.path.getsize(EXE) / 1048576.0))
     return 0
 

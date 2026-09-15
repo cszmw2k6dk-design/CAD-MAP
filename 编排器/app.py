@@ -34,7 +34,7 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_rack_types = _lr_rack_text = _lr_summary = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.17.10"
+APP_VERSION = "2.17.11"
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
@@ -68,6 +68,7 @@ DEFAULTS = {
     "strBgOn": "1", "strBgColor": "1", "strBgGap": "1.0",
     "lockViewport": False, "overwrite": False, "labelWhere": "M", "filterCluster": True,
     "regionFit": True,
+    "lbdFromRegion": True,
     "useAI": False,
     "aiPython": r"C:\Users\szk\Desktop\MAP-CAD\_pyinstaller_tool\python\python.exe",
     "aiScript": r"C:\Users\szk\Desktop\MAP-CAD\frame_detect\run_detect.py",
@@ -521,7 +522,26 @@ def build_extract_file(cfg, out_path, prog_path=None):
         return True, ("标注结果 JSON：标签 %d 行（LBD %d / 支架 %d，前缀 %s）"
                       % (n, nn, nt, pre)), detail
 
-    # 2)/3) LBD 行：Python 从 PDF 文字层提（位置就是图纸上 LBD 文字的位置）
+    # 2) 识别结果 debug JSON + 开关打开：LBD 标签填到「识别到的 LBD 区域」上
+    #    （PDF 文字层里那些 LBD 名常常在图纸右上角的清单表里，填出来会全跑到角落）
+    if (kind == "debug" and cfg.get("lbdFromRegion", True)
+            and _lr_extract_debug is not None):
+        try:
+            r = _lr_extract_debug(jp, out_path, prefix=pre, page_map=pgmap)
+        except Exception as e:
+            r = {"ok": False, "error": str(e)}
+        if r.get("ok") and r["lbd"]:
+            detail.update(lbd=r["lbd"], str=r["str"], pos="region")
+            _tip = ""
+            if pgmap:
+                _pgs = sorted(pgmap)
+                _tip = ("；识别到 %d 页图纸（PDF 第 %d~%d 页），已按底图顺序重编号 1~%d"
+                        % (len(pgmap), _pgs[0], _pgs[-1], len(pgmap)))
+            return True, ("识别结果：LBD %d 个（位置=识别到的 LBD 区域框中心）"
+                          " + 支架号 %d 个（按 LBD 分组行优先编号）%s"
+                          % (r["lbd"], r["str"], _tip)), detail
+
+    # 3) LBD 行：Python 从 PDF 文字层提（位置=图纸上 LBD 文字的正下方）—— 老行为 / 关掉开关时走这条
     pdf_err = ""
     if pdf and os.path.exists(pdf):
         ok, err = extract_lbd(pdf, out_path, p0, p1, prog=prog_path, page_map=pgmap)
@@ -1546,6 +1566,7 @@ class MainWindow(QMainWindow):
                                    ("useAI", "使用AI自动识别(无需手动框)", False),
                                    ("regionAuto", "生成时自动导出 LBD区域/支架范围", True),
                                    ("regionFit", "生成布局后按 LBD 区域上下限对准视口", True),
+                                   ("lbdFromRegion", "LBD 标签按识别到的区域位置填（不勾=按 PDF 里的 LBD 文字位置）", True),
                                    ("rackAuto", "支架类型自动读识别结果(免手填)", True)]:
                 cb = QCheckBox(txt)
                 cb.setChecked(init)
@@ -1853,6 +1874,7 @@ class MainWindow(QMainWindow):
         c["useAI"] = self.checkbox["useAI"].isChecked()
         c["regionAuto"] = self.checkbox["regionAuto"].isChecked()
         c["regionFit"] = self.checkbox["regionFit"].isChecked()
+        c["lbdFromRegion"] = self.checkbox["lbdFromRegion"].isChecked()
         c["rackAuto"] = self.checkbox["rackAuto"].isChecked()
         c["labelWhere"] = "M"          # 固定模型空间（界面不再给「当前布局」选项）
         # 支架类型明细行(每类一行)优先：类型自动来自识别结果，拆不拆按行选；
@@ -1881,6 +1903,7 @@ class MainWindow(QMainWindow):
         self.checkbox["useAI"].setChecked(bool(c.get("useAI")))
         self.checkbox["regionAuto"].setChecked(bool(c.get("regionAuto", True)))
         self.checkbox["regionFit"].setChecked(bool(c.get("regionFit", True)))
+        self.checkbox["lbdFromRegion"].setChecked(bool(c.get("lbdFromRegion", True)))
         self.checkbox["rackAuto"].setChecked(bool(c.get("rackAuto", True)))
         # 记忆每个支架类型的长度/拆分，明细行重建时套用
         self._rack_len_pref = {}
