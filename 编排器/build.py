@@ -107,12 +107,22 @@ def main():
     log("[1/3] 生成图标 ...")
     subprocess.run([PY, os.path.join(HERE, "make_icon.py")], cwd=HERE, check=False)
 
-    # 旧 exe 先挪走：这样后面只要 exe 存在，就保证是这次新产出的
+    # 旧 exe 先挪走：这样后面只要 exe 存在，就保证是这次新产出的。
+    # 注意：正在运行的那份 exe 会被 Windows 锁住（重命名/删除都失败），
+    # 这时直接提示"先关掉程序"，别打到一半再报权限错误。
     old = EXE + ".old"
     if os.path.exists(old):
-        os.remove(old)
+        try:
+            os.remove(old)
+        except Exception:
+            log("  提示：删不掉旧的 %s（多半是它还在运行），先留着，不影响本次打包。" % os.path.basename(old))
     if os.path.exists(EXE):
-        os.replace(EXE, old)
+        try:
+            os.replace(EXE, old)
+        except Exception as e:
+            log("[失败] 旧 exe 挪不动（%s）：多半是 Voltage-CAD MAP 正在运行。" % e)
+            log("       请先关掉正在运行的程序（任务管理器里结束 Voltage-CAD MAP），再重新打包。")
+            return 1
 
     log("[2/3] PyInstaller 打包中（约 1 分钟）...")
     args = [PY, "-m", "PyInstaller", "--onefile", "--windowed",

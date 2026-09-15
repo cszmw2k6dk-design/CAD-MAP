@@ -521,13 +521,32 @@ def _row_major(items, med_h):
     return sorted(items, key=lambda it: (ri(it[1]), it[0]))
 
 
-def rack_lines_from_debug(json_path, prefix="STR", digits=2):
+def debug_page_map(json_path):
+    """识别结果 debug JSON 里有图纸的页号 -> {真实页号: 图纸顺序号(1..N)}。
+
+    CAD 侧是按「第几张底图」当页号的，而 PDF 常有封面/说明页，真实页码和底图顺序对不上，
+    所以统一按"识别到的图纸页、页码升序"重编号。
+    """
+    with open(json_path, encoding="utf-8") as f:
+        doc = json.load(f)
+    pages = set()
+    for key in ("yolo_tracker_detection_results", "yolo_box_detection_results",
+                "ocr_node_name_results"):
+        for p in doc.get(key) or []:
+            pg = p.get("page_number")
+            if isinstance(pg, int):
+                pages.add(pg)
+    return {pg: i + 1 for i, pg in enumerate(sorted(pages))}
+
+
+def rack_lines_from_debug(json_path, prefix="STR", digits=2, page_map=None):
     """识别结果 debug JSON -> 支架号行（L 行：页号 fx fy STRxx 角度 字高占页比）。
 
     按所属 LBD 区域(Node 框) 分组、组内行优先（上→下、左→右）编号，每组从 01 起；
     竖条 90°、横条 0°，字高按框短边。没落在任何 LBD 区域里的支架不编号 ——
     和 frame_detect/map_lbd_str.py 的规则一致（那种框视为干扰）。
 
+    page_map: {真实页号: 图纸顺序号}，给了就重编号并跳过不在里面的页（CAD 侧按底图顺序认页号）。
     返回 (行列表, 支架数, 有支架的页数)。
     """
     with open(json_path, encoding="utf-8") as f:
@@ -543,6 +562,9 @@ def rack_lines_from_debug(json_path, prefix="STR", digits=2):
     for pg in sorted(p for p in trk if isinstance(p, int)):
         W, H = page_size.get(pg, (0, 0))
         if not W or not H:
+            continue
+        pg_out = pg if page_map is None else page_map.get(pg)
+        if pg_out is None:
             continue
         nodes, typs = [], []
         for d in (trk.get(pg) or {}).get("detections") or []:
@@ -575,7 +597,7 @@ def rack_lines_from_debug(json_path, prefix="STR", digits=2):
                 bw, bh = b["x2"] - b["x1"], b["y2"] - b["y1"]
                 ang = 90 if bh > bw else 0
                 lines.append("L\t%d\t%.6f\t%.6f\t%s\t%d\t%.6f"
-                             % (pg, cx / float(W), 1.0 - cy / float(H), nm, ang,
+                             % (pg_out, cx / float(W), 1.0 - cy / float(H), nm, ang,
                                 min(bw, bh) / float(H)))
                 n_str += 1
     return lines, n_str, n_pages

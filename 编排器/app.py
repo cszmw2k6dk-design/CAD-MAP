@@ -21,6 +21,7 @@ try:
                              sniff_json_kind as _lr_json_kind,
                              extract_lines_from_debug as _lr_extract_debug,
                              rack_lines_from_debug as _lr_rack_lines,
+                             debug_page_map as _lr_page_map,
                              rack_types_from_json as _lr_rack_types,
                              rack_types_text as _lr_rack_text,
                              summary_text as _lr_summary)
@@ -29,10 +30,11 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_page_bounds = _lr_write_regions = None
     _lr_json_kind = _lr_extract_debug = None
     _lr_rack_lines = None
+    _lr_page_map = None
     _lr_rack_types = _lr_rack_text = _lr_summary = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.17.8"
+APP_VERSION = "2.17.9"
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
@@ -59,7 +61,7 @@ DEFAULTS = {
     "regionOut": "", "regionAuto": True,
     "pageStart": "1", "pageEnd": "0", "templateLayout": "", "count": "0", "filter": "pdf",
     "margin": "5",
-    "textHeight": "0.15", "labelBgColor": "1", "labelBgGap": "1.0",
+    "textHeight": "0", "labelBgColor": "1", "labelBgGap": "1.0",
     "rackPrefix": "STR",
     "rackTypes": "", "rackSplit": "不拆", "rackStringLen": "",
     "rackAuto": True, "rackSplitByType": "",
@@ -258,9 +260,11 @@ def pdf_page_range_count(cfg):
     return pe - ps + 1, "起始 %d ~ 结束 %d，共 %d 页（PDF 总页数 %d）" % (ps, pe, pe - ps + 1, total)
 
 
-def extract_lbd(pdf, out, pageStart, pageEnd, prog=None):
+def extract_lbd(pdf, out, pageStart, pageEnd, prog=None, page_map=None):
     # 等价于 pdf_extract.py：就地用已打包的 pypdf 提取 LBD 标签坐标，
     # 写出的 P/L 制表符格式与 LSP 的 PdfLayout_ReadExtractFile 期望一致。
+    # page_map: {PDF 真实页号: 图纸顺序号}；给了就按它重编号，映射里没有的页整页跳过
+    #           （CAD 侧是按「第几张底图」当页号的，不是 PDF 页码）。
     # 返回 (ok, err)。
     try:
         from pypdf import PdfReader
@@ -332,9 +336,12 @@ def extract_lbd(pdf, out, pageStart, pageEnd, prog=None):
             page.extract_text(visitor_text=visit_text)
         except Exception:
             items = []
+        pg_out = idx + 1 if page_map is None else page_map.get(idx + 1)
+        if pg_out is None:
+            continue                       # 这一页不在识别到的图纸页里（封面/说明页等）
         title = "".join(all_text[:100])
         lines.append("P\t%d\t%.2f\t%.2f\t%s"
-                     % (idx + 1, pw, ph, title[:150].replace("\t", " ").replace("\n", " ")))
+                     % (pg_out, pw, ph, title[:150].replace("\t", " ").replace("\n", " ")))
         for it in items:
             if "LBD" not in it[0].upper():
                 continue
@@ -344,7 +351,7 @@ def extract_lbd(pdf, out, pageStart, pageEnd, prog=None):
             fx = (cx - x0) / pw
             fy = (cy - y0) / ph
             lines.append("L\t%d\t%.6f\t%.6f\t%s"
-                         % (idx + 1, fx, fy, it[0].replace("\t", " ").replace("\n", " ")))
+                         % (pg_out, fx, fy, it[0].replace("\t", " ").replace("\n", " ")))
         if prog:
             try:
                 with open(prog, "w", encoding="utf-8") as f:
@@ -497,6 +504,16 @@ def build_extract_file(cfg, out_path, prog_path=None):
             kind = ""
     detail["kind"] = kind
 
+    # 图纸页号 -> 底图顺序号：CAD 侧按「第几张底图」认页号，PDF 里的封面/说明页会让两者错位，
+    # 所以按识别结果里出现过的页、页码升序重编号（这一步同时把样板文字页滤掉）。
+    pgmap = None
+    if kind == "debug" and _lr_page_map is not None:
+        try:
+            pgmap = _lr_page_map(jp)
+        except Exception:
+            pgmap = None
+    detail["pages"] = len(pgmap) if pgmap else 0
+
     # 1) 标注/编号结果：LBD 名称 + 支架号都在 JSON 里
     if kind == "anylabeling":
         n, nn, nt = json_to_extract(jp, out_path, pre)
@@ -507,7 +524,7 @@ def build_extract_file(cfg, out_path, prog_path=None):
     # 2)/3) LBD 行：Python 从 PDF 文字层提（位置就是图纸上 LBD 文字的位置）
     pdf_err = ""
     if pdf and os.path.exists(pdf):
-        ok, err = extract_lbd(pdf, out_path, p0, p1, prog=prog_path)
+        ok, err = extract_lbd(pdf, out_path, p0, p1, prog=prog_path, page_map=pgmap)
         if ok:
             detail["pdf_lbd"] = True
             detail["lbd"] = _count("L\t")
@@ -518,7 +535,7 @@ def build_extract_file(cfg, out_path, prog_path=None):
     rack_err = ""
     if kind == "debug" and _lr_rack_lines is not None:
         try:
-            rl, nstr, _np = _lr_rack_lines(jp, pre)
+            rl, nstr, _np = _lr_rack_lines(jp, pre, page_map=pgmap)
         except Exception as e:
             rl, nstr, rack_err = [], 0, str(e)
         if rl:
@@ -549,9 +566,12 @@ def build_extract_file(cfg, out_path, prog_path=None):
         why = pdf_err or rack_err or ("这份 JSON 不是识别结果，也不是标注结果（没有 Node/Tracker 也没有 shapes）"
                                       if jp else "没有 PDF、也没有识别结果 JSON")
         return False, "没能生成任何标签行：%s" % why, detail
+    tip = ""
+    if pgmap:
+        tip = "；识别到 %d 页图纸，已按底图顺序重编号 1~%d" % (len(pgmap), len(pgmap))
     return True, ("标签 %d 行：LBD %d 个（Python 从 PDF 文字层识别）"
-                  " + 支架号 %d 个（按 LBD 分组行优先编号）"
-                  % (detail["lbd"] + detail["str"], detail["lbd"], detail["str"])), detail
+                  " + 支架号 %d 个（按 LBD 分组行优先编号）%s"
+                  % (detail["lbd"] + detail["str"], detail["lbd"], detail["str"], tip)), detail
 
 
 def prepare_region_file(cfg, extra_dirs=()):
@@ -900,11 +920,23 @@ def auto_worker(cfg, ini, prog, bus):
             except Exception:
                 _sbg_g = 1.0
             _rp = rack_prefix(cfg).replace('"', "")      # 支架号前缀：LISP 端按它认支架号
+            # 字高：UI「标签高度」填 0/空 = 自动（按支架框短边推算），填正数 = 用这个固定字高。
+            # 以前 AI 侧一直是 0.15 模型单位，图上大一点就看不见（就是"画了一个也没有"的原因）。
+            try:
+                _thv = float(str(cfg.get("textHeight", "0")).strip() or 0)
+            except Exception:
+                _thv = 0.0
+            if _thv > 0:
+                _auto_h, _txt_h = "nil", ("%.6g" % _thv)
+            else:
+                _auto_h, _txt_h = "T", "0.15"
             _strbg = ("(setq *PdfLayout_AiStrBgOn* %s)\n"
                       "(setq *PdfLayout_AiStrBgColor* %s)\n"
                       "(setq *PdfLayout_AiStrBgGap* %s)\n"
                       "(setq *PdfLayout_AiStrPrefix* \"%s\")\n"
-                      % (_sbg_on, _sbg_c, _sbg_g, _rp))
+                      "(setq *PdfLayout_AiStrAutoH* %s)\n"
+                      "(setq *PdfLayout_AiTextH* %s)\n"
+                      % (_sbg_on, _sbg_c, _sbg_g, _rp, _auto_h, _txt_h))
             cmd = ("(load %s)\n(load %s)\n(load %s)\n"
                    "(setq *PdfLayout_GridAutoFile* %s)\n(setq *PdfLayout_AiPage* %s)\n"
                    "%s"

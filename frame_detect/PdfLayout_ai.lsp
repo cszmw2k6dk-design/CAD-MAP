@@ -101,7 +101,7 @@
   (princ "[AI] read-labels...")
   (setq labels (PdfLayout_AiReadLabels *PdfLayout_GridAutoFile* *PdfLayout_AiPage*))
   (if (not labels)
-    (princ "\n[AI] no labels.")
+    (progn (princ "\n[AI] no labels.") nil)
     (progn
       (princ "[AI] draw...")
       (setq doc (vla-get-ActiveDocument (vlax-get-Acad-Object)))
@@ -154,7 +154,10 @@
   (setq r (vl-catch-all-apply 'PdfLayout_AiAutoRun nil))
   (if (vl-catch-all-error-p r)
     (princ (strcat "\n[AI] ERR: " (vl-catch-all-error-message r)))
-    (if r (princ (strcat "\n[AI] 已绘制 " (itoa (fix r)) " 个标签。"))))
+    (if (numberp r)
+      (princ (strcat "\n[AI] 已绘制 " (itoa (fix r)) " 个标签。"))
+      (princ "\n[AI] 这次没有可画的标签（STR 号）。")
+    ))
   (princ)
 )
 
