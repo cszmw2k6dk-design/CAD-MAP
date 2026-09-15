@@ -95,6 +95,15 @@ def main():
     if not os.path.exists(plugin_lsp):
         raise SystemExit("缺少插件：%s" % plugin_lsp)
 
+    # 连 CAD 走 COM，打包环境必须能 import pywin32；少了它打出来的 exe 一点「执行输出」
+    # 就报 No module named 'pythoncom'（pywin32-ctypes 不算）。
+    try:
+        import pythoncom  # noqa: F401
+        import win32com.client  # noqa: F401
+    except Exception as e:
+        log("[警告] 这个 Python 里没有 pywin32（%s），打出来的 exe 会连不上 CAD。" % e)
+        log("       先执行：%s -m pip install pywin32 再打包。" % PY)
+
     log("[1/3] 生成图标 ...")
     subprocess.run([PY, os.path.join(HERE, "make_icon.py")], cwd=HERE, check=False)
 

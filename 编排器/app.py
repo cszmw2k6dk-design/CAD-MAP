@@ -699,8 +699,14 @@ def auto_worker(cfg, ini, prog, bus):
         except Exception as e:
             bus.prog.emit("区域范围写入 ini 失败：" + str(e))
 
-        import pythoncom
-        import win32com.client as win32
+        try:
+            import pythoncom
+            import win32com.client as win32
+        except Exception as e:
+            bus.err.emit("连接 CAD 需要 pywin32（pythoncom / win32com），这个 Python 里没有：%s\n"
+                         "  源码运行：pip install pywin32\n"
+                         "  打包版：打包用的那个 Python 也要装 pywin32，装完重新打包" % e)
+            return
         pythoncom.CoInitialize()
         bus.prog.emit("1/4 连接/启动 CAD…")
         conn_stop = threading.Event()
@@ -1017,7 +1023,11 @@ def save_worker(path, bus):
         doc.SendCommand('(command "._SAVEAS" "" "%s")\n' % path.replace("\\", "/"))
         bus.save_result.emit(True, path)
     except Exception as e:
-        bus.save_result.emit(False, str(e))
+        msg = str(e)
+        if "pythoncom" in msg or "win32com" in msg or "pywintypes" in msg:
+            msg = ("连接 CAD 需要 pywin32（pythoncom）：%s\n"
+                   "请 pip install pywin32 后重试；打包版要用装了 pywin32 的 Python 重新打包。" % msg)
+        bus.save_result.emit(False, msg)
     finally:
         if pythoncom is not None:
             try:

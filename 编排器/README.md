@@ -145,6 +145,9 @@ CAD 插件本身仍保留 `labelWhere=L` 的分支，手工改 ini 还能用，�
   - 其它参数：`--version 2.18.0`、`--skip-build`、`--no-push`、`--no-release`、`--note "补充说明"`
   - 打包用的 Python 按这个顺序找：`C:\pybuild\python` → 仓库里 `_pyinstaller_tool` → 上一级 `.build-venv` → PATH 里的 python，
     要求能 `import PyInstaller, PySide6`
+  - 打包用的 Python **还必须装 pywin32**（`pip install pywin32`）：连 CAD 走 COM，少了它打出来的 exe
+    一点「执行输出」就报 `No module named 'pythoncom'`（`pywin32-ctypes` 是 PyInstaller 的依赖，不算）。
+    `build.py` 打包前会检查并给出警告。
   - 建 Release 二选一：装了 GitHub CLI（`gh auth login` 过）或设了 `GITHUB_TOKEN` / `GH_TOKEN`；
     都没有时只打包 + 提示手动发布的步骤
 - `同步.bat`：只提交推送，不打包不发版
