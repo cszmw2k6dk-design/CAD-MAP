@@ -1046,6 +1046,18 @@ class Bus(QObject):
     upd_ready = Signal(str)
 
 
+class NoWheelCombo(QComboBox):
+    """下拉框：滚轮不切换选项，只能点开列表选。
+
+    Qt 默认鼠标停在下拉框上滚滚轮就会改值，翻页/滚动时很容易误改；
+    这里直接忽略滚轮事件（事件会被忽略并传给父级，所以页面照常滚动；
+    点开后的列表里照样能用滚轮翻选项）。
+    """
+
+    def wheelEvent(self, e):
+        e.ignore()
+
+
 class DrawGrid(QWidget):
     def __init__(self):
         super().__init__()
@@ -1370,7 +1382,7 @@ class MainWindow(QMainWindow):
                 lb.setObjectName("FieldLabel")
                 form.addWidget(lb, r, 0)
                 if key == "strBgColor":
-                    cb = QComboBox()
+                    cb = NoWheelCombo()
                     cb.setObjectName("Field")
                     cb.setMinimumWidth(320)
                     for cname, aci in COLOR_CHOICES:
@@ -1378,7 +1390,7 @@ class MainWindow(QMainWindow):
                     self.combo[key] = cb
                     form.addWidget(cb, r, 1)
                 elif key == "strBgOn":
-                    cb = QComboBox()
+                    cb = NoWheelCombo()
                     cb.setObjectName("Field")
                     cb.setMinimumWidth(320)
                     cb.addItem("开", "1")
@@ -1405,7 +1417,7 @@ class MainWindow(QMainWindow):
                 lb.setObjectName("FieldLabel")
                 form.addWidget(lb, row, 0)
                 if key == "labelBgColor":
-                    cb = QComboBox()
+                    cb = NoWheelCombo()
                     cb.setObjectName("Field")
                     cb.setMinimumWidth(320)
                     for name, aci in COLOR_CHOICES:
@@ -1512,7 +1524,7 @@ class MainWindow(QMainWindow):
             cnt = tp.get("total_count")
             cl = QLabel(str(cnt) if cnt is not None else "—")
             self.rack_grid.addWidget(cl, i + 1, 3)
-            cb = QComboBox()
+            cb = NoWheelCombo()
             cb.setObjectName("Field")
             cb.setMinimumWidth(90)
             for opt in ("不拆", "2行", "3行"):
