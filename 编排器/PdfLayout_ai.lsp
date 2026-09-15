@@ -219,8 +219,14 @@
                 (setq *PdfLayout_LbdBgColor* oldBg *PdfLayout_LbdGap* oldGap)
               )
             )
-            ;; 标签几何中心 = 识别框几何中心(包围盒校正)
-            (vl-catch-all-apply 'PdfLayout_AiCenterAt (list m pt))
+            ;; 标签几何中心 = 识别框几何中心:
+            ;; 先按「中点对齐(5) + 插入点=目标点」放 —— 和 LBD 标签同一套，ZWCAD 里稳；
+            (vl-catch-all-apply 'vla-put-AttachmentPoint (list m 5))
+            (vl-catch-all-apply 'vla-put-InsertionPoint (list m (vlax-3d-point pt)))
+            ;; 只有不旋转的文字才再用包围盒校一次；旋转过的文字包围盒在 ZWCAD 里不准，
+            ;; 二次校正会把整排号推偏（实测往右偏约一个支架宽）。
+            (if (= ang 0.0)
+              (vl-catch-all-apply 'PdfLayout_AiCenterAt (list m pt)))
             (setq i (1+ i))
             (if (= (rem i 5) 0)
               (vl-catch-all-apply 'PdfLayout_Prog

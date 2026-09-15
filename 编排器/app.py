@@ -34,7 +34,7 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_rack_types = _lr_rack_text = _lr_summary = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.17.11"
+APP_VERSION = "2.17.12"
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
