@@ -44,6 +44,12 @@ REPO_RE = re.compile(r'^UPDATE_REPO\s*=\s*"([^"]+)"', re.M)
 ASSET_RE = re.compile(r'^UPDATE_ASSET\s*=\s*"([^"]+)"', re.M)
 
 
+def asset_key(name):
+    """附件名归一化：GitHub 会把空格换成点（Voltage-CAD MAP.exe -> Voltage-CAD.MAP.exe），
+    比较时忽略所有非字母数字，否则旧附件删不掉、再传同名会 422 Validation Failed。"""
+    return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+
+
 def log(msg=""):
     """打印中文；控制台代码页不认时退化成可打印字符，不炸掉。"""
     try:
@@ -268,14 +274,22 @@ def do_release_api(repo, tag, exe, notes, token):
         return False
     rid = js.get("id")
     name = os.path.basename(exe)
-    for a in js.get("assets") or []:      # 同名附件先删，避免 422
-        if a.get("name") == name:
+    # GitHub 会把附件名里的空格换成点（"Voltage-CAD MAP.exe" -> "Voltage-CAD.MAP.exe"），
+    # 按原名比会漏掉旧附件，再传同名就 422 Validation Failed，所以按归一化后的名字比。
+    for a in js.get("assets") or []:
+        if asset_key(a.get("name")) == asset_key(name):
             api(token, "DELETE", "%s/releases/assets/%s" % (api_root, a.get("id")))
     with open(exe, "rb") as f:
         blob = f.read()
     up = "https://uploads.github.com/repos/%s/releases/%s/assets?name=%s" % (
         repo, rid, urllib.parse.quote(name))
     st, js = api(token, "POST", up, raw=blob)
+    if st == 422:                          # 可能还有残留同名附件，再清一次重试
+        st2, js2 = api(token, "GET", "%s/releases/%s" % (api_root, rid))
+        for a in (js2.get("assets") or []):
+            if asset_key(a.get("name")) == asset_key(name):
+                api(token, "DELETE", "%s/releases/assets/%s" % (api_root, a.get("id")))
+        st, js = api(token, "POST", up, raw=blob)
     if st in (200, 201):
         log("[Release] 已建 %s 并传上 %s" % (tag, name))
         return True
