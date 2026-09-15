@@ -7,10 +7,10 @@ binaries += collect_dynamic_libs('shiboken6')
 
 
 a = Analysis(
-    ['C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/CAD-MAP-main/编排器/app.py'],
+    ['C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/_sync_repo/编排器/app.py'],
     pathex=[],
     binaries=binaries,
-    datas=[('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/CAD-MAP-main/编排器/app_icon.png', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/CAD-MAP-main/编排器/logo_blue.png', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/CAD-MAP-main/编排器/PdfLayout_auto.lsp', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/CAD-MAP-main/编排器/PdfLayout_ai.lsp', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/CAD-MAP-main/PdfLayout插件包/PdfLayout.lsp', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/.build-venv/Lib/site-packages/PySide6/plugins/platforms', 'PySide6/plugins/platforms'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/.build-venv/Lib/site-packages/PySide6/plugins/styles', 'PySide6/plugins/styles')],
+    datas=[('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/_sync_repo/编排器/app_icon.png', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/_sync_repo/编排器/logo_blue.png', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/_sync_repo/编排器/PdfLayout_auto.lsp', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/_sync_repo/编排器/PdfLayout_ai.lsp', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/_sync_repo/PdfLayout插件包/PdfLayout.lsp', '.'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/.build-venv/Lib/site-packages/PySide6/plugins/platforms', 'PySide6/plugins/platforms'), ('C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/.build-venv/Lib/site-packages/PySide6/plugins/styles', 'PySide6/plugins/styles')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -40,5 +40,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/CAD-MAP-main/编排器/app.ico'],
+    icon=['C:/Users/ZhaokeShi/Downloads/CAD-MAP-main/_sync_repo/编排器/app.ico'],
 )

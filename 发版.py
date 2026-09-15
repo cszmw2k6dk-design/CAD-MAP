@@ -147,9 +147,52 @@ def find_git():
 
 
 def git(git_exe, args, timeout=600):
-    cmd = [git_exe, "-c", "safe.directory=%s" % ROOT] + args
+    cmd = [git_exe] + git_identity(git_exe) + ["-c", "safe.directory=%s" % ROOT] + args
+    env = git_env(git_exe)
     return subprocess.run(cmd, cwd=ROOT, capture_output=True, timeout=timeout,
-                          text=True, encoding="utf-8", errors="replace")
+                          text=True, encoding="utf-8", errors="replace", env=env)
+
+
+def git_identity(git_exe):
+    """机器上没配 git 身份时给个占位身份（以前的提交就是 MAP-CAD sync <sync@local>）。
+
+    没配 user.email 时 `git commit` 会直接失败「Please tell me who you are」，
+    表现是 git add 做完了却没提交，所以这里必须兜一下。
+    """
+    for k in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
+        if (os.environ.get(k) or "").strip():
+            return []
+    try:
+        r = subprocess.run([git_exe, "config", "user.email"], capture_output=True,
+                           timeout=30, text=True, encoding="utf-8", errors="replace",
+                           env=git_env(git_exe))
+        if r.returncode == 0 and (r.stdout or "").strip():
+            return []
+    except Exception:
+        pass
+    return ["-c", "user.name=MAP-CAD sync", "-c", "user.email=sync@local"]
+
+
+def git_env(git_exe):
+    """给 git 补上 https 远程助手（git-remote-https）所在目录。
+
+    Codex 自带的 git 是精简版：git-remote-https.exe / libcurl 都在 mingw64\\bin 里，
+    默认 PATH 和 exec-path 都没带上，直接跑会报「git: 'remote-https' is not a git command」。
+    这里把同级目录补进 PATH，并把 GIT_EXEC_PATH 指过去。
+    """
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"          # 别卡在交互式账号密码上
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(git_exe)))
+        for sub in ("mingw64\\bin", "usr\\bin", "bin", "mingw64\\libexec\\git-core"):
+            d = os.path.join(root, sub)
+            if os.path.isdir(d):
+                env["PATH"] = d + os.pathsep + env.get("PATH", "")
+                if not env.get("GIT_EXEC_PATH"):
+                    env["GIT_EXEC_PATH"] = d
+    except Exception:
+        pass
+    return env
 
 
 # ---------------- 打包 ----------------
