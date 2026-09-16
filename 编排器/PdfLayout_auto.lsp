@@ -8,6 +8,10 @@
 ;;;=============================================================
 (vl-load-com)
 
+;; LBD 标签字高：0 = 不用 LBD 区域宽算（回到老逻辑：填固定字高 / 自动按底图尺寸）
+;; 想重新启用"LBD 区域宽 x 倍数"就把它改成 >0（例如 1.4）
+(setq *PdfLayout_LbdRegionScale* 0.0)
+
 ;;; 进度写入(覆盖写，供外部轮询)
 (defun PdfLayout_Prog (msg)
   (if *PdfLayout_ProgPath*
@@ -88,8 +92,53 @@
   ok
 )
 
+;; 稳定排序：不用 vl-sort —— 中望/AutoCAD 的 vl-sort 会把"相等"的元素丢掉
+(defun PdfLayout_AutoIns (lst x cmp / out done y)
+  (setq out nil done nil)
+  (foreach y lst
+    (if (and (not done) (apply cmp (list x y)))
+      (progn (setq out (append out (list x y))) (setq done T))
+      (setq out (append out (list y)))
+    )
+  )
+  (if (not done) (setq out (append out (list x))))
+  out
+)
+
+(defun PdfLayout_AutoStableSort (lst cmp / out x)
+  (foreach x lst
+    (setq out (PdfLayout_AutoIns out x cmp))
+  )
+  out
+)
+
+;; 一页的 LBD 标签重排：先按 fy(第3位) 从大到小分排(容差 0.02)，排内按 fx(第2位) 从左到右
+;; 元素就是提取文件里的 L 行：(页号 fx fy 文本 角度 字高)
+(defun PdfLayout_LbdRowSort (lst tol / byFy rows cur out e r)
+  (if (not lst)
+    nil
+    (progn
+      (setq byFy (PdfLayout_AutoStableSort lst '(lambda (a b) (> (caddr a) (caddr b)))))
+      (setq rows nil cur nil)
+      (foreach e byFy
+        (if (or (not cur) (> (abs (- (caddr e) (caddr (car cur)))) tol))
+          (progn (if cur (setq rows (append rows (list cur)))) (setq cur (list e)))
+          (setq cur (append cur (list e)))
+        )
+      )
+      (if cur (setq rows (append rows (list cur))))
+      (setq out nil)
+      (foreach r rows
+        (setq out (append out
+                     (PdfLayout_AutoStableSort r '(lambda (a b) (< (cadr a) (cadr b))))))
+      )
+      out
+    )
+  )
+)
+
 ;;; LBD 自动识别并填写标签(非交互)
-(defun PdfLayout_LbdAuto (pdf xlsx pgStart pgEnd txtH labelWhere bgColor bgGap / ok autoTxt maxDim uu bbu doc actLay blk vp ptUse runOk wait nSeen)
+(defun PdfLayout_LbdAuto (pdf xlsx pgStart pgEnd txtH labelWhere bgColor bgGap / ok autoTxt maxDim uu bbu doc actLay blk vp ptUse runOk wait nSeen hgtR txtHi pgIt pit)
   (setq autoTxt (or (not txtH) (<= txtH 0.0)))
   (setq outPath (if *PdfLayout_LbdPre* *PdfLayout_LbdOut* (strcat (getvar "TEMPPREFIX") "pdflbd_extract.txt")))
   (setq progPath (strcat (getvar "TEMPPREFIX") "pdflbd_progress.txt"))
@@ -174,23 +223,18 @@
             (setq pmin (car bb) pmax (cadr bb))
             (setq bw (- (car pmax) (car pmin)))
             (setq bh (- (cadr pmax) (cadr pmin)))
-            (setq pgXs nil)
-            (foreach it validItems
-              (if (= (car it) pgnum)
-                (setq pgXs (append pgXs (list (list (cadr it) (caddr it)))))
+            ;; 这一页的 LBD 标签先按「行(上→下) + 行内 x(左→右)」排好 —— 后面按这个顺序画，
+            ;; 才有"隔一个往下错一行"的整齐效果（原来是按提取文件里的先后顺序画）
+            (setq pgIt nil)
+            (foreach pit validItems
+              (if (= (car pit) pgnum)
+                (setq pgIt (append pgIt (list pit)))
               )
             )
-            (setq minGap 1e9)
-            (foreach a pgXs
-              (foreach b pgXs
-                (if (and (not (equal a b)) (< (abs (- (cadr a) (cadr b))) 0.02))
-                  (setq minGap (min minGap (abs (- (car a) (car b)))))
-                )
-              )
-            )
+            (setq pgIt (PdfLayout_LbdRowSort pgIt (/ (* 4.0 txtH) (if (> bh 0.0) bh 1.0))))
             (setq curRowFy nil curLane 0 lastRight nil)
 
-            (foreach it validItems
+            (foreach it pgIt
               (if (= (car it) pgnum)
                 (progn
                   (setq nSeen (1+ nSeen))
@@ -198,6 +242,14 @@
                     (PdfLayout_Prog (strcat "LBD_LABEL " (itoa nSeen)))
                   )
                   (setq fx (cadr it) fy (caddr it) stext (cadddr it))
+                  ;; LBD 字高：自动档且 L 行带第 7 列(LBD 区域宽/页高) -> 区域宽 x 底图高 x 倍数；
+                  ;; 没有第 7 列(按 PDF 文字层识别)或填了固定字高时，用原来的 txtH
+                  (setq hgtR (if (nth 5 it) (nth 5 it) 0.0))
+                  (setq txtHi (if (and autoTxt (> hgtR 0.0) (> bh 0.0)
+                                       (numberp *PdfLayout_LbdRegionScale*)
+                                       (> *PdfLayout_LbdRegionScale* 0.0))
+                                (* hgtR bh *PdfLayout_LbdRegionScale*)
+                                txtH))
                   (setq num (PdfLayout_LbdNumFromText stext))
                   (if num
                     (progn
@@ -210,20 +262,20 @@
                       ;; LBD 标签只认 Excel 映射: 查不到就不画, 不用 PDF 原文兜底, 也不编造 "LBD-xx"
                       (if labels
                         (progn
-                          (setq natW (* txtH (+ (* 0.8 (strlen labels)) 0.2)))
-                                                    (setq lft (- mx (* natW 0.5)) rgt (+ mx (* natW 0.5)))
-                                                    (if (or (not curRowFy) (> (abs (- fy curRowFy)) 0.02))
-                                                      (progn (setq curRowFy fy curLane 0 lastRight nil))
-                                                    )
-                                                    (if (and lastRight (< lft lastRight))
-                                                      (setq curLane (1+ curLane))
-                                                      (setq curLane 0)
-                                                    )
-                                                    (setq step (* txtH 1.5))
-                          (setq laneOff (if (= curLane 0) 0.0 
-                            (if (= (rem curLane 2) 1)
-                              (* step (/ (1+ curLane) 2))
-                              (- (* step (/ curLane 2))))))
+                          ;; 上下两档错行：第1个落在区域中心线上，第2个往下错一行，第3个回中心线…
+                          (setq natW (* txtHi (+ (* 0.8 (strlen labels)) 0.2)))
+                          (setq lft (- mx (* natW 0.5)) rgt (+ mx (* natW 0.5)))
+                          (if (or (not curRowFy)
+                                  (> (abs (- fy curRowFy)) (/ (* 4.0 txtH) (if (> bh 0.0) bh 1.0))))
+                            (progn (setq curRowFy fy curLane 0 lastRight nil))
+                          )
+                          (if (and lastRight (< lft lastRight))
+                            (setq curLane (if (= curLane 1) 0 1))
+                            (setq curLane 0)
+                          )
+                          ;; 错开量：1.5 倍字高(且不小于字高+0.10) —— 下错一行后与上一个标签不再重叠
+                          (setq step (max (* txtHi 1.5) (+ txtHi 0.10)))
+                          (setq laneOff (if (= curLane 0) 0.0 step))
                           (setq ptIns (list mx (- my laneOff) 0.0))
                           (setq ptUse (if (and (= labelWhere "L") vp) (PdfLayout_ModelToPaper vp ptIns) ptIns))
                           (setq mObj (vl-catch-all-apply
@@ -232,7 +284,7 @@
                                       natW labels)))
                           (if (and mObj (not (vl-catch-all-error-p mObj)))
                             (progn
-                              (vl-catch-all-apply 'vla-put-Height (list mObj txtH))
+                              (vl-catch-all-apply 'vla-put-Height (list mObj txtHi))
                               (vl-catch-all-apply 'vla-put-BackgroundFill (list mObj :vlax-true))
                               (vl-catch-all-apply '(lambda () (vlax-put-property mObj 'BackgroundFillUseDrawingBackgroundColor :vlax-false)) nil)
                               (vl-catch-all-apply '(lambda () (vlax-put-property mObj 'BackgroundFillColor (if bgColor bgColor 1))) nil)
@@ -263,7 +315,7 @@
           )
         )
         (setq i (1+ i))
-        (PdfLayout_Prog (strcat "LBD_PAGE " (itoa pgnum)))
+        (PdfLayout_Prog (strcat "LBD_PAGE " (itoa pgnum) " " (itoa (length underlays))))
       )
       (PdfLayout_Prog (strcat "LBD_DONE " (itoa nDone)))
       (PdfLayout_Prog (strcat "LBD_STAT 匹配到页=" (itoa nSeen) " 分表名没认出=" (itoa statNoSheet) " 编号表里没有=" (itoa statNoLabel) " 分表数=" (itoa (length sheetMap))))

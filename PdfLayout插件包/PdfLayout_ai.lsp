@@ -7,17 +7,17 @@
 ;;;   pdfgridai
 ;;; fx 自左、fy 自下(与 pdf_extract.py 一致); 用 PDFATTACH 底图 bbox 映射到模型空间。
 ;;; L 行第 6/7 列可选: 角度(度)、字高比例(占页高)。STR 号由 Python 端按支架框自动给出
-;;;   (竖支架=90度, 字高比例=框短边/页高), CAD 端字高 = 字高比例 x 底图边长 x *PdfLayout_AiStrScale*。
-;;; 没有这两列时回落到固定值: *PdfLayout_AiRot* 旋转、*PdfLayout_AiTextH* 字高(不影响 LBD 标签)。
-;;; *PdfLayout_AiStrScale* STR 字高系数(默认 1.1, 比支架框略大); *PdfLayout_AiLayer* 图层
+;;;   (竖支架=90度, 字高比例=短边/页高), CAD 端字高 = 字高比例 x 底图边长 x *PdfLayout_AiStrScale*
+;;; 没有第 7 列时回落到固定值: *PdfLayout_AiRot* 旋转、*PdfLayout_AiTextH* 字高(不影响 LBD 标签)
+;;; *PdfLayout_AiStrScale* STR 字高系数(默认 1.4 = 条带宽的 1.4 倍); *PdfLayout_AiLayer* 图层
 (vl-load-com)
 (setq *PdfLayout_AiTextH* 0.15)
 (setq *PdfLayout_AiRot* 0)
-(setq *PdfLayout_AiStrScale* 1.1)
-(setq *PdfLayout_AiStrMinH* 0.15)
+(setq *PdfLayout_AiStrScale* 1.4)
+(setq *PdfLayout_AiStrMinH* 0.0)
 (setq *PdfLayout_AiStrAutoH* nil)   ; T=STR 字高按支架框自动推算; nil=用固定字高(原行为)
 (setq *PdfLayout_AiStrBgOn* T)      ; T = STR label background fill (nil = off)
-(setq *PdfLayout_AiStrBgColor* 1)   ; STR background fill color (ACI)
+(setq *PdfLayout_AiStrBgColor* 2)   ; STR background fill color (ACI)
 (setq *PdfLayout_AiStrBgGap* 1.0)   ; STR background fill gap factor
 (setq *PdfLayout_AiStrPrefix* "STR") ; rack label prefix (orchestrator sets it; CIR belongs to PDFGRID)
 (setq *PdfLayout_AiSkipLbd* T)        ; T = 不画识别出的 LBD 标签(改由 Excel 导入)
@@ -174,16 +174,16 @@
       (setq lay (PdfLayout_EnsureLayer *PdfLayout_AiLayer*))
       (PdfLayout_AiEnsureVisibleLayer *PdfLayout_AiLayer*)
       (if (not (numberp *PdfLayout_AiStrScale*))
-        (setq *PdfLayout_AiStrScale* 1.1))
+        (setq *PdfLayout_AiStrScale* 1.4))
       (if (not (numberp *PdfLayout_AiStrMinH*))
-        (setq *PdfLayout_AiStrMinH* 0.15))
+        (setq *PdfLayout_AiStrMinH* 0.0))
       (setq i 0 autoH nil usedH nil)
       (foreach it labels
         (setq name (car it) pt (list (nth 1 it) (nth 2 it)))
         (setq ang (if (numberp (nth 3 it)) (nth 3 it) *PdfLayout_AiRot*))
         (setq hgt (nth 4 it))
         ;; 字高: 默认用固定字高 *PdfLayout_AiTextH*(原行为)。
-        ;;       把 *PdfLayout_AiStrAutoH* 设为 T 时才按支架框推算(第7列 x 底图高 x 系数, 不小于下限)
+;;       当 *PdfLayout_AiStrAutoH* 为 T 时按支架框自动算(第7列 x 底图高 x *PdfLayout_AiStrScale*, 默认 1.4)；为 nil 时用固定字高 *PdfLayout_AiTextH*
         (setq txtH
               (if (and *PdfLayout_AiStrAutoH* hgt (numberp hgt) (> hgt 0.0) (> *PdfLayout_AiBoxH* 0.0))
                 (progn
@@ -269,6 +269,7 @@
             (if labs (setq total (+ total (PdfLayout_AiDrawLabels labs))))
           )
         )
+        (PdfLayout_Prog (strcat "AI_PAGE " (itoa (1+ i)) " " (itoa nU)))
         (setq i (1+ i))
       )
       (vl-catch-all-apply 'PdfLayout_Prog (list (strcat "AI_DONE " (itoa total))))

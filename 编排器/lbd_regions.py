@@ -499,26 +499,85 @@ def sniff_json_kind(path):
     return ""
 
 
-def _row_major(items, med_h):
-    """行优先排序：先按 y 分带，带内按 x 从左到右（和 frame_detect/map_lbd_str.py 同一套）。"""
+# ---------------------------------------------------------------- STR 编号顺序
+# 和插件 PDFGRID 的 8 种顺序一致（值就是界面上的序号）：
+#   1 列优先: 左→右列、列内上→下     2 行优先: 上→下行、行内左→右
+#   3 列优先: 右→左列、列内上→下     4 行优先: 下→上行、行内左→右
+#   5 列优先: 左→右列、列内下→上     6 列优先: 右→左列、列内下→上
+#   7 行优先: 上→下行、行内右→左     8 行优先: 下→上行、行内右→左
+# 值 = (主轴, 主轴方向, 带内方向)。这里的坐标是识别 JSON 的图像坐标(y 向下)，
+# 方向已按"模型空间"的语义翻译：上→下 = 图像 y 递增，下→上 = 递减。
+STR_ORDERS = {
+    "1": ("X", +1, +1),
+    "2": ("Y", +1, +1),
+    "3": ("X", -1, +1),
+    "4": ("Y", -1, +1),
+    "5": ("X", +1, -1),
+    "6": ("X", -1, -1),
+    "7": ("Y", +1, -1),
+    "8": ("Y", -1, -1),
+}
+STR_ORDER_LABELS = [
+    ("1 列优先: 左→右列、列内上→下", "1"),
+    ("2 行优先: 上→下行、行内左→右", "2"),
+    ("3 列优先: 右→左列、列内上→下", "3"),
+    ("4 行优先: 下→上行、行内左→右", "4"),
+    ("5 列优先: 左→右列、列内下→上", "5"),
+    ("6 列优先: 右→左列、列内下→上", "6"),
+    ("7 行优先: 上→下行、行内右→左", "7"),
+    ("8 行优先: 下→上行、行内右→左", "8"),
+]
+DEFAULT_STR_ORDER = "2"
+
+
+def norm_order(order):
+    """把界面传来的顺序值归一到 "1".."8"（不合法就用默认 "2"）。"""
+    key = str(order if order is not None else "").strip()
+    return key if key in STR_ORDERS else DEFAULT_STR_ORDER
+
+
+def _band(vals, tol):
+    """把一串坐标按容差分带，返回每带的中心（升序）。"""
+    if not vals:
+        return []
+    vals = sorted(vals)
+    out, cur = [], [vals[0]]
+    for v in vals[1:]:
+        if v - cur[-1] <= tol:
+            cur.append(v)
+        else:
+            out.append(sum(cur) / len(cur))
+            cur = [v]
+    out.append(sum(cur) / len(cur))
+    return out
+
+
+def sort_items_by_order(items, med_h, order=DEFAULT_STR_ORDER, med_w=None):
+    """按 8 种顺序排 items=[(cx, cy, bbox), ...]；默认 "2" 与原来的行优先一致。
+
+    主轴是"带"的方向（X=按列分带，Y=按行分带），带内再按次方向排。
+    容差取典型尺寸的 0.6 倍，避免同一行/列被拆开。
+    """
     if not items:
         return []
+    axis, main_dir, sec_dir = STR_ORDERS[norm_order(order)]
+    med = med_w if (axis == "X" and med_w) else med_h
+    tol = max(1.0, float(med or 0.0) * 0.6)
+    pm = (lambda it: it[0]) if axis == "X" else (lambda it: it[1])
+    ps = (lambda it: it[1]) if axis == "X" else (lambda it: it[0])
+    bands = _band([pm(it) for it in items], tol)
 
-    def band(vals, tol):
-        vals = sorted(vals)
-        out, cur = [], [vals[0]]
-        for v in vals[1:]:
-            if v - cur[-1] <= tol:
-                cur.append(v)
-            else:
-                out.append(sum(cur) / len(cur))
-                cur = [v]
-        out.append(sum(cur) / len(cur))
-        return out
+    def bidx(v):
+        return min(range(len(bands)), key=lambda i: abs(bands[i] - v))
 
-    yb = band([it[1] for it in items], max(1.0, med_h * 0.6))
-    ri = lambda y: min(range(len(yb)), key=lambda i: abs(yb[i] - y))     # noqa: E731
-    return sorted(items, key=lambda it: (ri(it[1]), it[0]))
+    return sorted(items, key=lambda it: (main_dir * bidx(pm(it)), sec_dir * ps(it)))
+
+
+def _row_major(items, med_h):
+    """兼容老调用：等价于顺序 "2"（上→下行、行内左→右）。"""
+    return sort_items_by_order(items, med_h, DEFAULT_STR_ORDER)
+
+
 
 
 def debug_page_map(json_path):
@@ -539,7 +598,8 @@ def debug_page_map(json_path):
     return {pg: i + 1 for i, pg in enumerate(sorted(pages))}
 
 
-def rack_lines_from_debug(json_path, prefix="STR", digits=2, page_map=None):
+def rack_lines_from_debug(json_path, prefix="STR", digits=2, page_map=None,
+                           order=DEFAULT_STR_ORDER):
     """识别结果 debug JSON -> 支架号行（L 行：页号 fx fy STRxx 角度 字高占页比）。
 
     按所属 LBD 区域(Node 框) 分组、组内行优先（上→下、左→右）编号，每组从 01 起；
@@ -559,6 +619,8 @@ def rack_lines_from_debug(json_path, prefix="STR", digits=2, page_map=None):
     digits = max(1, int(digits or 2))
 
     lines, n_str, n_pages = [], 0, 0
+    # 全册统一 STR 字高：用全册支架短边中位比例，避免个别框宽窄不一致导致大小不一
+    gratio = _global_short_ratio(page_size, trk)
     for pg in sorted(p for p in trk if isinstance(p, int)):
         W, H = page_size.get(pg, (0, 0))
         if not W or not H:
@@ -591,19 +653,22 @@ def rack_lines_from_debug(json_path, prefix="STR", digits=2, page_map=None):
             groups.setdefault(nodes.index(p), []).append((cx, cy, b))
         heights.sort()
         med_h = heights[len(heights) // 2] if heights else 1.0
+        med_w = _med_width(typs)
         for _key, items in groups.items():
-            for k, (cx, cy, b) in enumerate(_row_major(items, med_h), 1):
+            for k, (cx, cy, b) in enumerate(
+                    sort_items_by_order(items, med_h, order, med_w), 1):
                 nm = "%s%s" % (prefix, str(k).zfill(digits))
                 bw, bh = b["x2"] - b["x1"], b["y2"] - b["y1"]
                 ang = 90 if bh > bw else 0
                 lines.append("L\t%d\t%.6f\t%.6f\t%s\t%d\t%.6f"
                              % (pg_out, cx / float(W), 1.0 - cy / float(H), nm, ang,
-                                min(bw, bh) / float(H)))
+                                gratio if gratio > 0 else min(bw, bh) / float(H)))
                 n_str += 1
     return lines, n_str, n_pages
 
 
-def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_map=None):
+def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_map=None,
+                             order=DEFAULT_STR_ORDER):
     """识别结果 debug JSON -> CAD 读的 L 行（和 X-AnyLabeling 那条路输出同一套格式）。
 
         L <页号> <fx> <fy> <名称> <角度> <字高占页比>      fx/fy 归一化、y 从下往上
@@ -635,6 +700,8 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
 
     digits = max(1, int(digits or 2))
     lines, n_lbd, n_str, n_pages = [], 0, 0, 0
+    # 全册统一 STR 字高（同 rack_lines_from_debug）
+    gratio = _global_short_ratio(page_size, trk)
     for pg in sorted(p for p in trk if isinstance(p, int)):
         W, H = page_size.get(pg, (0, 0))
         if not W or not H:
@@ -675,8 +742,10 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
             if not n["name"]:
                 continue
             cx, cy = _center(b)
-            lines.append("L\t%d\t%.6f\t%.6f\t%s\t0\t0.000000"
-                         % (pg_out, cx / float(W), 1.0 - cy / float(H), n["name"]))
+            # 第 7 列 = LBD 区域(Node)宽 / 页高：CAD 端字高 = 该比例 x 底图高 x 倍数(1.4)
+            lines.append("L\t%d\t%.6f\t%.6f\t%s\t0\t%.6f"
+                         % (pg_out, cx / float(W), 1.0 - cy / float(H), n["name"],
+                            max(1.0, b["x2"] - b["x1"]) / float(H)))
             n_lbd += 1
 
         groups, heights = {}, []
@@ -690,14 +759,16 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
             groups.setdefault(p["name"], []).append((cx, cy, b))
         heights.sort()
         med_h = heights[len(heights) // 2] if heights else 1.0
+        med_w = _med_width(typs)
         for _grp, items in groups.items():
-            for k, (cx, cy, b) in enumerate(_row_major(items, med_h), 1):
+            for k, (cx, cy, b) in enumerate(
+                    sort_items_by_order(items, med_h, order, med_w), 1):
                 nm = "%s%s" % (prefix, str(k).zfill(digits))
                 bw, bh = b["x2"] - b["x1"], b["y2"] - b["y1"]
                 ang = 90 if bh > bw else 0
                 lines.append("L\t%d\t%.6f\t%.6f\t%s\t%d\t%.6f"
                              % (pg_out, cx / float(W), 1.0 - cy / float(H), nm, ang,
-                                min(bw, bh) / float(H)))
+                                gratio if gratio > 0 else min(bw, bh) / float(H)))
                 n_str += 1
 
     try:
@@ -824,3 +895,153 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def _global_short_ratio(page_size, trk):
+    """全册 tracker 短边(占页高)的中位数；取不到返回 0（退回按每个框各算）。"""
+    vals = []
+    for pg, data in (trk or {}).items():
+        H = (page_size.get(pg) or (0, 0))[1]
+        if not H:
+            continue
+        for d in (data or {}).get("detections") or []:
+            b = d.get("bbox") or {}
+            if not all(k in b for k in ("x1", "y1", "x2", "y2")):
+                continue
+            if (d.get("label") or "").strip().lower() not in ("tracker", "typical"):
+                continue
+            vals.append(min(b["x2"] - b["x1"], b["y2"] - b["y1"]) / float(H))
+    if not vals:
+        return 0.0
+    vals.sort()
+    return vals[len(vals) // 2]
+
+
+def _med_width(typs):
+    """Tracker 框宽的中位数（按列排序时定容差用）。"""
+    ws = sorted((t["bbox"]["x2"] - t["bbox"]["x1"]) for t in typs)
+    return ws[len(ws) // 2] if ws else 1.0
+
+
+def preview_group(json_path, order=DEFAULT_STR_ORDER, prefix="STR", digits=2):
+    """给界面预览用：取第一张有 Tracker 的图里"支架最多的那个 LBD 组"。
+
+    返回 {"page": 页号, "group": 组名, "cols": 列数, "rows": 行数,
+          "items": [(编号, 列号, 行号), ...], "count": n, "hint": 说明}；
+    读不到返回 None。items 已按 order 排好，编号就是最终画到图上的 STR 号。
+    列/行号由支架中心按 X/Y 分带得到（左上角为 (0, 0)）。
+    """
+    try:
+        with open(json_path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except Exception:
+        return None
+    ocr = {p.get("page_number"): (p.get("data") or [])
+           for p in doc.get("ocr_node_name_results") or []}
+    trk = {p.get("page_number"): (p.get("data") or {})
+           for p in doc.get("yolo_tracker_detection_results") or []}
+    order = norm_order(order)
+    digits = max(1, int(digits or 2))
+
+    for pg in sorted(p for p in trk if isinstance(p, int)):
+        nodes, typs = [], []
+        for d in (trk.get(pg) or {}).get("detections") or []:
+            b = d.get("bbox") or {}
+            if not all(k in b for k in ("x1", "y1", "x2", "y2")):
+                continue
+            lab = (d.get("label") or "").strip().lower()
+            if lab == "node":
+                nodes.append({"bbox": b})
+            elif lab in ("tracker", "typical"):
+                typs.append({"bbox": b})
+        if not typs or not nodes:
+            continue
+        for r in ocr.get(pg) or []:
+            nb = r.get("node_bbox") or {}
+            if not all(k in nb for k in ("x1", "y1", "x2", "y2")):
+                continue
+            key = (round(nb["x1"], 1), round(nb["y1"], 1), round(nb["x2"], 1), round(nb["y2"], 1))
+            nm = (r.get("final_node_name") or r.get("preliminary_node_name") or "").strip()
+            for n in nodes:
+                b = n["bbox"]
+                if key == (round(b["x1"], 1), round(b["y1"], 1),
+                           round(b["x2"], 1), round(b["y2"], 1)):
+                    n["name"] = nm
+        groups, heights = {}, []
+        for t in typs:
+            b = t["bbox"]
+            heights.append(b["y2"] - b["y1"])
+            p = _assign_parent(b, nodes)
+            if p is None or not p.get("name"):
+                continue
+            cx, cy = _center(b)
+            groups.setdefault(p["name"], []).append((cx, cy, b))
+        if not groups:
+            continue
+        heights.sort()
+        med_h = heights[len(heights) // 2] if heights else 1.0
+        med_w = _med_width(typs)
+        gname = max(groups, key=lambda k: len(groups[k]))       # 支架最多的那个组
+        items = sort_items_by_order(groups[gname], med_h, order, med_w)
+
+        # 按 X / Y 分带得到列号 / 行号（左上角为 (0,0)）
+        xb = _band([it[0] for it in items], max(1.0, med_w * 0.6))
+        yb = _band([it[1] for it in items], max(1.0, med_h * 0.6))
+
+        def cidx(v, bands):
+            return min(range(len(bands)), key=lambda i: abs(bands[i] - v))
+
+        data = [(("%s%s" % (prefix, str(i).zfill(digits))),
+                 cidx(it[0], xb), cidx(it[1], yb))
+                for i, it in enumerate(items, 1)]
+        return {"page": pg, "group": gname, "items": data, "count": len(data),
+                "cols": len(xb), "rows": len(yb), "order": order,
+                "hint": "第 %s 页 · %s · %d 个支架（%s ~ %s）"
+                        % (pg, gname, len(data), data[0][0], data[-1][0])}
+    return None
+
+
+def write_region_file_for_sheets(json_path, out_path, sheets):
+    """按"布局顺序"（= Excel 分表顺序）写区域文件：R 行序号与布局/图纸一一对应。
+
+    布局名来自 Excel 分表名，而区域数据在识别结果里；用 OCR 认出的 LBD 名
+    （如 INV11A101-LBD-15）反查属于哪个分表、在哪一页，再取那一页 LBD 区域的合并范围。
+    反查不到的分表写整页 (0,0,1,1)，CAD 侧按整页对准，不会对错图。
+    """
+    try:
+        by_page = {pg: (a, b, c, d) for (pg, a, b, c, d) in page_region_bounds(json_path)}
+    except Exception as e:
+        return {"ok": False, "error": "读取识别结果失败：%s" % e}
+    sheet_page = {}
+    try:
+        with open(json_path, encoding="utf-8") as f:
+            doc = json.load(f)
+        for p in doc.get("ocr_node_name_results") or []:
+            pg = p.get("page_number")
+            if pg not in by_page:
+                continue
+            for r in (p.get("data") or []):
+                nm = (r.get("final_node_name") or r.get("preliminary_node_name") or "").strip().upper()
+                i = nm.find("-LBD-")
+                if i > 0:
+                    sheet_page.setdefault(nm[:i], pg)
+    except Exception:
+        pass
+
+    lines, hit, miss = [], 0, []
+    for i, name in enumerate(sheets or [], 1):
+        pg = sheet_page.get(str(name or "").strip().upper())
+        v = by_page.get(pg) if pg is not None else None
+        if v is None:
+            miss.append(str(name))
+            lines.append("R\t%d\t0.000000\t0.000000\t1.000000\t1.000000" % i)
+        else:
+            hit += 1
+            lines.append("R\t%d\t%.6f\t%.6f\t%.6f\t%.6f" % ((i,) + v))
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + ("\n" if lines else ""))
+    except Exception as e:
+        return {"ok": False, "error": "写区域文件失败：%s" % e}
+    return {"ok": True, "path": out_path, "pages": len(sheets or []),
+            "with_region": hit, "miss": miss}

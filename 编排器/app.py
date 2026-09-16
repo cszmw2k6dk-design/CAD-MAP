@@ -18,16 +18,20 @@ try:
                              region_out_dir as _lr_out_dir,
                              page_region_bounds as _lr_page_bounds,
                              write_region_file as _lr_write_regions,
+                             write_region_file_for_sheets as _lr_write_regions_sheets,
                              sniff_json_kind as _lr_json_kind,
                              extract_lines_from_debug as _lr_extract_debug,
                              rack_lines_from_debug as _lr_rack_lines,
                              debug_page_map as _lr_page_map,
                              rack_types_from_json as _lr_rack_types,
+                             preview_group as _lr_preview,
+                             STR_ORDER_LABELS as _LR_ORDER_LABELS,
                              rack_types_text as _lr_rack_text,
                              summary_text as _lr_summary)
 except Exception:                    # 模块缺失时不阻塞主程序
     _lr_extract = _lr_candidates = _lr_out_dir = None
-    _lr_page_bounds = _lr_write_regions = None
+    _lr_page_bounds = _lr_write_regions = _lr_write_regions_sheets = None
+    _lr_preview = _LR_ORDER_LABELS = None
     _lr_json_kind = _lr_extract_debug = None
     _lr_rack_lines = None
     _lr_page_map = None
@@ -40,32 +44,35 @@ UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_PAGE = "https://github.com/%s/releases" % UPDATE_REPO
 FIELDS = [
-    ("dwg", "目标 DWG 文件"), ("lspPath", "ZWCAD 插件路径(.lsp)"),
+    ("dwg", "目标 DWG 文件"),
     ("pdf", "PDF 文件路径"), ("xlsx", "LBD 名称 Excel"), ("jsonPath", "识别结果 JSON文件"),
-    ("outputDir", "默认保存目录(可空)"), ("regionOut", "区域范围输出目录(可空)"),
     ("newName", "新文件名(可空)"), ("pageStart", "起始页"), ("pageEnd", "结束页(0=全部)"),
     ("importPages", "导入页码(0=全部)"), ("templateLayout", "模板布局名(留空=自动)"),
     ("filter", "标记块名(竖线)"), ("count", "复制数量(0=按识别)"),
-    ("textHeight", "标签高度(0=自动)"), ("labelBgColor", "标签背景色"),
+    ("textHeight", "标签高度(模型单位, 0=自动)"), ("labelBgColor", "标签背景色"),
     ("labelBgGap", "背景遮挡间隙(倍)"),
     ("rackPrefix", "支架命名前缀"),
+    ("strHeight", "STR 字高(0=按typical宽自动)"),
+    ("strOrder", "STR 编号顺序(8 种)"),
     ("rackTypes", "支架类型"), ("rackSplit", "拆不拆"), ("rackStringLen", "单串长度(FT)"),
     ("strBgOn", "STR背景填充"), ("strBgColor", "STR背景色"), ("strBgGap", "STR遮挡间隙"),
     ("margin", "视口边距(mm)"),
 ]
-BROWSE_KEYS = ("dwg", "lspPath", "pdf", "xlsx", "jsonPath", "outputDir", "regionOut")
+BROWSE_KEYS = ("dwg", "pdf", "xlsx", "jsonPath")
 NAME_PREVIEW_COLS = 5          # 「生成计划」里布局名预览每行几个（网格编号已从界面移除，固定按 5 个折行）
 DEFAULTS = {
     "dwg": "", "lspPath": "",
     "pdf": "", "xlsx": "", "jsonPath": "", "outputDir": "", "newName": "MAP文件",
-    "regionOut": "", "regionAuto": True,
+    "regionOut": "", "regionAuto": False,
     "pageStart": "1", "pageEnd": "0", "templateLayout": "", "count": "0", "filter": "pdf",
     "margin": "5",
-    "textHeight": "0", "labelBgColor": "1", "labelBgGap": "1.0",
+    "textHeight": "0.25", "labelBgColor": "1", "labelBgGap": "1.0",
     "rackPrefix": "STR",
+    "strHeight": "0",
+    "strOrder": "2",
     "rackTypes": "", "rackSplit": "不拆", "rackStringLen": "",
     "rackAuto": True, "rackSplitByType": "",
-    "strBgOn": "1", "strBgColor": "1", "strBgGap": "1.0",
+    "strBgOn": "1", "strBgColor": "2", "strBgGap": "1.0",
     "lockViewport": False, "overwrite": False, "labelWhere": "M", "filterCluster": True,
     "regionFit": True,
     "lbdFromRegion": True,
@@ -75,25 +82,37 @@ DEFAULTS = {
     "aiModel": r"C:\Users\szk\Desktop\MAP-CAD\frame_detect\runs\frames\weights\best.pt",
     "aiOutdir": r"C:\Users\szk\Desktop\MAP-CAD\frame_detect\output_run",
 }
+# STR 编号顺序（8 种，和插件 PDFGRID 一致；值 = 界面上的序号）
+STR_ORDER_CHOICES = _LR_ORDER_LABELS or [
+    ("1 列优先: 左→右列、列内上→下", "1"),
+    ("2 行优先: 上→下行、行内左→右", "2"),
+    ("3 列优先: 右→左列、列内上→下", "3"),
+    ("4 行优先: 下→上行、行内左→右", "4"),
+    ("5 列优先: 左→右列、列内下→上", "5"),
+    ("6 列优先: 右→左列、列内下→上", "6"),
+    ("7 行优先: 上→下行、行内右→左", "7"),
+    ("8 行优先: 下→上行、行内右→左", "8"),
+]
+
 COLOR_CHOICES = [("红", "1"), ("黄", "2"), ("绿", "3"), ("青", "4"),
                  ("蓝", "5"), ("洋红", "6"), ("白", "7"), ("灰", "8")]
 SECTIONS = [
-    ("文件与输出", [("dwg", "目标 DWG 文件"), ("lspPath", "ZWCAD 插件路径(.lsp)"),
+    ("文件与输出", [("dwg", "目标 DWG 文件"),
                   ("pdf", "PDF 文件路径"), ("xlsx", "LBD 名称 Excel"),
                   ("jsonPath", "识别结果 JSON文件"),
-                  ("outputDir", "默认保存目录(可空)"),
-                  ("regionOut", "区域范围输出目录(可空)"),
                   ("newName", "新文件名(可空)")]),
     ("PDF 与标签", [("pageStart", "起始页"), ("pageEnd", "结束页(0=全部)"),
                   ("importPages", "导入页码(0=全部)"), ("templateLayout", "模板布局名(留空=自动)"),
                   ("count", "复制数量(0=按识别)"), ("filter", "标记块名(竖线)"),
-                  ("textHeight", "标签高度(0=自动)"), ("labelBgColor", "标签背景色"),
+                  ("textHeight", "标签高度(模型单位, 0=自动)"), ("labelBgColor", "标签背景色"),
                   ("labelBgGap", "背景遮挡间隙(倍)"),
                   ("margin", "视口边距(mm)")]),
     ("支架", [("rackPrefix", "命名前缀(支架号)"),
             ("rackTypes", "支架类型(串数:长度FT)"),
             ("rackSplit", "拆不拆"),
             ("rackStringLen", "单串长度(FT,可空)"),
+            ("strHeight", "STR 字高(0=按typical宽自动)"),
+            ("strOrder", "STR 编号顺序(8 种)"),
             ("strBgOn", "STR背景填充"),
             ("strBgColor", "STR背景色"),
             ("strBgGap", "STR遮挡间隙(倍)")]),
@@ -413,6 +432,9 @@ def json_to_extract(json_path, out_path, prefix="STR"):
         if up.startswith(pre):
             ang = 90 if bh > bw else 0
             hgt = min(bw, bh) / float(H)
+        elif "-LBD-" in up:
+            ang = 0
+            hgt = max(1.0, bw) / float(H)          # LBD 标签：按 LBD 区域宽算字高
         else:
             ang = 0
             hgt = 0.0
@@ -488,6 +510,7 @@ def build_extract_file(cfg, out_path, prog_path=None):
     except Exception:
         p1 = 0
     pre = rack_prefix(cfg)
+    order = str(cfg.get("strOrder", "2") or "2").strip() or "2"
     detail = {"kind": "", "lbd": 0, "str": 0, "pdf_lbd": False}
 
     def _count(prefix):
@@ -527,7 +550,7 @@ def build_extract_file(cfg, out_path, prog_path=None):
     if (kind == "debug" and cfg.get("lbdFromRegion", True)
             and _lr_extract_debug is not None):
         try:
-            r = _lr_extract_debug(jp, out_path, prefix=pre, page_map=pgmap)
+            r = _lr_extract_debug(jp, out_path, prefix=pre, page_map=pgmap, order=order)
         except Exception as e:
             r = {"ok": False, "error": str(e)}
         if r.get("ok") and r["lbd"]:
@@ -555,7 +578,7 @@ def build_extract_file(cfg, out_path, prog_path=None):
     rack_err = ""
     if kind == "debug" and _lr_rack_lines is not None:
         try:
-            rl, nstr, _np = _lr_rack_lines(jp, pre, page_map=pgmap)
+            rl, nstr, _np = _lr_rack_lines(jp, pre, page_map=pgmap, order=order)
         except Exception as e:
             rl, nstr, rack_err = [], 0, str(e)
         if rl:
@@ -574,7 +597,7 @@ def build_extract_file(cfg, out_path, prog_path=None):
 
     # 兜底：PDF 文字层没给出 LBD 行（无文字层的扫描件等），用 debug JSON 的区域中心
     if detail["lbd"] == 0 and kind == "debug" and _lr_extract_debug is not None:
-        r = _lr_extract_debug(jp, out_path, prefix=pre)
+        r = _lr_extract_debug(jp, out_path, prefix=pre, order=order)
         if r.get("ok"):
             detail["lbd"], detail["str"] = r["lbd"], r["str"]
             return True, ("识别结果 JSON：%d 页、LBD %d 个（按区域中心）、支架号 %d 个"
@@ -614,17 +637,28 @@ def prepare_region_file(cfg, extra_dirs=()):
     if not cands:
         return "", "区域对准：没找到识别结果 JSON，视口按整页对准"
     out = os.path.join(tempfile.gettempdir(), "pdflbd_regions.txt")
+    # 布局名来自 Excel 分表顺序，所以区域文件也按分表顺序写，保证 R 行与布局一一对应
+    try:
+        sheets, _nmsg = plan_names(cfg)
+    except Exception:
+        sheets = []
     last_err = ""
     for jp in cands:                       # 依次试，挑第一份能读出来的
         try:
-            r = _lr_write_regions(jp, out, page_start=cfg.get("pageStart", 1),
-                                  count=cfg.get("count", 0))
+            if sheets and _lr_write_regions_sheets is not None:
+                r = _lr_write_regions_sheets(jp, out, sheets)
+            else:
+                r = _lr_write_regions(jp, out, page_start=cfg.get("pageStart", 1),
+                                      count=cfg.get("count", 0))
         except Exception as e:
             last_err = str(e)
             continue
         if r.get("ok"):
-            return out, ("区域对准：%d 页，其中 %d 页有 LBD 区域 → 生成布局后按区域上下限调视口大小"
-                         % (r["pages"], r["with_region"]))
+            return out, ("区域对准：按分表顺序 %d 个布局，%d 个匹配到 LBD 区域%s"
+                         " → 生成布局后按区域上下限调视口大小"
+                         % (r["pages"], r["with_region"],
+                            ("（%d 个分表没匹配到，按整页对准）" % len(r.get("miss") or []))
+                            if r.get("miss") else ""))
         last_err = r.get("error") or last_err
     return "", "区域对准：%s（视口按整页对准）" % (last_err or "读取失败")
 
@@ -813,26 +847,41 @@ def auto_worker(cfg, ini, prog, bus):
                         f.write(err)
                 except Exception:
                     pass
-        # 自动导出 LBD 区域范围 + Typical(支架)范围，供下游程序/报表直接读。
-        # 只在“可能拿得到识别 JSON”时执行，纯 PDF 抽文字的流程不打扰。
-        _rauto = str(cfg.get("regionAuto", "1")).strip() not in ("0", "", "关", "否", "off", "false", "False")
+        # 支架类型：仍从识别结果 JSON 自动读（填「支架」页明细行 + 补写 ini，CAD 侧这次就能读到）。
+        # LBD 区域 / 支架范围的导出不再随生成自动做 —— 需要时点底部「导出区域范围」按钮，
+        # 或在「选项」页勾上「生成时自动导出 LBD区域/支架范围」。
+        _rauto = str(cfg.get("regionAuto", "0")).strip() not in ("0", "", "关", "否", "off", "false", "False")
+        _rackauto = str(cfg.get("rackAuto", "1")).strip() not in ("0", "", "关", "否", "off", "false", "False")
         _rready = (bool((cfg.get("jsonPath") or "").strip())
                    or str(cfg.get("useAI", "0")) in ("1", "True", "true")
                    or bool((cfg.get("aiOutdir") or "").strip()))
-        if _rauto and _rready:
-            bus.prog.emit("0/4 导出 LBD 区域 / 支架范围…")
-            _rres = export_region_ranges(cfg, extra_dirs=[lbd_out])
-            bus.prog.emit(_rres["msg"])
-            _rt = _rres.get("rack_types") or []
+        if _rready and (_rauto or _rackauto):
+            _rres = None
+            if _rauto:
+                bus.prog.emit("0/4 导出 LBD 区域 / 支架范围…")
+                _rres = export_region_ranges(cfg, extra_dirs=[lbd_out])
+                bus.prog.emit(_rres["msg"])
+            _rt = (_rres.get("rack_types") if _rres else None) or []
+            if not _rt and _rackauto:
+                # 不导出时也要能读到支架类型（来源还是同一份识别结果 JSON）
+                for _jp in (_lr_candidates(cfg, extra_paths=[lbd_out]) if _lr_candidates else []):
+                    try:
+                        _rt = _lr_rack_types(_jp) if _lr_rack_types else []
+                    except Exception:
+                        _rt = []
+                    if _rt:
+                        break
             if _rt:
                 bus.racks.emit(_rt)              # 界面「支架」页明细行自动填上
-                if str(cfg.get("rackAuto", "1")).strip() not in ("0", "", "关", "否",
-                                                                 "off", "false", "False"):
-                    cfg["rackTypes"] = _rres.get("rack_types_text") or cfg.get("rackTypes", "")
-                    try:
-                        write_auto_ini(cfg, ini)  # 补写 ini, LSP 这一次就能读到支架类型
-                    except Exception as e:
-                        bus.prog.emit("支架类型写入 ini 失败：" + str(e))
+                if _rackauto:
+                    _rtext = ((_rres.get("rack_types_text") or "") if _rres else "") \
+                             or (_lr_rack_text(_rt) if _lr_rack_text else "")
+                    if _rtext:
+                        cfg["rackTypes"] = _rtext
+                        try:
+                            write_auto_ini(cfg, ini)  # 补写 ini, LSP 这一次就能读到支架类型
+                        except Exception as e:
+                            bus.prog.emit("支架类型写入 ini 失败：" + str(e))
 
         # 布局生成后按 LBD 区域上下限对准视口：先把区域范围文件写出来，再补写一次 ini
         _rfile = ""
@@ -946,10 +995,10 @@ def auto_worker(cfg, ini, prog, bus):
             except Exception:
                 _sbg_g = 1.0
             _rp = rack_prefix(cfg).replace('"', "")      # 支架号前缀：LISP 端按它认支架号
-            # 字高：UI「标签高度」填 0/空 = 自动（按支架框短边推算），填正数 = 用这个固定字高。
-            # 以前 AI 侧一直是 0.15 模型单位，图上大一点就看不见（就是"画了一个也没有"的原因）。
+            # STR 号字高：UI「支架」页的「STR 字高」。0/空 = 自动（按 typical 框短边算，见 PdfLayout_ai.lsp）；
+            # >0 = 用这个固定字高（模型单位）。「标签高度」那一格只管 LBD 标签，不再顺手改 STR 号。
             try:
-                _thv = float(str(cfg.get("textHeight", "0")).strip() or 0)
+                _thv = float(str(cfg.get("strHeight", "0")).strip() or 0)
             except Exception:
                 _thv = 0.0
             if _thv > 0:
@@ -1254,6 +1303,7 @@ class Bus(QObject):
     done = Signal(str)
     status = Signal(str)
     racks = Signal(list)          # 支架类型明细（后台线程解析完推给界面）
+    strprev = Signal(object)        # STR 顺序预览（后台线程 -> 界面）
     save_result = Signal(bool, str)
     upd_found = Signal(str, str, str, str)
     upd_none = Signal(str, str, str)
@@ -1378,12 +1428,94 @@ class UpdateDialog(QDialog):
         self.accept()
 
 
+class StrOrderPreview(QWidget):
+    """STR 编号顺序预览：把一个 LBD 组里的支架按当前顺序画成格子示意。
+
+    格子里的号 = 该支架会得到的 STR 号；绿=第 1 个、橙=最后一个；
+    连线 = 编号走向（格子行列按支架在图上的左右/上下关系排）。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.page = None
+        self.group = ""
+        self.cols = 1
+        self.rows = 1
+        self.items = []
+        self.hint = "还没有预览：选好「识别结果 JSON文件」后点「刷新 STR 顺序预览」"
+        self.setMinimumHeight(170)
+        self.setObjectName("StrPreview")
+
+    def set_data(self, page=None, group="", items=None, hint="", cols=1, rows=1):
+        self.page = page
+        self.group = group or ""
+        self.items = list(items or [])
+        self.cols = max(1, int(cols or 1))
+        self.rows = max(1, int(rows or 1))
+        if hint:
+            self.hint = hint
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.fillRect(self.rect(), QColor("#ffffff"))
+        p.setPen(QColor("#ccd3dc"))
+        p.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        f = p.font()
+        f.setPointSize(max(8, f.pointSize() - 1))
+        p.setFont(f)
+        if not self.items:
+            p.setPen(QColor("#8a93a0"))
+            p.drawText(self.rect().adjusted(12, 12, -12, -12),
+                       Qt.AlignCenter | Qt.TextWordWrap, self.hint)
+            return
+        pad, head, gap = 12, 22, 6
+        w = max(40, self.width() - 2 * pad)
+        h = max(30, self.height() - 2 * pad - head)
+        cw = max(28, min(96, int(w / self.cols)))
+        chh = max(20, min(44, int(h / self.rows)))
+        ox = pad + max(0, int((w - cw * self.cols) / 2.0))
+        oy = pad + head + max(0, int((h - chh * self.rows) / 2.0))
+        p.setPen(QColor("#39424e"))
+        p.drawText(pad, 2, self.width() - 2 * pad, head, Qt.AlignLeft | Qt.AlignVCenter,
+                   "STR 顺序预览：%s" % self.hint)
+
+        def cell(i):
+            it = self.items[i]
+            return (ox + it[1] * cw, oy + it[2] * chh, cw - gap, chh - gap)
+
+        pts = []
+        for i in range(len(self.items)):
+            x, y, w2, h2 = cell(i)
+            pts.append((x + w2 // 2, y + h2 // 2))
+        p.setPen(QColor("#b9c6d6"))
+        for i in range(1, len(pts)):
+            p.drawLine(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1])
+        for i, it in enumerate(self.items):
+            x, y, w2, h2 = cell(i)
+            if i == 0:
+                p.setBrush(QColor("#d6f5d6"))
+                p.setPen(QColor("#2e8b57"))
+            elif i == len(self.items) - 1:
+                p.setBrush(QColor("#ffe6cc"))
+                p.setPen(QColor("#d2691e"))
+            else:
+                p.setBrush(QColor("#eef3f9"))
+                p.setPen(QColor("#8aa0b8"))
+            p.drawRect(x, y, w2, h2)
+            p.setPen(QColor("#33414f"))
+            p.drawText(x, y, w2, h2, Qt.AlignCenter, it[0])
+
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.bus = Bus()
         self.bus.prog.connect(self.on_prog)
         self.bus.racks.connect(self.on_rack_types)
+        self.bus.strprev.connect(self.on_str_preview)
         self.bus.err.connect(self.on_err)
         self.bus.done.connect(self.on_done)
         self.bus.status.connect(self.on_status)
@@ -1564,7 +1696,7 @@ class MainWindow(QMainWindow):
                                    ("overwrite", "覆盖同名布局", False),
                                    ("filterCluster", "排除集中干扰标号", True),
                                    ("useAI", "使用AI自动识别(无需手动框)", False),
-                                   ("regionAuto", "生成时自动导出 LBD区域/支架范围", True),
+                                   ("regionAuto", "生成时自动导出 LBD区域/支架范围（默认不勾）", False),
                                    ("regionFit", "生成布局后按 LBD 区域上下限对准视口", True),
                                    ("lbdFromRegion", "LBD 标签按识别到的区域位置填（不勾=按 PDF 里的 LBD 文字位置）", True),
                                    ("rackAuto", "支架类型自动读识别结果(免手填)", True)]:
@@ -1591,6 +1723,8 @@ class MainWindow(QMainWindow):
                 "rackSplit": "全部按同一规则时填这里：不拆 / 2行 / 3行；也可按 LBD 写。"
                              "要每个支架类型分开设，用下面的明细行",
                 "rackStringLen": "可留空。填了按 行长度÷单串长度 反推串数，再和支架类型核对",
+                "strHeight": "STR 号的字高（模型单位）。填 0 = 自动：按 typical 框短边（条带宽）的 1.4 倍算；填数字 = 用这个固定字高。LBD 标签的字高仍用上面「PDF 与标签」页的「标签高度」。",
+                "strOrder": "同一个 LBD 组里 STR 号的编号顺序（8 种，和 PDFGRID 一致）；每个 LBD 组都从 01 重新编号。默认 2 = 上→下行、行内左→右（和以前一样）。下面「STR 顺序预览」能看到实际效果。",
                 "strBgOn": "STR 号是否加背景填充（遮掉底图线条）。默认开",
                 "strBgColor": "背景填充颜色，下拉选择 ACI 色号",
                 "strBgGap": "背景相对文字的外扩倍数，默认 1.0（越大遮得越宽）",
@@ -1608,6 +1742,16 @@ class MainWindow(QMainWindow):
                         cb.addItem(cname, aci)
                     self.combo[key] = cb
                     form.addWidget(cb, r, 1)
+                elif key == "strOrder":
+                    cb = NoWheelCombo()
+                    cb.setObjectName("Field")
+                    cb.setMinimumWidth(320)
+                    for label, val in STR_ORDER_CHOICES:
+                        cb.addItem(label, val)
+                    self.combo[key] = cb
+                    cb.currentIndexChanged.connect(lambda *_: self.on_refresh_str_preview())
+                    form.addWidget(cb, r, 1)
+
                 elif key == "strBgOn":
                     cb = NoWheelCombo()
                     cb.setObjectName("Field")
@@ -1684,6 +1828,19 @@ class MainWindow(QMainWindow):
         hb.addWidget(self.rack_refresh_btn)
         hb.addStretch(1)
         v.addLayout(hb)
+        # STR 编号顺序预览（按当前顺序给一个 LBD 组内的支架编号）
+        ph = QHBoxLayout()
+        ph.setSpacing(8)
+        self.str_preview_btn = QPushButton("刷新 STR 顺序预览")
+        self.str_preview_btn.clicked.connect(self.on_refresh_str_preview)
+        ph.addWidget(self.str_preview_btn)
+        self.str_preview_info = QLabel("（点「刷新 STR 顺序预览」看当前顺序的编号效果）")
+        self.str_preview_info.setObjectName("Hint")
+        ph.addWidget(self.str_preview_info, 1)
+        v.addLayout(ph)
+        self.str_preview = StrOrderPreview()
+        v.addWidget(self.str_preview)
+
         self.rack_rows = []          # [(串数, 长度QLineEdit, 拆不拆QComboBox)]
         self._rack_types = []        # 当前明细对应的支架类型(来自识别结果)
         self._rack_len_pref = {}     # 串数 -> 长度文本(用户填过/配置里带的)
@@ -1804,6 +1961,54 @@ class MainWindow(QMainWindow):
         if _lr_rack_types is None or not cfg.get("rackAuto", True):
             return
         threading.Thread(target=self._rack_fill_worker, args=(cfg, announce), daemon=True).start()
+        self.on_refresh_str_preview()
+
+    def on_refresh_str_preview(self):
+        """按当前 STR 顺序刷新预览（后台读识别结果，不卡界面）。"""
+        if not hasattr(self, "str_preview"):
+            return
+        try:
+            cfg = self.cfg()
+        except Exception:
+            return
+        threading.Thread(target=self._str_preview_worker, args=(cfg,), daemon=True).start()
+
+    def _str_preview_worker(self, cfg):
+        if _lr_preview is None or _lr_candidates is None:
+            self.bus.strprev.emit({"hint": "缺少 lbd_regions.py，不能预览"})
+            return
+        try:
+            cands = _lr_candidates(cfg)
+        except Exception as e:
+            self.bus.strprev.emit({"hint": "查找识别结果出错：%s" % e})
+            return
+        if not cands:
+            self.bus.strprev.emit({"hint": "没找到识别结果 JSON：请先在上面选「识别结果 JSON文件」"})
+            return
+        order = str((cfg or {}).get("strOrder", "2") or "2").strip() or "2"
+        for jp in cands:
+            try:
+                d = _lr_preview(jp, order=order)
+            except Exception:
+                d = None
+            if d:
+                self.bus.strprev.emit(d)
+                return
+        self.bus.strprev.emit({"hint": "这份识别结果里没读到 LBD 区域或支架框"})
+
+    def on_str_preview(self, data):
+        if not hasattr(self, "str_preview"):
+            return
+        d = data or {}
+        if not d.get("items"):
+            self.str_preview.set_data(hint=d.get("hint") or "没有可预览的支架")
+        else:
+            self.str_preview.set_data(d.get("page"), d.get("group"), d["items"],
+                                      d.get("hint", ""), d.get("cols", 1), d.get("rows", 1))
+        if hasattr(self, "str_preview_info"):
+            self.str_preview_info.setText(d.get("hint") or "")
+
+
 
     def _build_status_page(self):
         page = QWidget()
@@ -1823,8 +2028,10 @@ class MainWindow(QMainWindow):
         self.pbar.setTextVisible(False)
         self.pbar.setFixedHeight(18)
         v.addWidget(self.pbar)
-        self.grid = DrawGrid()
-        v.addWidget(self.grid, 1)
+        # 按页进度（CAD 侧 LBD_PAGE / AI_PAGE 事件）
+        self.page_label = QLabel("")
+        self.page_label.setObjectName("Hint")
+        v.addWidget(self.page_label)
         # 完成区：跑完由用户选保存位置（不再自动保存到输出目录）
         fin = QFrame()
         fin.setObjectName("FinishBox")
@@ -1833,7 +2040,7 @@ class MainWindow(QMainWindow):
         fv.setSpacing(12)
         fcol = QVBoxLayout()
         fcol.setSpacing(4)
-        self.finish_title = QLabel("执行完成后，在这里选择保存位置")
+        self.finish_title = QLabel("生成完成后，点右下角「下载」选择保存位置")
         self.finish_title.setObjectName("FinishTitle")
         self.finish_hint = QLabel("不会再自动保存到“默认保存目录”，选完路径才写文件")
         self.finish_hint.setObjectName("Hint")
@@ -1841,7 +2048,7 @@ class MainWindow(QMainWindow):
         fcol.addWidget(self.finish_title)
         fcol.addWidget(self.finish_hint)
         fv.addLayout(fcol, 1)
-        self.save_btn = QPushButton("选择保存位置并保存…")
+        self.save_btn = QPushButton("下载")
         self.save_btn.setObjectName("Primary")
         self.save_btn.setFixedHeight(38)
         self.save_btn.setEnabled(False)
@@ -1901,7 +2108,7 @@ class MainWindow(QMainWindow):
         self.checkbox["overwrite"].setChecked(bool(c.get("overwrite")))
         self.checkbox["filterCluster"].setChecked(bool(c.get("filterCluster")))
         self.checkbox["useAI"].setChecked(bool(c.get("useAI")))
-        self.checkbox["regionAuto"].setChecked(bool(c.get("regionAuto", True)))
+        self.checkbox["regionAuto"].setChecked(bool(c.get("regionAuto", False)))
         self.checkbox["regionFit"].setChecked(bool(c.get("regionFit", True)))
         self.checkbox["lbdFromRegion"].setChecked(bool(c.get("lbdFromRegion", True)))
         self.checkbox["rackAuto"].setChecked(bool(c.get("rackAuto", True)))
@@ -2058,8 +2265,8 @@ class MainWindow(QMainWindow):
         self._finish_ready = False
         self._phase = ""
         self.save_btn.setEnabled(False)
-        self.save_btn.setText("选择保存位置并保存…")
-        self.finish_title.setText("执行完成后，在这里选择保存位置")
+        self.save_btn.setText("下载")
+        self.finish_title.setText("生成完成后，点右下角「下载」选择保存位置")
         self.finish_hint.setText("不会再自动保存到“默认保存目录”，选完路径才写文件")
         # 读取配置里的 AI 自动识别参数
         try:
@@ -2083,7 +2290,6 @@ class MainWindow(QMainWindow):
         self.status_label.setText("正在连接 / 启动 CAD…")
         self.count_label.setText("已绘制  0 / ？")
         self.pbar.setValue(0)
-        self.grid.set_value(0, 0)
         self.content_stack.setCurrentIndex(1)
         self.log_msg("正在调用 ZWCAD 执行（请切到 ZWCAD 等待）…")
         self._prog_path = prog
@@ -2136,7 +2342,7 @@ class MainWindow(QMainWindow):
         if self.total > 0:
             self.count_label.setText("已绘制  %d / %d" % (self.done_n, self.total))
             self.pbar.setValue(int(round(min(1.0, self.done_n / float(self.total)) * 100)))
-            self.grid.set_value(self.done_n, self.total)
+            pass                      # 进度方块已去掉，只保留进度条
 
     def on_status(self, msg):
         self.run_status = msg
@@ -2157,7 +2363,7 @@ class MainWindow(QMainWindow):
             self.done_n = max(self.done_n, self.total)
             self.count_label.setText("已绘制  %d / %d" % (self.done_n, self.total))
             self.pbar.setValue(100)
-            self.grid.set_value(self.done_n, self.total)
+            pass                      # 进度方块已去掉，只保留进度条
         self.log_msg("完成：" + msg)
 
     def on_save_dwg(self):
@@ -2189,7 +2395,7 @@ class MainWindow(QMainWindow):
             self.finish_hint.setText("需要换位置或改名字，点右边按钮再存一次")
             self.log_msg("已保存：" + msg)
         else:
-            self.save_btn.setText("选择保存位置并保存…")
+            self.save_btn.setText("下载")
             self.finish_title.setText("保存失败")
             self.finish_hint.setText(msg)
             self.log_msg("保存失败：" + msg)
@@ -2345,6 +2551,24 @@ class MainWindow(QMainWindow):
         if lay:
             self._phase = "LAYOUT"
             self.done_n, self.total = int(lay[-1][0]), int(lay[-1][1])
+        # 按页进度：LBD_PAGE <第几张> <总数> / AI_PAGE <第几张> <总数>；页与页的间隔=该页耗时
+        for tag in ("LBD", "AI"):
+            arr = re.findall(tag + r"_PAGE\s*(\d+)(?:\s+(\d+))?", txt)
+            if not arr:
+                continue
+            pg_no, pg_tot = arr[-1]
+            if getattr(self, "_pg_last", None) is None:
+                self._pg_last, self._pg_ts, self._pg_times = {}, {}, []
+            if self._pg_last.get(tag) != pg_no:
+                now = time.time()
+                if self._pg_ts.get(tag):
+                    self._pg_times.append((tag, pg_no, now - self._pg_ts[tag]))
+                self._pg_last[tag] = pg_no
+                self._pg_ts[tag] = now
+            name = {"LBD": "LBD 标签", "AI": "STR 号"}[tag]
+            self._page_status = "%s：第 %s%s 张图纸" % (name, pg_no, ("/" + pg_tot) if pg_tot else "")
+            if hasattr(self, "page_label"):
+                self.page_label.setText("按页进度 ｜ " + self._page_status)
         lbd_total = re.findall(r"LBD_TOTAL\s*(\d+)", txt)
         if lbd_total:
             self._phase = "LBD"
@@ -2385,8 +2609,14 @@ class MainWindow(QMainWindow):
             finished = True
             if not self._finish_ready:
                 self._finish_ready = True
+                _times = [(t2, p2, d2) for (t2, p2, d2) in getattr(self, "_pg_times", []) if d2 > 0.2]
+                if _times:
+                    _slow = sorted(_times, key=lambda x: -x[2])[:5]
+                    self.log_msg("每页耗时：共记录 %d 页；最慢 5 页 %s"
+                                 % (len(_times), "、".join("%s 第%s张 %.1fs" % (t2, p2, d2)
+                                                        for t2, p2, d2 in _slow)))
                 self.save_btn.setEnabled(True)
-                self.save_btn.setText("选择保存位置并保存…")
+                self.save_btn.setText("下载")
                 self.finish_title.setText("执行完成，共 %d 个布局 —— 请选择保存位置"
                                           % (self.total or self.done_n or 0))
                 self.finish_hint.setText("点右边按钮选路径，会连到 CAD 用 SAVEAS 写成你选的文件"
@@ -2398,7 +2628,7 @@ class MainWindow(QMainWindow):
         if self.total > 0:
             self.count_label.setText("已绘制  %d / %d" % (self.done_n, self.total))
             self.pbar.setValue(int(round(min(1.0, self.done_n / float(self.total)) * 100)))
-            self.grid.set_value(self.done_n, self.total)
+            pass                      # 进度方块已去掉，只保留进度条
         if finished:
             if self._poll_timer:
                 self._poll_timer.stop()
