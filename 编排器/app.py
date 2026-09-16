@@ -38,7 +38,7 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_rack_types = _lr_rack_text = _lr_summary = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.17.13"
+APP_VERSION = "2.17.14"
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
@@ -57,6 +57,7 @@ FIELDS = [
     ("rackTypes", "支架类型"), ("rackSplit", "拆不拆"), ("rackStringLen", "单串长度(FT)"),
     ("strBgOn", "STR背景填充"), ("strBgColor", "STR背景色"), ("strBgGap", "STR遮挡间隙"),
     ("margin", "视口边距(mm)"),
+    ("regionInset", "区域对准留白(%)"),
 ]
 BROWSE_KEYS = ("dwg", "pdf", "xlsx", "jsonPath")
 NAME_PREVIEW_COLS = 5          # 「生成计划」里布局名预览每行几个（网格编号已从界面移除，固定按 5 个折行）
@@ -66,6 +67,7 @@ DEFAULTS = {
     "regionOut": "", "regionAuto": False,
     "pageStart": "1", "pageEnd": "0", "templateLayout": "", "count": "0", "filter": "pdf",
     "margin": "5",
+    "regionInset": "90",
     "textHeight": "0.25", "labelBgColor": "1", "labelBgGap": "1.0",
     "rackPrefix": "STR",
     "strHeight": "0",
@@ -106,7 +108,8 @@ SECTIONS = [
                   ("count", "复制数量(0=按识别)"), ("filter", "标记块名(竖线)"),
                   ("textHeight", "标签高度(模型单位, 0=自动)"), ("labelBgColor", "标签背景色"),
                   ("labelBgGap", "背景遮挡间隙(倍)"),
-                  ("margin", "视口边距(mm)")]),
+                  ("margin", "视口边距(mm)"),
+                  ("regionInset", "区域对准留白(%)")]),
     ("支架", [("rackPrefix", "命名前缀(支架号)"),
             ("rackTypes", "支架类型(串数:长度FT)"),
             ("rackSplit", "拆不拆"),
@@ -980,6 +983,14 @@ def auto_worker(cfg, ini, prog, bus):
 
         ai = ensure_ai_lsp()
         _lbdout = (cfg.get("lbdOut") or "").strip()
+        # 区域对准留白：CAD 侧按 *PdfLayout_ViewInset* 把「LBD 区域范围」缩放进视口。
+        # 100 = 铺满视口（最大）；越小图纸越小、四周留白越多（95 = 上一版，90 = 现在默认）。
+        try:
+            _vins = float(str(cfg.get("regionInset", "90")).strip() or 90)
+        except Exception:
+            _vins = 90.0
+        _vins = max(50.0, min(100.0, _vins)) / 100.0
+        _vinsnip = "(setq *PdfLayout_ViewInset* %.4f)\n" % _vins
         # *PdfLayout_AiPage* = 0 → CAD 侧逐页画 STR 号（第 i 张底图配第 i 页）；
         # 以前这里传的是起始页，结果只有一页会画上支架号。
         _pg = "0"
@@ -1013,13 +1024,14 @@ def auto_worker(cfg, ini, prog, bus):
                       "(setq *PdfLayout_AiTextH* %s)\n"
                       % (_sbg_on, _sbg_c, _sbg_g, _rp, _auto_h, _txt_h))
             cmd = ("(load %s)\n(load %s)\n(load %s)\n"
+                   "%s"
                    "(setq *PdfLayout_GridAutoFile* %s)\n(setq *PdfLayout_AiPage* %s)\n"
                    "%s"
                    "(PdfLayout_AutoRun %s %s)\n(c:pdfgridai)\n(PdfLayout_Prog \"RUN_DONE\")\n"
-                   % (L(lsp), L(auto), L(ai), L(_lbdout), _pg, _strbg, L(ini), L(prog)))
+                   % (L(lsp), L(auto), L(ai), _vinsnip, L(_lbdout), _pg, _strbg, L(ini), L(prog)))
         else:
-            cmd = ("(load %s)\n(load %s)\n(PdfLayout_AutoRun %s %s)\n(PdfLayout_Prog \"RUN_DONE\")\n"
-                   % (L(lsp), L(auto), L(ini), L(prog)))
+            cmd = ("(load %s)\n(load %s)\n%s(PdfLayout_AutoRun %s %s)\n(PdfLayout_Prog \"RUN_DONE\")\n"
+                   % (L(lsp), L(auto), _vinsnip, L(ini), L(prog)))
         bus.prog.emit("发送命令给 ZWCAD：\n" + cmd.replace("\n", " "))
         doc.SendCommand(cmd)
         try:
