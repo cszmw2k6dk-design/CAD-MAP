@@ -38,7 +38,7 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_rack_types = _lr_rack_text = _lr_summary = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.17.14"
+APP_VERSION = "2.18"
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
@@ -50,12 +50,14 @@ FIELDS = [
     ("importPages", "导入页码(0=全部)"), ("templateLayout", "模板布局名(留空=自动)"),
     ("filter", "标记块名(竖线)"), ("count", "复制数量(0=按识别)"),
     ("textHeight", "标签高度(模型单位, 0=自动)"), ("labelBgColor", "标签背景色"),
+    ("labelTextColor", "LBD 标签字色"),
     ("labelBgGap", "背景遮挡间隙(倍)"),
     ("rackPrefix", "支架命名前缀"),
     ("strHeight", "STR 字高(0=按typical宽自动)"),
     ("strOrder", "STR 编号顺序(8 种)"),
     ("rackTypes", "支架类型"), ("rackSplit", "拆不拆"), ("rackStringLen", "单串长度(FT)"),
     ("strBgOn", "STR背景填充"), ("strBgColor", "STR背景色"), ("strBgGap", "STR遮挡间隙"),
+    ("strTextColor", "STR 标签字色"),
     ("margin", "视口边距(mm)"),
     ("regionInset", "区域对准留白(%)"),
 ]
@@ -68,13 +70,13 @@ DEFAULTS = {
     "pageStart": "1", "pageEnd": "0", "templateLayout": "", "count": "0", "filter": "pdf",
     "margin": "5",
     "regionInset": "90",
-    "textHeight": "0.25", "labelBgColor": "1", "labelBgGap": "1.0",
+    "textHeight": "0.25", "labelBgColor": "1", "labelTextColor": "7", "labelBgGap": "1.0",
     "rackPrefix": "STR",
     "strHeight": "0",
     "strOrder": "2",
     "rackTypes": "", "rackSplit": "不拆", "rackStringLen": "",
     "rackAuto": True, "rackSplitByType": "",
-    "strBgOn": "1", "strBgColor": "2", "strBgGap": "1.0",
+    "strBgOn": "1", "strBgColor": "2", "strTextColor": "7", "strBgGap": "1.0",
     "lockViewport": False, "overwrite": False, "labelWhere": "M", "filterCluster": True,
     "regionFit": True,
     "lbdFromRegion": True,
@@ -107,6 +109,7 @@ SECTIONS = [
                   ("importPages", "导入页码(0=全部)"), ("templateLayout", "模板布局名(留空=自动)"),
                   ("count", "复制数量(0=按识别)"), ("filter", "标记块名(竖线)"),
                   ("textHeight", "标签高度(模型单位, 0=自动)"), ("labelBgColor", "标签背景色"),
+                  ("labelTextColor", "LBD 标签字色"),
                   ("labelBgGap", "背景遮挡间隙(倍)"),
                   ("margin", "视口边距(mm)"),
                   ("regionInset", "区域对准留白(%)")]),
@@ -118,6 +121,7 @@ SECTIONS = [
             ("strOrder", "STR 编号顺序(8 种)"),
             ("strBgOn", "STR背景填充"),
             ("strBgColor", "STR背景色"),
+            ("strTextColor", "STR 标签字色"),
             ("strBgGap", "STR遮挡间隙(倍)")]),
     ("选项", []),
 ]
@@ -399,6 +403,18 @@ def rack_prefix(cfg):
     return p or "STR"
 
 
+def rack_split_spec(cfg):
+    """界面「支架」页的「拆不拆」-> lbd_regions.parse_rack_split() 认的文字。
+
+    支架明细行写的 rackSplitByType（每类一行，如 "9=不拆; 13=3行"）优先；
+    没填明细行时才用「拆不拆」那一格 rackSplit。两处都没填就是全不拆。
+    """
+    by_type = str((cfg or {}).get("rackSplitByType") or "").strip()
+    if by_type:
+        return by_type
+    return str((cfg or {}).get("rackSplit") or "").strip()
+
+
 def json_to_extract(json_path, out_path, prefix="STR"):
     """读取识别结果 JSON(X-AnyLabeling 格式) -> 输出 L 行(页号 fx fy 标签) 供 CAD 读取。
     Node 框= LBD 区域, Typical 框= 支架(STR号)。页号取文件名里的 _pNNN。
@@ -514,6 +530,7 @@ def build_extract_file(cfg, out_path, prog_path=None):
         p1 = 0
     pre = rack_prefix(cfg)
     order = str(cfg.get("strOrder", "2") or "2").strip() or "2"
+    split = rack_split_spec(cfg)
     detail = {"kind": "", "lbd": 0, "str": 0, "pdf_lbd": False}
 
     def _count(prefix):
@@ -553,16 +570,20 @@ def build_extract_file(cfg, out_path, prog_path=None):
     if (kind == "debug" and cfg.get("lbdFromRegion", True)
             and _lr_extract_debug is not None):
         try:
-            r = _lr_extract_debug(jp, out_path, prefix=pre, page_map=pgmap, order=order)
+            r = _lr_extract_debug(jp, out_path, prefix=pre, page_map=pgmap,
+                                  order=order, split=split)
         except Exception as e:
             r = {"ok": False, "error": str(e)}
         if r.get("ok") and r["lbd"]:
             detail.update(lbd=r["lbd"], str=r["str"], pos="region")
+            detail["split"] = r.get("split") or ""
             _tip = ""
             if pgmap:
                 _pgs = sorted(pgmap)
                 _tip = ("；识别到 %d 页图纸（PDF 第 %d~%d 页），已按底图顺序重编号 1~%d"
                         % (len(pgmap), _pgs[0], _pgs[-1], len(pgmap)))
+            if detail["split"]:
+                _tip += "；" + detail["split"]
             return True, ("识别结果：LBD %d 个（位置=识别到的 LBD 区域框中心）"
                           " + 支架号 %d 个（按 LBD 分组行优先编号）%s"
                           % (r["lbd"], r["str"], _tip)), detail
@@ -581,7 +602,10 @@ def build_extract_file(cfg, out_path, prog_path=None):
     rack_err = ""
     if kind == "debug" and _lr_rack_lines is not None:
         try:
-            rl, nstr, _np = _lr_rack_lines(jp, pre, page_map=pgmap, order=order)
+            _sinfo = {}
+            rl, nstr, _np = _lr_rack_lines(jp, pre, page_map=pgmap, order=order,
+                                           split=split, info=_sinfo)
+            detail["split"] = _sinfo.get("split") or ""
         except Exception as e:
             rl, nstr, rack_err = [], 0, str(e)
         if rl:
@@ -600,12 +624,14 @@ def build_extract_file(cfg, out_path, prog_path=None):
 
     # 兜底：PDF 文字层没给出 LBD 行（无文字层的扫描件等），用 debug JSON 的区域中心
     if detail["lbd"] == 0 and kind == "debug" and _lr_extract_debug is not None:
-        r = _lr_extract_debug(jp, out_path, prefix=pre, order=order)
+        r = _lr_extract_debug(jp, out_path, prefix=pre, order=order, split=split)
+        detail["split"] = r.get("split") or detail.get("split") or ""
         if r.get("ok"):
             detail["lbd"], detail["str"] = r["lbd"], r["str"]
+            _stip = ("；" + detail["split"]) if detail.get("split") else ""
             return True, ("识别结果 JSON：%d 页、LBD %d 个（按区域中心）、支架号 %d 个"
-                          "（PDF 文字层没读到 LBD 文字，位置按区域中心放）"
-                          % (r["pages"], r["lbd"], r["str"])), detail
+                          "（PDF 文字层没读到 LBD 文字，位置按区域中心放）%s"
+                          % (r["pages"], r["lbd"], r["str"], _stip)), detail
         pdf_err = pdf_err or (r.get("error") or "")
 
     if detail["lbd"] == 0 and detail["str"] == 0:
@@ -621,6 +647,8 @@ def build_extract_file(cfg, out_path, prog_path=None):
             _rng = "%d 页（PDF 第 %d~%d 页，中间有跳页）" % (len(_pgs), _pgs[0], _pgs[-1])
         tip = "；识别到 %d 页图纸（%s），已按底图顺序重编号 1~%d —— 请确认 CAD 里正好是这些页、顺序一致" \
               % (len(pgmap), _rng, len(pgmap))
+    if detail.get("split"):
+        tip += "；" + detail["split"]
     return True, ("标签 %d 行：LBD %d 个（Python 从 PDF 文字层识别）"
                   " + 支架号 %d 个（按 LBD 分组行优先编号）%s"
                   % (detail["lbd"] + detail["str"], detail["lbd"], detail["str"], tip)), detail
@@ -720,12 +748,12 @@ def build_plan(cfg):
     return [
         "1. 打开目标 DWG：%s；模板布局（用于复制）：%s" % (g("dwg", "(未选择)"), g("templateLayout", "(未选择)")),
         "2. 导入/附着 PDF：%s（页码范围 %s–%s）" % (g("pdf", "(未选择)"), g("pageStart", "1"), g("pageEnd") or "末尾"),
-        "3. LBD 标签识别：%s" % g("xlsx", "(未使用)"),
+        "3. LBD 标签识别：%s（LBD 标签字色：ACI %s）" % (g("xlsx", "(未使用)"), g("labelTextColor", "7")),
         "4. 支架号命名前缀：%s（形如 %s01）；支架类型：%s；拆不拆：%s；单串长度：%s；"
-        "STR背景填充：%s 色号%s 间隙%s" % (
+        "STR背景填充：%s 色号%s 间隙%s；STR 标签字色：ACI %s" % (
             rp, rp, g("rackTypes", "(未填)"), g("rackSplit", "不拆"), g("rackStringLen", "(未填)"),
             ("开" if g("strBgOn", "1").strip() not in ("0", "", "关", "否") else "关"),
-            g("strBgColor", "1"), g("strBgGap", "1.0")),
+            g("strBgColor", "1"), g("strBgGap", "1.0"), g("strTextColor", "7")),
         "5. PDFLAYOUT 批量布局：按 LBD Excel 分表名命名，布局 %d 个（%s）" % (total, name_msg or "—"),
         "6. 视口自动对准每张图（显示锁定：%s；%s）"
         % ("是" if cfg.get("lockViewport") else "否",
@@ -1016,13 +1044,26 @@ def auto_worker(cfg, ini, prog, bus):
                 _auto_h, _txt_h = "nil", ("%.6g" % _thv)
             else:
                 _auto_h, _txt_h = "T", "0.15"
+            # 标签字色（ACI 色号）：STR 用 *PdfLayout_AiStrColor*；
+            # LBD 标签由 PdfLayout_auto.lsp 画，主用 ini 的 labelTextColor，
+            # 这里再发一份 *PdfLayout_AiLabelColor*，万一由 AI 侧画 LBD 也能上色。
+            try:
+                _ltc = int(float(str(cfg.get("labelTextColor", "7")).strip() or 7))
+            except Exception:
+                _ltc = 7
+            try:
+                _stc = int(float(str(cfg.get("strTextColor", "7")).strip() or 7))
+            except Exception:
+                _stc = 7
             _strbg = ("(setq *PdfLayout_AiStrBgOn* %s)\n"
                       "(setq *PdfLayout_AiStrBgColor* %s)\n"
                       "(setq *PdfLayout_AiStrBgGap* %s)\n"
                       "(setq *PdfLayout_AiStrPrefix* \"%s\")\n"
                       "(setq *PdfLayout_AiStrAutoH* %s)\n"
                       "(setq *PdfLayout_AiTextH* %s)\n"
-                      % (_sbg_on, _sbg_c, _sbg_g, _rp, _auto_h, _txt_h))
+                      "(setq *PdfLayout_AiStrColor* %s)\n"
+                      "(setq *PdfLayout_AiLabelColor* %s)\n"
+                      % (_sbg_on, _sbg_c, _sbg_g, _rp, _auto_h, _txt_h, _stc, _ltc))
             cmd = ("(load %s)\n(load %s)\n(load %s)\n"
                    "%s"
                    "(setq *PdfLayout_GridAutoFile* %s)\n(setq *PdfLayout_AiPage* %s)\n"
@@ -1725,20 +1766,25 @@ class MainWindow(QMainWindow):
             pos.setWordWrap(True)
             form.addWidget(pos, r, 0, 1, 2)
         elif sec_title == "支架":
-            # 支架类型 + 拆不拆：程序按 行长度÷单串长度 得每行串数，
-            # 再按"拆成几行"把相邻各行归成一张支架，串数取和。
+            # 支架类型 + 拆不拆：每类支架可以选 不拆 / 2行 / 3行；
+            # 选了几行，这个支架框就沿长边均分成几行，每行各一个 STR 号（同一张支架连号）。
+            # 哪一列属于哪一类，按框长对：长的一档 = 长度FT 大的那一类（见 lbd_regions.rack_type_indices）。
             HINTS = {
                 "rackPrefix": "支架号前缀，默认 STR：编号长这样 STR01、STR02…（CIR 是网格编号 PDFGRID 用的前缀，"
                               "不是支架号的；网格编号在 CAD 插件里单独设，本程序不再设它）。"
                               "改了前缀，识别结果里的 STR 号会按新前缀写进 CAD。",
                 "rackTypes": "一般不用手填：下面明细行会自动读识别结果（填了明细行就以下面为准）",
                 "rackSplit": "全部按同一规则时填这里：不拆 / 2行 / 3行；也可按 LBD 写。"
-                             "要每个支架类型分开设，用下面的明细行",
+                             "要每个支架类型分开设，用下面的明细行（明细行的「拆不拆」按串数分）。"
+                             "选 3 行 = 这一列支架沿长边拆成 3 行、每行一个号（连号）。"
+                             "哪一列算什么类型按框长认：长的一档就是长度FT 大的那类。",
                 "rackStringLen": "可留空。填了按 行长度÷单串长度 反推串数，再和支架类型核对",
                 "strHeight": "STR 号的字高（模型单位）。填 0 = 自动：按 typical 框短边（条带宽）的 1.4 倍算；填数字 = 用这个固定字高。LBD 标签的字高仍用上面「PDF 与标签」页的「标签高度」。",
                 "strOrder": "同一个 LBD 组里 STR 号的编号顺序（8 种，和 PDFGRID 一致）；每个 LBD 组都从 01 重新编号。默认 2 = 上→下行、行内左→右（和以前一样）。下面「STR 顺序预览」能看到实际效果。",
                 "strBgOn": "STR 号是否加背景填充（遮掉底图线条）。默认开",
                 "strBgColor": "背景填充颜色，下拉选择 ACI 色号",
+                "strTextColor": "STR 号本身的字色，下拉选择 ACI 色号（默认 7=白，和以前一样）；"
+                                "背景填充色是另一格，两者分开设",
                 "strBgGap": "背景相对文字的外扩倍数，默认 1.0（越大遮得越宽）",
             }
             r = 0
@@ -1746,7 +1792,7 @@ class MainWindow(QMainWindow):
                 lb = QLabel(label)
                 lb.setObjectName("FieldLabel")
                 form.addWidget(lb, r, 0)
-                if key == "strBgColor":
+                if key in ("strBgColor", "strTextColor"):
                     cb = NoWheelCombo()
                     cb.setObjectName("Field")
                     cb.setMinimumWidth(320)
@@ -1791,7 +1837,7 @@ class MainWindow(QMainWindow):
                 lb = QLabel(label)
                 lb.setObjectName("FieldLabel")
                 form.addWidget(lb, row, 0)
-                if key == "labelBgColor":
+                if key in ("labelBgColor", "labelTextColor"):
                     cb = NoWheelCombo()
                     cb.setObjectName("Field")
                     cb.setMinimumWidth(320)
@@ -1998,9 +2044,10 @@ class MainWindow(QMainWindow):
             self.bus.strprev.emit({"hint": "没找到识别结果 JSON：请先在上面选「识别结果 JSON文件」"})
             return
         order = str((cfg or {}).get("strOrder", "2") or "2").strip() or "2"
+        split = rack_split_spec(cfg)
         for jp in cands:
             try:
-                d = _lr_preview(jp, order=order)
+                d = _lr_preview(jp, order=order, split=split)
             except Exception:
                 d = None
             if d:

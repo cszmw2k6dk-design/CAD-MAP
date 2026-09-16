@@ -552,6 +552,22 @@ def _band(vals, tol):
     return out
 
 
+def _band_auto(vals):
+    """同 _band()，但容差按这串坐标自己的正常间距定（相邻值中位间距的一半）。
+
+    预览用：支架拆成几行后，同一列里的小格子间距远小于支架本身的高度，
+    固定用支架高度当容差会把几行并成一行（格子叠在一起）。
+    """
+    if not vals:
+        return []
+    uniq = sorted(set(round(float(v), 3) for v in vals))
+    gaps = [uniq[i + 1] - uniq[i] for i in range(len(uniq) - 1)]
+    gaps = [g for g in gaps if g > 0]
+    tol = 0.5 * _vals_median(gaps) if gaps else 1.0
+    return _band(vals, max(1.0, tol))
+
+
+
 def sort_items_by_order(items, med_h, order=DEFAULT_STR_ORDER, med_w=None):
     """按 8 种顺序排 items=[(cx, cy, bbox), ...]；默认 "2" 与原来的行优先一致。
 
@@ -578,6 +594,266 @@ def _row_major(items, med_h):
     return sort_items_by_order(items, med_h, DEFAULT_STR_ORDER)
 
 
+# ---------------------------------------------------------------- 支架拆分（一列拆成几行）
+# 界面「支架」页每一类支架可以选 不拆 / 2行 / 3行：选了几行，这个支架框就沿长边均分成几段，
+# 每段各给一个 STR 号（同一张支架连号，见 rack_lines_from_debug()）。
+# 框属于哪一类按框长认：支架框长边 ÷ 页高 分档，档之间的比例对上支架类型「长度FT」的比例
+# （本项目 13 串 214.3FT 比 9 串 100.3FT 长一倍多，两档分得很开）。
+
+
+def parse_rack_split(spec):
+    """界面「拆不拆」的文字 -> ({串数: 行数}, 所有类型同一规则的行数)；1 = 不拆。
+
+    认明细行写的 "9=不拆; 13=3行"，也认 "13=2" / "13:3行"；只写 "3行" 时对所有类型生效。
+    """
+    by_type, all_rows = {}, 1
+    for part in re.split(r"[;,\r\n]+", str(spec or "")):
+        part = part.strip()
+        if not part:
+            continue
+        key, val = None, part
+        for sep in ("=", ":"):
+            if sep in part:
+                a, b = [x.strip() for x in part.split(sep, 1)]
+                if re.fullmatch(r"\d+", a):
+                    key, val = int(a), b
+                else:
+                    val = b or a            # 形如 "3行" / "不拆"
+                break
+        m = re.search(r"\d+", val)
+        n = max(1, min(6, int(m.group(0)) if m else 1))
+        if key is None:
+            all_rows = n
+        else:
+            by_type[key] = n
+    return by_type, all_rows
+
+
+def rack_split_rows(split, strings):
+    """某个支架类型（按串数）要拆成几行；1 = 不拆。split 见 parse_rack_split()。"""
+    if not split:
+        return 1
+    by_type, all_rows = split
+    try:
+        s = int(float(strings))
+    except (TypeError, ValueError):
+        s = None
+    if s is not None and s in (by_type or {}):
+        return by_type[s]
+    return all_rows
+
+
+def split_enabled(split):
+    """这套配置里有没有要拆的（全是 1 就等于没开）。"""
+    by_type, all_rows = split or ({}, 1)
+    return all_rows > 1 or any(int(v or 1) > 1 for v in (by_type or {}).values())
+
+
+def _long_side(b):
+    return max(b["x2"] - b["x1"], b["y2"] - b["y1"])
+
+
+def _vals_median(vals):
+    vals = sorted(vals)
+    return vals[len(vals) // 2] if vals else 0.0
+
+
+def _cluster_levels(vals, k, gap_ratio=0.35):
+    """一串长度值 -> 最多 k 个"档"的中心（升序）。
+
+    只在相邻值差得够开（> 35%）的地方切；切不出来就少几档（返回 1 档）。
+    """
+    vals = sorted(v for v in (vals or []) if v > 0)
+    if not vals:
+        return []
+    groups = [vals]
+    while len(groups) < max(1, int(k or 1)):
+        best = None
+        for gi, g in enumerate(groups):
+            gap, cut = 0.0, None
+            for i in range(len(g) - 1):
+                d = g[i + 1] - g[i]
+                if d > gap:
+                    gap, cut = d, i
+            if cut is not None and g[cut] > 0 and gap > gap_ratio * g[cut]:
+                if best is None or gap > best[0]:
+                    best = (gap, gi, cut)
+        if best is None:
+            break
+        _gap, gi, cut = best
+        g = groups.pop(gi)
+        groups[gi:gi] = [g[:cut + 1], g[cut + 1:]]
+        groups.sort(key=lambda gg: gg[0])
+    return [_vals_median(g) for g in groups]
+
+
+def _match_levels_to_types(levels, types, tol=0.35):
+    """长度档 -> 支架类型下标（按长度FT 的比例对，不做绝对换算）；判不出返回 None。"""
+    lens = [float(t.get("length_ft") or 0.0) for t in (types or [])]
+    if not levels or not lens or not all(lens):
+        return None
+    if len(types) == 1:
+        return [0] * len(levels)
+    if len(levels) != len(types):
+        return None
+    base_l, base_t = levels[0], min(lens)
+    out, used = [], set()
+    for lv in levels:
+        best, err = None, None
+        for i, ln in enumerate(lens):
+            if i in used:
+                continue
+            r = ln / base_t
+            e = abs((lv / base_l) - r) / max(1e-9, r)
+            if err is None or e < err:
+                best, err = i, e
+        if best is None or err is None or err > tol:
+            return None
+        used.add(best)
+        out.append(best)
+    return out
+
+
+def _page_boxes(dets):
+    """一页 detections -> (nodes, typs)，只留坐标齐全的框。"""
+    nodes, typs = [], []
+    for d in dets or []:
+        b = d.get("bbox") or {}
+        if not all(k in b for k in ("x1", "y1", "x2", "y2")):
+            continue
+        lab = (d.get("label") or "").strip().lower()
+        if lab == "node":
+            nodes.append({"bbox": b})
+        elif lab in ("tracker", "typical"):
+            typs.append({"bbox": b})
+    return nodes, typs
+
+
+def rack_type_indices(trk, page_size, types, split=None):
+    """每一列支架框属于哪个支架类型 -> ({页号: [类型下标或 None]}, 说明文字)。
+
+    按框长认类型：长边 ÷ 页高 分档，档的比例对上支架类型的长度FT 比例。
+    整册只分出一档、而只有一类要拆时，就按那一类拆（说明里会写清楚）；
+    分不出且不止一类要拆时返回空 dict（= 这次不拆，保持原样）。
+    """
+    types = list(types or [])
+    per_page = {}
+    for pg, data in (trk or {}).items():
+        _W, H = page_size.get(pg, (0, 0))
+        if not H:
+            continue
+        _n, typs = _page_boxes((data or {}).get("detections"))
+        if typs:
+            per_page[pg] = [_long_side(t["bbox"]) / float(H) for t in typs]
+    if not per_page:
+        return {}, ""
+    if len(types) <= 1:
+        return {pg: [0] * len(v) for pg, v in per_page.items()}, ""
+
+    levels = _cluster_levels([v for vs in per_page.values() for v in vs], len(types))
+    lvl_ty = _match_levels_to_types(levels, types)
+    if lvl_ty:
+        out = {}
+        for pg, vals in per_page.items():
+            idx = []
+            for v in vals:
+                bi, be = None, None
+                for li, lv in enumerate(levels):
+                    e = abs(v - lv) / max(1e-9, lv)
+                    if be is None or e < be:
+                        bi, be = li, e
+                idx.append(lvl_ty[bi] if (bi is not None and be is not None and be <= 0.35) else None)
+            out[pg] = idx
+        return out, ""
+
+    # 分不出档：只有一类要拆时按它拆（框都差不多长，说明这一册基本就是这一种）
+    todo = [i for i, t in enumerate(types) if rack_split_rows(split, t.get("strings")) > 1]
+    if len(todo) == 1:
+        i = todo[0]
+        return ({pg: [i] * len(v) for pg, v in per_page.items()},
+                "支架框长分不出档，按要拆的那一类（%s 串）拆" % types[i].get("strings"))
+    return {}, "支架框长分不出档，这次没拆（请核对支架类型的「长度FT」）"
+
+
+def split_dir(order, vertical):
+    """同一张支架拆出来的几段，先画哪一段：按当前编号顺序的行内/列内方向。"""
+    axis, main_dir, sec_dir = STR_ORDERS[norm_order(order)]
+    return main_dir if axis == ("Y" if vertical else "X") else sec_dir
+
+
+def split_box(b, n, vertical, forward=True):
+    """把一个支架框沿长边均分成 n 段（n 就是界面上选的行数），返回 n 个框。"""
+    n = max(1, int(n or 1))
+    if n <= 1:
+        return [dict(b)]
+    out = []
+    if vertical:
+        step = (b["y2"] - b["y1"]) / float(n)
+        for i in range(n):
+            out.append({"x1": b["x1"], "x2": b["x2"],
+                        "y1": b["y1"] + i * step, "y2": b["y1"] + (i + 1) * step})
+    else:
+        step = (b["x2"] - b["x1"]) / float(n)
+        for i in range(n):
+            out.append({"x1": b["x1"] + i * step, "x2": b["x1"] + (i + 1) * step,
+                        "y1": b["y1"], "y2": b["y2"]})
+    if not forward:
+        out.reverse()
+    return out
+
+
+def expand_racks(racks, order):
+    """[(cx, cy, bbox, 拆几行, 类型串数), ...]（已排好序）
+    -> [(cx, cy, 小框, 原框, 拆几行, 类型串数), ...]。
+
+    同一张支架的几行连在一起、连号；不拆的框原样返回。
+    原框一起带出去：角度/字高按整张支架算，不按拆出来的小段算。
+    """
+    out = []
+    for cx, cy, b, n, key in racks:
+        n = max(1, int(n or 1))
+        if n <= 1:
+            out.append((cx, cy, dict(b), b, n, key))
+            continue
+        vertical = (b["y2"] - b["y1"]) >= (b["x2"] - b["x1"])   # 竖条=竖着拆成几行
+        for sb in split_box(b, n, vertical, split_dir(order, vertical) >= 0):
+            sx, sy = _center(sb)
+            out.append((sx, sy, sb, b, n, key))
+    return out
+
+
+def count_splits(racks):
+    """[(cx, cy, bbox, 拆几行, 类型串数), ...] -> {类型串数: [行数, 支架张数]}（只为日志/提示）。"""
+    counts = {}
+    for it in racks or []:
+        try:
+            n, key = int(it[3] or 1), it[4]
+        except (IndexError, TypeError, ValueError):
+            continue
+        if n > 1:
+            c = counts.setdefault(key, [n, 0])
+            c[0] = n
+            c[1] += 1
+    return counts
+
+
+def merge_counts(dst, add):
+    for key, (rows, n) in (add or {}).items():
+        c = dst.setdefault(key, [rows, 0])
+        c[0] = rows
+        c[1] += n
+
+
+def split_note(counts):
+    """{支架类型串数: [行数, 支架张数]} -> 给界面看的说明（没拆就返回空串）。"""
+    if not counts or not any(v[0] > 1 for v in counts.values()):
+        return ""
+    parts = []
+    for s, (rows, n) in sorted(counts.items(), key=lambda kv: str(kv[0])):
+        parts.append("%s串%s %d 张" % (s, ("拆%d行" % rows) if rows > 1 else "不拆", n))
+    return "支架拆分：" + "；".join(parts)
+
+
 
 
 def debug_page_map(json_path):
@@ -599,13 +875,16 @@ def debug_page_map(json_path):
 
 
 def rack_lines_from_debug(json_path, prefix="STR", digits=2, page_map=None,
-                           order=DEFAULT_STR_ORDER):
+                           order=DEFAULT_STR_ORDER, split=None, info=None):
     """识别结果 debug JSON -> 支架号行（L 行：页号 fx fy STRxx 角度 字高占页比）。
 
     按所属 LBD 区域(Node 框) 分组、组内行优先（上→下、左→右）编号，每组从 01 起；
     竖条 90°、横条 0°，字高按框短边。没落在任何 LBD 区域里的支架不编号 ——
     和 frame_detect/map_lbd_str.py 的规则一致（那种框视为干扰）。
 
+    split: 界面「支架」页每类的「拆不拆」（例 "13=3行; 9=不拆"，见 parse_rack_split()）。
+           选了 N 行的支架框会沿长边均分成 N 行，每行各一个号、同一张支架连号。
+    info:  可选 dict；算完把这次拆分的情况写进 info["split"]（给界面日志用）。
     page_map: {真实页号: 图纸顺序号}，给了就重编号并跳过不在里面的页（CAD 侧按底图顺序认页号）。
     返回 (行列表, 支架数, 有支架的页数)。
     """
@@ -617,6 +896,10 @@ def rack_lines_from_debug(json_path, prefix="STR", digits=2, page_map=None,
     trk = {p.get("page_number"): (p.get("data") or {})
            for p in doc.get("yolo_tracker_detection_results") or []}
     digits = max(1, int(digits or 2))
+    split_map = parse_rack_split(split)
+    types = rack_types_from_doc(doc) if split_enabled(split_map) else []
+    tmap, note = (rack_type_indices(trk, page_size, types, split_map) if types else ({}, ""))
+    counts = {}                       # 类型下标 -> [拆几行, 列数]（只为日志）
 
     lines, n_str, n_pages = [], 0, 0
     # 全册统一 STR 字高：用全册支架短边中位比例，避免个别框宽窄不一致导致大小不一
@@ -628,47 +911,48 @@ def rack_lines_from_debug(json_path, prefix="STR", digits=2, page_map=None,
         pg_out = pg if page_map is None else page_map.get(pg)
         if pg_out is None:
             continue
-        nodes, typs = [], []
-        for d in (trk.get(pg) or {}).get("detections") or []:
-            b = d.get("bbox") or {}
-            if not all(k in b for k in ("x1", "y1", "x2", "y2")):
-                continue
-            lab = (d.get("label") or "").strip().lower()
-            if lab == "node":
-                nodes.append({"bbox": b})
-            elif lab in ("tracker", "typical"):
-                typs.append({"bbox": b})
+        nodes, typs = _page_boxes((trk.get(pg) or {}).get("detections"))
         if not typs or not nodes:
             continue
         n_pages += 1
 
         groups, heights = {}, []
-        for t in typs:
+        for ti, t in enumerate(typs):
             b = t["bbox"]
             heights.append(b["y2"] - b["y1"])
             p = _assign_parent(b, nodes)
             if p is None:
                 continue                      # 不在任何 LBD 区域内：不编号
             cx, cy = _center(b)
-            groups.setdefault(nodes.index(p), []).append((cx, cy, b))
+            # 这一类支架要拆几行（认不出类型就 1 = 不拆，保持原样）
+            rows, tkey = 1, None
+            idx = (tmap.get(pg) or [])[ti] if ti < len(tmap.get(pg) or []) else None
+            if idx is not None and idx < len(types):
+                tkey = types[idx].get("strings")
+                rows = rack_split_rows(split_map, tkey)
+            groups.setdefault(nodes.index(p), []).append((cx, cy, b, rows, tkey))
         heights.sort()
         med_h = heights[len(heights) // 2] if heights else 1.0
         med_w = _med_width(typs)
         for _key, items in groups.items():
-            for k, (cx, cy, b) in enumerate(
-                    sort_items_by_order(items, med_h, order, med_w), 1):
+            racks = sort_items_by_order(items, med_h, order, med_w)
+            ordered = expand_racks(racks, order)
+            merge_counts(counts, count_splits(racks))
+            for k, (cx, cy, b, ob, _n, _t) in enumerate(ordered, 1):
                 nm = "%s%s" % (prefix, str(k).zfill(digits))
-                bw, bh = b["x2"] - b["x1"], b["y2"] - b["y1"]
+                bw, bh = ob["x2"] - ob["x1"], ob["y2"] - ob["y1"]
                 ang = 90 if bh > bw else 0
                 lines.append("L\t%d\t%.6f\t%.6f\t%s\t%d\t%.6f"
                              % (pg_out, cx / float(W), 1.0 - cy / float(H), nm, ang,
                                 gratio if gratio > 0 else min(bw, bh) / float(H)))
                 n_str += 1
+    if info is not None:
+        info["split"] = note or split_note(counts)
     return lines, n_str, n_pages
 
 
 def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_map=None,
-                             order=DEFAULT_STR_ORDER):
+                             order=DEFAULT_STR_ORDER, split=None):
     """识别结果 debug JSON -> CAD 读的 L 行（和 X-AnyLabeling 那条路输出同一套格式）。
 
         L <页号> <fx> <fy> <名称> <角度> <字高占页比>      fx/fy 归一化、y 从下往上
@@ -679,6 +963,8 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
       frame_detect/map_lbd_str.py 的规则一致）；竖条 90°、横条 0°，字高按框短边。
       没落在任何 LBD 区域里的支架视为干扰，不编号（和 map_lbd_str.py 一样）。
 
+    split: 界面「支架」页每类的「拆不拆」（例 "13=3行; 9=不拆"）：选了 N 行的支架框
+           沿长边均分成 N 行，每行各一个号（同一张支架连号）。
     返回 dict：{ok, lines, lbd, str, pages} 或 {ok: False, error}。
     """
     try:
@@ -699,6 +985,10 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
                                       "不是识别结果 debug JSON"}
 
     digits = max(1, int(digits or 2))
+    split_map = parse_rack_split(split)
+    types = rack_types_from_doc(doc) if split_enabled(split_map) else []
+    tmap, note = (rack_type_indices(trk, page_size, types, split_map) if types else ({}, ""))
+    counts = {}                       # 类型下标 -> [拆几行, 列数]（只为日志）
     lines, n_lbd, n_str, n_pages = [], 0, 0, 0
     # 全册统一 STR 字高（同 rack_lines_from_debug）
     gratio = _global_short_ratio(page_size, trk)
@@ -709,17 +999,7 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
         pg_out = pg if page_map is None else page_map.get(pg)
         if pg_out is None:
             continue
-        dets = (trk.get(pg) or {}).get("detections") or []
-        nodes, typs = [], []
-        for d in dets:
-            b = d.get("bbox") or {}
-            if not all(k in b for k in ("x1", "y1", "x2", "y2")):
-                continue
-            lab = (d.get("label") or "").strip().lower()
-            if lab == "node":
-                nodes.append({"bbox": b})
-            elif lab in ("tracker", "typical"):
-                typs.append({"bbox": b})
+        nodes, typs = _page_boxes((trk.get(pg) or {}).get("detections"))
         if not nodes and not typs:
             continue
         n_pages += 1
@@ -749,22 +1029,30 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
             n_lbd += 1
 
         groups, heights = {}, []
-        for t in typs:
+        for ti, t in enumerate(typs):
             b = t["bbox"]
             heights.append(b["y2"] - b["y1"])
             p = _assign_parent(b, nodes)
             if p is None or not p.get("name"):
                 continue
             cx, cy = _center(b)
-            groups.setdefault(p["name"], []).append((cx, cy, b))
+            # 这一类支架要拆几行（认不出类型就 1 = 不拆，保持原样）
+            rows, tkey = 1, None
+            idx = (tmap.get(pg) or [])[ti] if ti < len(tmap.get(pg) or []) else None
+            if idx is not None and idx < len(types):
+                tkey = types[idx].get("strings")
+                rows = rack_split_rows(split_map, tkey)
+            groups.setdefault(p["name"], []).append((cx, cy, b, rows, tkey))
         heights.sort()
         med_h = heights[len(heights) // 2] if heights else 1.0
         med_w = _med_width(typs)
         for _grp, items in groups.items():
-            for k, (cx, cy, b) in enumerate(
-                    sort_items_by_order(items, med_h, order, med_w), 1):
+            racks = sort_items_by_order(items, med_h, order, med_w)
+            ordered = expand_racks(racks, order)
+            merge_counts(counts, count_splits(racks))
+            for k, (cx, cy, b, ob, _n, _t) in enumerate(ordered, 1):
                 nm = "%s%s" % (prefix, str(k).zfill(digits))
-                bw, bh = b["x2"] - b["x1"], b["y2"] - b["y1"]
+                bw, bh = ob["x2"] - ob["x1"], ob["y2"] - ob["y1"]
                 ang = 90 if bh > bw else 0
                 lines.append("L\t%d\t%.6f\t%.6f\t%s\t%d\t%.6f"
                              % (pg_out, cx / float(W), 1.0 - cy / float(H), nm, ang,
@@ -777,7 +1065,8 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
     except Exception as e:
         return {"ok": False, "error": "写提取文件失败：%s" % e}
     return {"ok": True, "lines": len(lines), "lbd": n_lbd, "str": n_str,
-            "pages": n_pages, "path": os.path.abspath(out_path)}
+            "pages": n_pages, "path": os.path.abspath(out_path),
+            "split": note or split_note(counts)}
 
 
 def page_region_bounds(json_path):
@@ -923,13 +1212,16 @@ def _med_width(typs):
     return ws[len(ws) // 2] if ws else 1.0
 
 
-def preview_group(json_path, order=DEFAULT_STR_ORDER, prefix="STR", digits=2):
+def preview_group(json_path, order=DEFAULT_STR_ORDER, prefix="STR", digits=2, split=None):
     """给界面预览用：取第一张有 Tracker 的图里"支架最多的那个 LBD 组"。
 
     返回 {"page": 页号, "group": 组名, "cols": 列数, "rows": 行数,
           "items": [(编号, 列号, 行号), ...], "count": n, "hint": 说明}；
     读不到返回 None。items 已按 order 排好，编号就是最终画到图上的 STR 号。
     列/行号由支架中心按 X/Y 分带得到（左上角为 (0, 0)）。
+
+    split: 界面「支架」页每类的「拆不拆」；选了行的支架在预览里也按拆后的格子画，
+           编号和实际画到图上的一致（同一张支架连号）。
     """
     try:
         with open(json_path, encoding="utf-8") as f:
@@ -942,18 +1234,16 @@ def preview_group(json_path, order=DEFAULT_STR_ORDER, prefix="STR", digits=2):
            for p in doc.get("yolo_tracker_detection_results") or []}
     order = norm_order(order)
     digits = max(1, int(digits or 2))
+    page_size = {}
+    for pgd in (doc.get("input_data") or {}).get("pages") or []:
+        page_size[pgd.get("page_number")] = (pgd.get("width") or 0, pgd.get("height") or 0)
+    split_map = parse_rack_split(split)
+    types = rack_types_from_doc(doc) if split_enabled(split_map) else []
+    tmap, note = (rack_type_indices(trk, page_size, types, split_map) if types else ({}, ""))
+    counts = {}
 
     for pg in sorted(p for p in trk if isinstance(p, int)):
-        nodes, typs = [], []
-        for d in (trk.get(pg) or {}).get("detections") or []:
-            b = d.get("bbox") or {}
-            if not all(k in b for k in ("x1", "y1", "x2", "y2")):
-                continue
-            lab = (d.get("label") or "").strip().lower()
-            if lab == "node":
-                nodes.append({"bbox": b})
-            elif lab in ("tracker", "typical"):
-                typs.append({"bbox": b})
+        nodes, typs = _page_boxes((trk.get(pg) or {}).get("detections"))
         if not typs or not nodes:
             continue
         for r in ocr.get(pg) or []:
@@ -968,25 +1258,33 @@ def preview_group(json_path, order=DEFAULT_STR_ORDER, prefix="STR", digits=2):
                            round(b["x2"], 1), round(b["y2"], 1)):
                     n["name"] = nm
         groups, heights = {}, []
-        for t in typs:
+        for ti, t in enumerate(typs):
             b = t["bbox"]
             heights.append(b["y2"] - b["y1"])
             p = _assign_parent(b, nodes)
             if p is None or not p.get("name"):
                 continue
             cx, cy = _center(b)
-            groups.setdefault(p["name"], []).append((cx, cy, b))
+            rows, tkey = 1, None
+            idx = (tmap.get(pg) or [])[ti] if ti < len(tmap.get(pg) or []) else None
+            if idx is not None and idx < len(types):
+                tkey = types[idx].get("strings")
+                rows = rack_split_rows(split_map, tkey)
+            groups.setdefault(p["name"], []).append((cx, cy, b, rows, tkey))
         if not groups:
             continue
         heights.sort()
         med_h = heights[len(heights) // 2] if heights else 1.0
         med_w = _med_width(typs)
         gname = max(groups, key=lambda k: len(groups[k]))       # 支架最多的那个组
-        items = sort_items_by_order(groups[gname], med_h, order, med_w)
+        racks = sort_items_by_order(groups[gname], med_h, order, med_w)
+        items = expand_racks(racks, order)                      # 拆成几行的按拆后画
+        merge_counts(counts, count_splits(racks))
 
-        # 按 X / Y 分带得到列号 / 行号（左上角为 (0,0)）
-        xb = _band([it[0] for it in items], max(1.0, med_w * 0.6))
-        yb = _band([it[1] for it in items], max(1.0, med_h * 0.6))
+        # 按 X / Y 分带得到列号 / 行号（左上角为 (0,0)）；
+        # 容差按格子间距自己定，拆成几行的小格子才不会被并回一行。
+        xb = _band_auto([it[0] for it in items])
+        yb = _band_auto([it[1] for it in items])
 
         def cidx(v, bands):
             return min(range(len(bands)), key=lambda i: abs(bands[i] - v))
@@ -994,10 +1292,14 @@ def preview_group(json_path, order=DEFAULT_STR_ORDER, prefix="STR", digits=2):
         data = [(("%s%s" % (prefix, str(i).zfill(digits))),
                  cidx(it[0], xb), cidx(it[1], yb))
                 for i, it in enumerate(items, 1)]
+        hint = "第 %s 页 · %s · %d 个号（%s ~ %s）" % (pg, gname, len(data),
+                                                        data[0][0], data[-1][0])
+        extra = note or split_note(counts)
+        if extra:
+            hint += "；" + extra
         return {"page": pg, "group": gname, "items": data, "count": len(data),
                 "cols": len(xb), "rows": len(yb), "order": order,
-                "hint": "第 %s 页 · %s · %d 个支架（%s ~ %s）"
-                        % (pg, gname, len(data), data[0][0], data[-1][0])}
+                "hint": hint}
     return None
 
 
