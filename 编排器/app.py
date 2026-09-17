@@ -33,7 +33,7 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_rack_types = _lr_rack_text = _lr_set_hints = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.20"
+APP_VERSION = "2.20.1"
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
@@ -160,14 +160,13 @@ def find_logo():
 
 
 def config_path():
-    cand = os.path.join(app_dir(), "config.json")
-    try:
-        open(cand, "a").close()
-        return cand
-    except Exception:
-        home = os.path.join(os.path.expanduser("~"), ".pdflayout_编排器")
-        os.makedirs(home, exist_ok=True)
-        return os.path.join(home, "config.json")
+    """配置文件路径（只读）。
+
+    以前这里会顺手 open(cand, "a") 建一个 config.json，关窗口时还会再写一遍；
+    程序放在桌面（本机就是这样）时，桌面上就凭空多出一个 config.json。
+    现在这个文件不再创建、也不再写入。
+    """
+    return os.path.join(app_dir(), "config.json")
 
 
 def load_config():
@@ -179,11 +178,6 @@ def load_config():
     out = dict(DEFAULTS)
     out.update({k: v for k, v in d.items() if k in DEFAULTS})
     return out
-
-
-def save_config(c):
-    with open(config_path(), "w", encoding="utf-8") as f:
-        json.dump(c, f, ensure_ascii=False, indent=2)
 
 
 def pdf_page_range_count(cfg):
@@ -2166,11 +2160,7 @@ class MainWindow(QMainWindow):
         self.log.appendPlainText(text)
 
     def closeEvent(self, ev):
-        """关窗口时把界面上的配置存下来（原来靠底部「保存配置」按钮，按钮已去掉）。"""
-        try:
-            save_config(self.cfg())
-        except Exception:
-            pass
+        """关窗口：不再写 config.json（以前会在 exe 同目录落一个文件）。"""
         super().closeEvent(ev)
 
     @staticmethod
