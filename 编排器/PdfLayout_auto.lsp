@@ -22,6 +22,18 @@
       nil))
 )
 
+;;; 计时(毫秒)：优先 MILLISECS，取不到就用 DATE 的当天比例换算（只为进度显示）
+(defun PdfLayout_NowMs (/ v)
+  (setq v (vl-catch-all-apply 'getvar (list "MILLISECS")))
+  (if (or (vl-catch-all-error-p v) (not (numberp v)) (<= v 0))
+    (progn
+      (setq v (vl-catch-all-apply 'getvar (list "DATE")))
+      (if (and (numberp v) (> v 0))
+        (fix (* (- v (fix v)) 86400000.0))
+        0))
+    (fix v))
+)
+
 ;;; 读取 key=value 的 ini 配置文件，返回 ((key . val) ...)
 (defun PdfLayout_ReadAutoConfig (path / f line eq k v out)
   (setq out nil)
@@ -213,10 +225,12 @@
           (setq vp (PdfLayout_LayoutBiggestVp actLay)))
         (progn (setq blk ms) (setq vp nil))
       )
-      (setq i 0 nDone 0 nSeen 0 statNoSheet 0 statNoLabel 0)
+      (setq i 0 nDone 0 nSeen 0 nPgDone 0 statNoSheet 0 statNoLabel 0)
       (PdfLayout_Prog (strcat "LBD_TOTAL " (itoa (length validItems))))
       (foreach u underlays
         (setq pgnum (1+ i))
+        (setq nPgDone 0)
+        (setq tPg0 (PdfLayout_NowMs))
         (setq bb (PdfLayout_GetExtentsSafeObj u))
         (if bb
           (progn
@@ -302,6 +316,7 @@
                               (if (and lay (not (vl-catch-all-error-p lay)))
                                 (vl-catch-all-apply 'vla-put-Layer (list mObj "LBD标签")))
                               (setq nDone (1+ nDone))
+                              (setq nPgDone (1+ nPgDone))
                                (setq lastRight rgt)
                             )
                           )
@@ -315,7 +330,9 @@
           )
         )
         (setq i (1+ i))
-        (PdfLayout_Prog (strcat "LBD_PAGE " (itoa pgnum) " " (itoa (length underlays))))
+        (PdfLayout_Prog (strcat "LBD_PAGE " (itoa pgnum) " " (itoa (length underlays))
+                                " filled=" (itoa nPgDone)
+                                " ms=" (itoa (max 0 (- (PdfLayout_NowMs) (if tPg0 tPg0 0))))))
       )
       (PdfLayout_Prog (strcat "LBD_DONE " (itoa nDone)))
       (PdfLayout_Prog (strcat "LBD_STAT 匹配到页=" (itoa nSeen) " 分表名没认出=" (itoa statNoSheet) " 编号表里没有=" (itoa statNoLabel) " 分表数=" (itoa (length sheetMap))))

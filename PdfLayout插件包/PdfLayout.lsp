@@ -44,6 +44,9 @@
 ;;; 全局状态与错误处理
 ;;;-------------------------------------------------------------
 (setq *PdfLayout_ViewInset* 1.0)    ; 对准视口时图纸占视口的比例：1.0=铺满、0.9=占 90%（编排器每次都会用界面「区域对准留白」填的数覆盖它）
+(setq *PdfLayout_LspVersion* "2026-09-17")   ; 插件版本（编排器只看能力标记，这行给人看）
+;; 能力标记：编排器发命令前读一眼 —— 老插件没有这行，「区域对准留白」改了也不生效。
+(setq *PdfLayout_LspFeatures* "viewinset")
 (setq *PdfLayout_Running* nil)
 (setq *PdfLayout_UndoOn* nil)
 (setq *PdfLayout_CreatedLayouts* nil)
@@ -1765,13 +1768,21 @@
 
 (defun PdfLayout_FitViewport (vpObj bbox lockVp
                               / bb pmin pmax pw ph minPt maxPt center w h
-                                scale viewH ok oldCmdEcho oldExpert)
+                                scale viewH ok oldCmdEcho oldExpert inset)
   (setq bb (PdfLayout_GetExtentsSafeObj vpObj))
   (if (and bb bbox)
     (progn
       (setq pmin (car bb) pmax (cadr bb))
-      (setq pw (* (- (car pmax) (car pmin)) *PdfLayout_ViewInset*))
-      (setq ph (* (- (cadr pmax) (cadr pmin)) *PdfLayout_ViewInset*))
+      ;; 区域对准留白（*PdfLayout_ViewInset*）= 图纸在视口里占的比例：
+      ;; 1.0 = 铺满视口；0.9 = 占 90%，四周留白；<1 越大越满，越小越空。
+      ;; 注意：这个系数只能作用一次 —— 先用视口真实尺寸算「刚好铺满」的 scale，
+      ;; 再把视图范围放大 1/inset。以前把 inset 乘进 pw/ph，又被 scale 约掉，
+      ;; 结果留白完全不生效（界面改了数也不动），这里别再改回去。
+      (setq inset (if (and *PdfLayout_ViewInset* (numberp *PdfLayout_ViewInset*)
+                           (> *PdfLayout_ViewInset* 0.05) (<= *PdfLayout_ViewInset* 1.0))
+                    *PdfLayout_ViewInset* 1.0))
+      (setq pw (- (car pmax) (car pmin)))
+      (setq ph (- (cadr pmax) (cadr pmin)))
       (setq minPt (car bbox) maxPt (cadr bbox))
       (setq center (list (/ (+ (car minPt) (car maxPt)) 2.0)
                          (/ (+ (cadr minPt) (cadr maxPt)) 2.0)
@@ -1781,11 +1792,11 @@
       (if (and (> pw 0.0) (> ph 0.0) (> w 0.0) (> h 0.0))
         (progn
           (setq scale (min (/ pw w) (/ ph h)))
-          (setq viewH (/ ph scale *PdfLayout_ViewInset*))
+          (setq viewH (/ (/ ph scale) inset))
           (if *PdfLayout_Debug*
             (princ (strcat "\n[PDF布局调试] 图纸 " (rtos w 2 2) " x " (rtos h 2 2)
                            " | 视口 " (rtos pw 2 2) " x " (rtos ph 2 2)
-                           " | 比例 " (rtos scale 2 4)
+                           " | 比例 " (rtos scale 2 4) " | 留白 " (rtos inset 2 3)
                            " | 视图高 " (rtos viewH 2 2)))
           )
           (setq oldCmdEcho (getvar "CMDECHO"))
