@@ -256,10 +256,11 @@
                     (PdfLayout_Prog (strcat "LBD_LABEL " (itoa nSeen)))
                   )
                   (setq fx (cadr it) fy (caddr it) stext (cadddr it))
-                  ;; LBD 字高：自动档且 L 行带第 7 列(LBD 区域宽/页高) -> 区域宽 x 底图高 x 倍数；
-                  ;; 没有第 7 列(按 PDF 文字层识别)或填了固定字高时，用原来的 txtH
+                  ;; LBD 字高：L 行带第 7 列(LBD 区域宽/页高) 且界面填了倍数 -> 区域宽 x 底图高 x 倍数；
+                  ;; 倍数填 0、或这行没有第 7 列(按 PDF 文字层识别出来的) -> 用原来的 txtH
+                  ;; （以前这里还要求「标签高度」必须是 0(自动档)，结果界面上填了倍数也不生效）
                   (setq hgtR (if (nth 5 it) (nth 5 it) 0.0))
-                  (setq txtHi (if (and autoTxt (> hgtR 0.0) (> bh 0.0)
+                  (setq txtHi (if (and (> hgtR 0.0) (> bh 0.0)
                                        (numberp *PdfLayout_LbdRegionScale*)
                                        (> *PdfLayout_LbdRegionScale* 0.0))
                                 (* hgtR bh *PdfLayout_LbdRegionScale*)
@@ -401,19 +402,24 @@
         (list (+ (car pmin) (* fx2 dx)) (+ (cadr pmin) (* fy2 dy)) 0.0))
 )
 
-(defun PdfLayout_AutoRegionFit (cfg names lockVp / regs draws i n bb r box vps vpObj k vp)
+(defun PdfLayout_AutoRegionFit (cfg names lockVp / regs draws i nTot k nm bb r box vps vpObj vp tPg0 msPg)
   (setq regs (PdfLayout_AutoReadRegions (PdfLayout_ACfg cfg "regionFile" "")))
   (if (and regs names)
     (progn
       (setq draws (PdfLayout_ScanMarkerDrawings (PdfLayout_ACfg cfg "filter" "pdf")))
       (setq i 0 k 0)
-      (foreach n names
+      ;; 按 LBD 区域上下限调视口大小：布局一多这一步也要几十秒，所以逐个布局写进度，
+      ;; 界面才能显示"区域对准 3/12"（REGION_TOTAL / REGION_FIT / REGION_DONE）。
+      (setq nTot (length names))
+      (PdfLayout_Prog (strcat "REGION_TOTAL " (itoa nTot)))
+      (foreach nm names
+        (setq tPg0 (PdfLayout_NowMs))
         (setq bb (nth i draws) r (nth i regs))
-        (if (and bb r (PdfLayout_GetLayoutObj n))
+        (if (and bb r (PdfLayout_GetLayoutObj nm))
           (progn
             (setq box (PdfLayout_AutoRegionBox bb r))
-            (command ".-LAYOUT" "_S" n "")
-            (setq vps (PdfLayout_GetLayoutViewports n))
+            (command ".-LAYOUT" "_S" nm "")
+            (setq vps (PdfLayout_GetLayoutViewports nm))
             (if vps
               (progn
                 (setq vp (car (PdfLayout_StableSort vps 'PdfLayout_CmpVpArea)))
@@ -427,17 +433,21 @@
           )
         )
         (setq i (1+ i))
+        (setq msPg (max 0 (- (PdfLayout_NowMs) (if tPg0 tPg0 0))))
+        (PdfLayout_Prog (strcat "REGION_FIT " (itoa i) " " (itoa nTot) " " (itoa k)
+                                " ms=" (itoa msPg)))
       )
+      (if (car names) (command ".-LAYOUT" "_S" (car names) ""))
+      (PdfLayout_Prog (strcat "REGION_DONE " (itoa k) " " (itoa nTot)))
       (if (> k 0)
-        (progn
-          (if (car names) (command ".-LAYOUT" "_S" (car names) ""))
-          (PdfLayout_Prog (strcat "REGION_FIT " (itoa k)))
-          (princ (strcat "\n[区域对准] 已按 LBD 区域上下限调好 " (itoa k) " 个布局的视口。"))
-        )
+        (princ (strcat "\n[区域对准] 已按 LBD 区域上下限调好 " (itoa k) " 个布局的视口。"))
         (princ "\n[区域对准] 没有可用区域范围，视口保持整页对准。")
       )
     )
-    (princ "\n[区域对准] 没有区域范围文件，视口保持整页对准。")
+    (progn
+      (PdfLayout_Prog "REGION_NONE")
+      (princ "\n[区域对准] 没有区域范围文件，视口保持整页对准。")
+    )
   )
   (princ)
 )
@@ -488,7 +498,7 @@
           (cons "Count" countVal)
           (cons "Margin" (atof (PdfLayout_ACfg cfg "margin" "5")))
           (cons "Overwrite" (= (PdfLayout_ACfg cfg "overwrite" "0") "1"))
-          (cons "LockViewport" (= (PdfLayout_ACfg cfg "lockViewport" "0") "1"))
+          (cons "LockViewport" nil)      ;; 界面已删掉「锁定视口显示」，固定不锁
           (cons "NamesList" names2)
         )
       )
@@ -496,7 +506,7 @@
       ;; 布局建好后按识别到的 LBD 区域上下限再对准一次视口（不是按整页）
       (if (and names2 (= (PdfLayout_ACfg cfg "regionFit" "1") "1"))
         (vl-catch-all-apply 'PdfLayout_AutoRegionFit
-          (list cfg names2 (= (PdfLayout_ACfg cfg "lockViewport" "0") "1")))
+          (list cfg names2 nil))         ;; 对准视口时同样不锁
       )
     )
   )

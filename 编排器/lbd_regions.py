@@ -810,7 +810,8 @@ def row_avoid_offsets(cells, anchor_y, obstacles, box_sizes, soft_boxes=(),
     if lo is None or hi < lo - 1e-9:
         return None
     g = max(1.0, float(gap) * max(float(s[1]) for s in box_sizes))
-    bad = []
+    bad = []                 # 只用来判"能不能完全避开"
+    pen = []                 # 判不出来的退路用：(a, b, 权重) —— 底图文字比压到自己的号更要紧
     for it, (bwid, bh) in zip(cells, box_sizes):
         lx1, lx2 = it[0] - float(bwid) / 2.0, it[0] + float(bwid) / 2.0
         for ox1, oy1, ox2, oy2 in obstacles:
@@ -819,6 +820,8 @@ def row_avoid_offsets(cells, anchor_y, obstacles, box_sizes, soft_boxes=(),
             ocy = (float(oy1) + float(oy2)) / 2.0
             half = (float(bh) + (float(oy2) - float(oy1))) / 2.0 + g
             bad.append((ocy - half - float(anchor_y), ocy + half - float(anchor_y)))
+            # 底图/标签文字的权重比"压到自己的号"高：宁可挤一点自己的号，也别盖住名字
+            pen.append((bad[-1][0], bad[-1][1], 3.0))
     # 别的号（原位）：不能比自己原来压得更厉害
     for it, (bwid, bh) in zip(cells, box_sizes):
         bx1, bx2 = it[0] - float(bwid) / 2.0, it[0] + float(bwid) / 2.0
@@ -832,6 +835,7 @@ def row_avoid_offsets(cells, anchor_y, obstacles, box_sizes, soft_boxes=(),
                 continue
             scy = (float(sy1) + float(sy2)) / 2.0
             bad.append((scy - r - float(anchor_y), scy + r - float(anchor_y)))
+            pen.append((bad[-1][0], bad[-1][1], 0.5))
     # 候选：原位、可动区间两端、每个禁区两侧各让开一点
     cands = [0.0, lo, hi]
     for a, b in bad:
@@ -844,7 +848,17 @@ def row_avoid_offsets(cells, anchor_y, obstacles, box_sizes, soft_boxes=(),
             continue
         ok.append(d)
     if not ok:
-        return None
+        # 整根 Typical 都被压住、挪到哪里都要压点什么：退一步挑"压得最轻、又离原位最近"的，
+        # 不走原来直接返回 None（= 一动不动的老行为，最后就是整片号压在底图文字上）。
+        best = best_key = None
+        for d in cands:
+            if d < lo - 1e-9 or d > hi + 1e-9:
+                continue
+            score = sum(w for a, b, w in pen if a - 1e-9 < d < b + 1e-9)
+            key = (score, abs(d), -d)
+            if best_key is None or key < best_key:
+                best, best_key = d, key
+        return best            # 一个候选都不在区间里才返回 None
     ok.sort(key=lambda d: (abs(d), -d))             # 动得最少优先；一样近就往下
     return ok[0]
 
@@ -894,6 +908,114 @@ def avoid_cells_offsets(ordered, ys, obstacles, label_ratio=0.0, page_h=0.0,
             for i in idxs:
                 off[i] = d
     return off
+
+
+def lbd_sheet_num(text):
+    """LBD 名称 -> (分表名, 编号)，规则和插件 PdfLayout_LbdSheetFromText/LbdNumFromText 一致。
+
+    "INV11A101-LBD-05" -> ("INV11A101", 5)；认不出返回 (None, None)。
+    """
+    s = str(text or "")
+    num = None
+    m = re.search(r"LBD[^0-9]*(\d+)", s, re.I)
+    if m:
+        num = int(m.group(1))
+    sheet = None
+    m2 = re.search(r"INV(\d+)([A-Za-z])(\d+)", s)
+    if m2:
+        sheet = ("INV" + m2.group(1) + m2.group(2) + m2.group(3)).upper()
+    return sheet, num
+
+
+def lbd_label_text_len(name, lens):
+    """这个 LBD 在 CAD 里会画出来的名字有多长（Excel 的 Item Code 串，如 "LGM/LGN" -> 7）。
+
+    lens: {分表名: {编号: 名称串长度}}（编排器从 Excel 读，见 app.read_xlsx_lbd_labels）。
+    查不到返回 0 —— CAD 那边也查不到、不会画这个标签，所以不当障碍。
+    """
+    if not lens:
+        return 0
+    sheet, num = lbd_sheet_num(name)
+    if not sheet or num is None:
+        return 0
+    d = lens.get(sheet) or lens.get(sheet.upper()) or lens.get(sheet.lower())
+    if not d:
+        return 0
+    v = d.get(num)
+    if v is None:
+        v = d.get(str(num))
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def lbd_label_boxes(json_path, scale=1.4, lens=None, page_map=None):
+    """CAD 侧会画的 LBD 标签框 -> {图纸页号: [(fx1, fy1, fx2, fy2), ...]}（归一化、fy 从下往上）。
+
+    和 PdfLayout_auto.lsp 的 PdfLayout_LbdAuto 对齐：
+      位置 = LBD 区域(Node 框)中心（fx/fy 和 STR 号同一套坐标系）；
+      scale > 0：字高 = LBD 区域宽 x scale（= L 行第 7 列 x 底图高 x *PdfLayout_LbdRegionScale*）；
+      scale = 0：CAD 用界面「标签高度」(默认 0.25 模型单位)，这边没有模型尺寸可比，
+                 按插件自动档同一套换算估一个（maxDim/150 -> (页宽+页高)/150 像素）；
+      文字 = Excel 里这个 LBD 编号下的 Item Code 串，宽 = 字高 x (0.8 x 字数 + 0.2)。
+    查不到 Excel 名称的不输出（CAD 那边同样不画）。
+    STR 号带背景填充，压在这些标签上会把 LBD 名字盖掉，所以拿来当避让障碍。
+    """
+    out = {}
+    try:
+        scale = float(scale or 0)
+    except (TypeError, ValueError):
+        scale = 0.0
+    try:
+        with open(json_path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except Exception:
+        return out
+    page_size = {}
+    for pg in (doc.get("input_data") or {}).get("pages") or []:
+        page_size[pg.get("page_number")] = (pg.get("width") or 0, pg.get("height") or 0)
+    ocr = {p.get("page_number"): (p.get("data") or [])
+           for p in doc.get("ocr_node_name_results") or []}
+    trk = {p.get("page_number"): (p.get("data") or {})
+           for p in doc.get("yolo_tracker_detection_results") or []}
+    for pg in sorted(p for p in trk if isinstance(p, int)):
+        W, H = page_size.get(pg, (0, 0))
+        if not W or not H:
+            continue
+        pg_out = pg if page_map is None else page_map.get(pg)
+        if pg_out is None:
+            continue
+        nodes, _typs = _page_boxes((trk.get(pg) or {}).get("detections"))
+        if not nodes:
+            continue
+        name_by_key = {}
+        for r in ocr.get(pg) or []:
+            nb = r.get("node_bbox") or {}
+            if not all(k in nb for k in ("x1", "y1", "x2", "y2")):
+                continue
+            key = (round(nb["x1"], 1), round(nb["y1"], 1),
+                   round(nb["x2"], 1), round(nb["y2"], 1))
+            name_by_key[key] = (r.get("final_node_name")
+                                or r.get("preliminary_node_name") or "").strip()
+        boxes = []
+        for n in nodes:
+            b = n["bbox"]
+            key = (round(b["x1"], 1), round(b["y1"], 1),
+                   round(b["x2"], 1), round(b["y2"], 1))
+            tlen = lbd_label_text_len(name_by_key.get(key, ""), lens)
+            if not tlen:
+                continue
+            cx, cy = _center(b)
+            hh = max(1.0, b["x2"] - b["x1"]) * scale       # 字高（页像素）
+            ww = hh * (0.8 * tlen + 0.2)
+            fx1, fx2 = (cx - ww / 2.0) / float(W), (cx + ww / 2.0) / float(W)
+            fy1, fy2 = 1.0 - (cy + hh / 2.0) / float(H), 1.0 - (cy - hh / 2.0) / float(H)
+            boxes.append((min(max(fx1, 0.0), 1.0), min(max(fy1, 0.0), 1.0),
+                          min(max(fx2, 0.0), 1.0), min(max(fy2, 0.0), 1.0)))
+        if boxes:
+            out[pg_out] = boxes
+    return out
 
 
 # ---------------------------------------------------------------- 支架拆分（一列拆成几行）
