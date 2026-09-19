@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 # Voltage-CAD MAP · PDF 半自动流程编排器（PySide6/Qt 界面）
 # 业务逻辑（扫描/计划/配置/ZWCAD 自动化）与旧 ctypes 版保持一致。
-import os, sys, json, re, tempfile, threading, time, subprocess, shutil
-import urllib.request, urllib.error
+import os, sys, json, re, glob, hashlib, tempfile, threading, time, subprocess, shutil
+import urllib.request, urllib.error, urllib.parse
 from PySide6.QtCore import Qt, Signal, QObject, QTimer
 from PySide6.QtGui import QColor, QPainter, QIcon, QPixmap
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QLabel, QLineEdit, QPushButton, QProgressBar, QStackedWidget,
                                QScrollArea, QFileDialog, QButtonGroup, QPlainTextEdit,
                                QFrame, QGridLayout, QCheckBox, QRadioButton, QComboBox,
-                               QMessageBox, QDialog)
+                               QMessageBox, QDialog, QListWidget, QListWidgetItem)
 from pypdf import PdfReader
 
 try:
@@ -41,7 +41,7 @@ UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_PAGE = "https://github.com/%s/releases" % UPDATE_REPO
 FIELDS = [
-    ("dwg", "目标 DWG 文件"),
+    ("dwg", "模板 DWG 文件"),
     ("pdf", "PDF 文件路径"), ("xlsx", "LBD 名称 Excel"), ("jsonPath", "识别结果 JSON文件"),
     ("newName", "新文件名(可空)"), ("pageStart", "起始页"), ("pageEnd", "结束页(0=全部)"),
     ("importPages", "导入页码(0=全部)"),
@@ -98,7 +98,7 @@ STR_ORDER_CHOICES = _LR_ORDER_LABELS or [
 COLOR_CHOICES = [("红", "1"), ("黄", "2"), ("绿", "3"), ("青", "4"),
                  ("蓝", "5"), ("洋红", "6"), ("白", "7"), ("灰", "8")]
 SECTIONS = [
-    ("文件与输出", [("dwg", "目标 DWG 文件"),
+    ("文件与输出", [("dwg", "模板 DWG 文件"),
                   ("pdf", "PDF 文件路径"), ("xlsx", "LBD 名称 Excel"),
                   ("jsonPath", "识别结果 JSON文件"),
                   ("newName", "新文件名(可空)")]),
@@ -1240,6 +1240,181 @@ def http_get(url, timeout=15):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+# ---- 更新包下载：GitHub 直连在国内常年几十 KB/s 甚至被重置，这里先测速再挑源 ----
+# 顺序只是备选清单，真正用哪个由测速决定；最后一项 "" 是直连。
+DOWNLOAD_MIRRORS = (
+    "https://gh-proxy.com/",
+    "https://ghfast.top/",
+    "https://ghproxy.net/",
+    "",
+)
+PROBE_BYTES = 1024 * 1024        # 每个源先下 1MB 测速
+IDLE_TIMEOUT = 20                # 连续这么多秒没有新数据就当卡住，换源
+
+
+def dl_headers(extra=None):
+    h = {"User-Agent": "%s/%s" % (APP_TITLE, APP_VERSION),
+         "Accept": "application/octet-stream"}
+    if extra:
+        h.update(extra)
+    return h
+
+
+def short_url(u):
+    """日志里用：只保留主机名，免得整条签名地址糊满日志。"""
+    try:
+        return urllib.parse.urlsplit(u).netloc or u
+    except Exception:
+        return u
+
+
+def probe_speed(url, probe_bytes=PROBE_BYTES, timeout=6, max_secs=3):
+    """下 probe_bytes 字节测速，返回「下满这些字节大约要几秒」；不通返回 None。
+
+    慢源不能干等：超过 max_secs 就按已经下到的字节折算，免得一个死慢的镜像
+    把测速阶段拖成几分钟。
+    """
+    import urllib.request
+    req = urllib.request.Request(
+        url, headers=dl_headers({"Range": "bytes=0-%d" % (probe_bytes - 1)}))
+    t0 = time.time()
+    got = 0
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            while got < probe_bytes:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                got += len(chunk)
+                if time.time() - t0 > max_secs:
+                    break
+    except Exception:
+        return None
+    if got <= 0:
+        return None
+    return (time.time() - t0) * probe_bytes / float(got)
+
+
+def pick_sources(url, log=None):
+    """把各个镜像 + 直连测速排序，返回 [(地址, 耗时秒或 None), ...]，最快的排前面。
+
+    几个源同时测，不然串行等慢源会很久。
+    """
+    cands = [(url if not p else p + url) for p in DOWNLOAD_MIRRORS]
+    result = {}
+
+    def worker(u):
+        result[u] = probe_speed(u)
+
+    threads = [threading.Thread(target=worker, args=(u,), daemon=True) for u in cands]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    scored = [(u, result.get(u)) for u in cands]
+    if log:
+        for u, sec in scored:
+            log("测速 %s：%s" % (short_url(u),
+                                ("约 %.1f 秒 / 1MB" % sec) if sec else "不通"))
+    scored.sort(key=lambda x: (x[1] is None, x[1] or 0))
+    return scored
+
+
+def fetch_into(src, part, got, total, progress=None, detail=None):
+    """从 src 把数据续写到 part；返回 (已下载字节, 总字节)。
+
+    连接断开或卡住（IDLE_TIMEOUT 秒没有新数据）会抛异常，交给调用方换源。
+    """
+    import urllib.request
+    headers = dl_headers({"Range": "bytes=%d-" % got} if got else None)
+    mode = "ab" if got else "wb"
+    req = urllib.request.Request(src, headers=headers)
+    with urllib.request.urlopen(req, timeout=IDLE_TIMEOUT) as r:
+        code = getattr(r, "status", 200) or 200
+        if got and code != 206:          # 这个源不认 Range：只能从头下
+            got = 0
+            mode = "wb"
+        try:
+            clen = int(r.headers.get("Content-Length") or 0)
+        except Exception:
+            clen = 0
+        if clen:
+            total = clen + (got if code == 206 else 0)
+        t0 = time.time()
+        with open(part, mode) as f:
+            while True:
+                chunk = r.read(262144)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                if progress and total:
+                    progress(int(got * 100 / total))
+                if detail:
+                    speed = got / max(0.001, time.time() - t0)
+                    detail("%.1f/%.1fMB  %.0fKB/s"
+                           % (got / 1048576.0, (total or 0) / 1048576.0, speed / 1024.0))
+    return got, total
+
+
+def download_file(url, dest, progress=None, detail=None, log=None, key=""):
+    """下载 url 到 dest：先测速选源，中途卡住/断开就换源续传。
+
+    进度：progress(百分比)、detail(「已下 12.3/68.7MB 1.2MB/s」)；log(一行日志)。
+    下载先写 <dest>.<key>.part，下完再改名，所以中断了下次能接着下。
+    """
+    part = "%s.%s.part" % (dest, key) if key else (dest + ".part")
+    got = os.path.getsize(part) if os.path.exists(part) else 0
+    total = 0
+    sources = [s for s, _ in pick_sources(url, log=log)]
+    errors = []
+    for _round in range(3):
+        for src in list(sources):
+            try:
+                if log:
+                    log("从 %s 下载…（已有 %.1fMB）" % (short_url(src), got / 1048576.0))
+                got, total = fetch_into(src, part, got, total, progress, detail)
+            except Exception as e:
+                # 断开时 fetch_into 没来得及返回，已下的字节数在 part 文件里，得自己捡回来
+                try:
+                    if os.path.exists(part):
+                        got = os.path.getsize(part)
+                except Exception:
+                    pass
+                errors.append("%s: %s" % (short_url(src), e))
+                if log:
+                    log("  %s 断了（%s）；已下 %.1fMB，这里排到最后，换个源接着下"
+                        % (short_url(src), e, got / 1048576.0))
+                # 这个源刚断过，后面的轮次里放最后再试
+                if src in sources:
+                    sources.remove(src)
+                    sources.append(src)
+                continue
+            if not total or got >= total:      # 没有 Content-Length 时按「读完了」算完成
+                if os.path.exists(dest):
+                    try:
+                        os.remove(dest)
+                    except Exception:
+                        pass
+                os.replace(part, dest)
+                if detail:
+                    detail("下载完成 %.1fMB" % (os.path.getsize(dest) / 1048576.0))
+                if log:
+                    log("下载完成：%s（%.1fMB）"
+                        % (dest, os.path.getsize(dest) / 1048576.0))
+                for stale in glob.glob(dest + ".*.part"):     # 清掉别的版本的半截文件
+                    if os.path.abspath(stale) != os.path.abspath(part):
+                        try:
+                            os.remove(stale)
+                        except Exception:
+                            pass
+                return dest
+        if total and got >= total:
+            break
+    raise RuntimeError("下载没完成（已下 %s / %s）：%s"
+                       % (got, total or "未知", "；".join(errors[-3:]) or "所有源都不通"))
+
+
 def fmt_time(iso):
     """GitHub 的 ISO 时间 -> 本地 2026-09-14 20:05。"""
     import datetime
@@ -1287,26 +1462,6 @@ def fetch_release():
     }, "")
 
 
-def download_file(url, dest, progress=None):
-    """下载到 dest，progress(百分比) 回调可选。"""
-    with http_get(url, timeout=120) as r:
-        try:
-            total = int(r.headers.get("Content-Length") or 0)
-        except Exception:
-            total = 0
-        got = 0
-        with open(dest, "wb") as f:
-            while True:
-                chunk = r.read(262144)
-                if not chunk:
-                    break
-                f.write(chunk)
-                got += len(chunk)
-                if progress and total:
-                    progress(int(got * 100 / total))
-    return dest
-
-
 def update_check_worker(bus):
     info, err = fetch_release()
     if err or not info:
@@ -1337,9 +1492,13 @@ def update_download_worker(url, bus):
         d = os.path.join(tempfile.gettempdir(), "VCADMAP_update")
         os.makedirs(d, exist_ok=True)
         dest = os.path.join(d, UPDATE_ASSET)
-        if os.path.exists(dest):
-            os.remove(dest)
-        download_file(url, dest, progress=lambda p: bus.upd_progress.emit(p))
+        # 半截文件按下载地址区分：换了版本就从新的一份开始，不会拿旧版残留续传
+        key = hashlib.md5(url.encode("utf-8")).hexdigest()[:8]
+        download_file(url, dest,
+                      progress=lambda p: bus.upd_progress.emit(p),
+                      detail=lambda t: bus.upd_detail.emit(t),
+                      log=lambda m: bus.upd_log.emit(m),
+                      key=key)
         bus.upd_ready.emit(dest)
     except Exception as e:
         bus.upd_error.emit("下载更新失败：%s" % e)
@@ -1434,6 +1593,226 @@ def save_worker(path, bus):
                 pass
 
 
+# ---------------- 导出 PDF（打印布局） ----------------
+# 实测（ZWCAD 2026）：设备/纸型列表要问布局对象 ActiveLayout.GetPlotDeviceNames /
+# GetCanonicalMediaNames；Plot.PlotToFile 的参数顺序是「文件名, 设备名」，和 AutoCAD
+# 文档里写的相反，所以下面先按 ZWCAD 的顺序试，失败再试另一种写法。
+CAD_PROGIDS = ("ZWCAD.Application", "AutoCAD.Application")
+
+
+def cad_connect(create=False):
+    """连正在运行的 CAD。导出 PDF 要用当前打开的那张图，所以默认不新开实例。"""
+    import win32com.client as win32
+    for progid in CAD_PROGIDS:
+        try:
+            acad = win32.GetActiveObject(progid)
+        except Exception:
+            acad = None
+        if acad:
+            return acad, ""
+    if not create:
+        return None, "连不上 CAD：请先打开 ZWCAD 和要导出的图纸。"
+    for progid in CAD_PROGIDS:
+        try:
+            return win32.DispatchEx(progid), ""
+        except Exception:
+            continue
+    return None, "连不上 CAD，也没有可启动的 ZWCAD / AutoCAD。"
+
+
+def cad_doc_or_none(acad):
+    try:
+        return acad.ActiveDocument
+    except Exception:
+        return None
+
+
+def cad_layout_names(doc):
+    """当前图纸里可以打印的布局名（不含 Model）。"""
+    out = []
+    try:
+        layouts = doc.Layouts
+        for i in range(layouts.Count):
+            nm = str(layouts.Item(i).Name or "")
+            if nm and nm.lower() != "model":
+                out.append(nm)
+    except Exception:
+        pass
+    return out
+
+
+def cad_plot_devices(doc):
+    """CAD 里可用的 PDF 类打印设备。只列名字带 PDF 的，不列实体打印机。"""
+    out = []
+    try:
+        names = doc.ActiveLayout.GetPlotDeviceNames()
+    except Exception:
+        return out
+    try:
+        for i in range(len(names)):
+            nm = str(names[i] or "").strip()
+            if nm and "PDF" in nm.upper() and nm not in out:
+                out.append(nm)
+    except Exception:
+        pass
+    return out
+
+
+def cad_plot_media(doc, device):
+    """切到指定设备后取该设备的纸型 [(友好名, 规范名), ...]，取完把设备还原。"""
+    lay = doc.ActiveLayout
+    try:
+        old = lay.ConfigName
+    except Exception:
+        old = None
+    pairs = []
+    try:
+        lay.ConfigName = device
+        names = lay.GetCanonicalMediaNames()
+        for i in range(len(names)):
+            canon = str(names[i])
+            label = canon
+            try:
+                label = str(lay.GetLocaleMediaName(canon))
+            except Exception:
+                pass
+            pairs.append((label, canon))
+    except Exception:
+        pairs = []
+    finally:
+        if old:
+            try:
+                lay.ConfigName = old
+            except Exception:
+                pass
+    return pairs
+
+
+def media_match_by_size(old_media, candidates):
+    """换设备后原纸型名可能不认：按尺寸数字（如 420.00_x_297.00）找同规格的纸型。"""
+    key = re.findall(r"\d+(?:\.\d+)?", old_media or "")
+    if not key:
+        return ""
+    want = set(key)
+    loose = ""
+    for c in candidates:
+        got = set(re.findall(r"\d+(?:\.\d+)?", c))
+        if got == want:              # 尺寸完全一样的优先（避开 full_bleed 之类）
+            return c
+        if not loose and got >= want:
+            loose = c
+    return loose
+
+
+def plot_one_to_file(plot, device, out_file):
+    """ZWCAD 是 PlotToFile(文件, 设备)；AutoCAD 文档写的是反的，两种都试。"""
+    try:
+        plot.PlotToFile(out_file, device)
+    except Exception as first:
+        try:
+            plot.PlotToFile(device, out_file)
+        except Exception:
+            raise first
+
+
+def plot_worker(layouts, device, media_canon, out_path, bus):
+    """把勾选的布局逐张打印成 PDF，再合并成一个多页 PDF；中间文件用完就删。"""
+    pythoncom = None
+    tmpdir = None
+    notes = []
+    try:
+        import pythoncom
+        import win32com.client as win32
+        from pypdf import PdfWriter
+        pythoncom.CoInitialize()
+        acad, msg = cad_connect()
+        if not acad:
+            bus.plot_result.emit(False, msg)
+            return
+        doc = cad_doc_or_none(acad)
+        if doc is None:
+            bus.plot_result.emit(False, "CAD 里没有打开的图纸。")
+            return
+        plot = doc.Plot
+        try:
+            plot.QuietErrorMode = True          # ZWCAD 里是属性，不是方法
+        except Exception:
+            pass
+        try:
+            old_tab = doc.GetVariable("CTAB")
+        except Exception:
+            old_tab = None
+        # 该设备的纸型清单（"随布局页面设置" 时用来找同规格纸型）
+        dev_media = [canon for _lab, canon in cad_plot_media(doc, device)]
+
+        tmpdir = tempfile.mkdtemp(prefix="vcad_pdf_")
+        total = len(layouts)
+        outs = []
+        for i, name in enumerate(layouts, 1):
+            bus.plot_prog.emit(i - 1, total)
+            doc.SetVariable("CTAB", name)
+            lay = doc.ActiveLayout
+            try:
+                old_media = str(lay.CanonicalMediaName or "")
+            except Exception:
+                old_media = ""
+            try:
+                lay.ConfigName = device
+            except Exception as e:
+                raise RuntimeError("切换到打印设备「%s」失败：%s" % (device, e))
+            want = media_canon or ""
+            if not want and old_media:
+                if old_media in dev_media:
+                    want = old_media
+                else:
+                    want = media_match_by_size(old_media, dev_media)
+                    if not want:
+                        notes.append("布局「%s」原来的纸型在新设备里没有同规格的，按设备默认纸型打印" % name)
+            if want:
+                try:
+                    lay.CanonicalMediaName = want
+                except Exception as e:
+                    raise RuntimeError("布局「%s」设置纸型失败（%s）：%s" % (name, want, e))
+            out_i = os.path.join(tmpdir, "%04d.pdf" % i)
+            plot_one_to_file(plot, device, out_i)
+            if not os.path.exists(out_i) or os.path.getsize(out_i) <= 0:
+                raise RuntimeError("布局「%s」没有生成 PDF（设备 %s）。" % (name, device))
+            outs.append(out_i)
+            bus.plot_prog.emit(i, total)
+
+        writer = PdfWriter()
+        for p in outs:
+            writer.append(p)
+        part = out_path + ".part"
+        with open(part, "wb") as f:
+            writer.write(f)
+        os.replace(part, out_path)
+        if old_tab:
+            try:
+                doc.SetVariable("CTAB", old_tab)
+            except Exception:
+                pass
+    except Exception as e:
+        msg = str(e)
+        if "pythoncom" in msg or "win32com" in msg or "pywintypes" in msg:
+            msg = ("连接 CAD 需要 pywin32（pythoncom）：%s\n"
+                   "打包版要用装了 pywin32 的 Python 重新打包。" % msg)
+        bus.plot_result.emit(False, msg)
+        return
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        if pythoncom is not None:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+    if notes:
+        bus.plot_result.emit(True, "%s\n（%s）" % (out_path, "；".join(notes)))
+    else:
+        bus.plot_result.emit(True, out_path)
+
+
 # ---------------- Qt 界面 ----------------
 QSS = """
 * { font-family: 'Microsoft YaHei', 'SimHei'; font-size: 14px; color: #DADFE3; }
@@ -1483,6 +1862,13 @@ QScrollArea { border: none; background: transparent; }
 QCheckBox, QRadioButton { background: transparent; color: #DADFE3; }
 QPushButton:disabled { background-color: rgba(255,255,255,0.03); color: #5c6064;
   border: 1px solid rgba(255,255,255,0.06); }
+QComboBox { background-color: #1f2124; border: 1px solid #2a2c2e; border-radius: 8px;
+  padding: 4px 8px; color: #DADFE3; }
+QComboBox QAbstractItemView { background-color: #1f2124; color: #DADFE3;
+  selection-background-color: #0432FA; }
+QListWidget { background-color: #1f2124; border: 1px solid #2a2c2e; border-radius: 8px;
+  color: #DADFE3; }
+QListWidget::item { padding: 4px 6px; }
 """
 
 
@@ -1494,11 +1880,15 @@ class Bus(QObject):
     racks = Signal(list)          # 支架类型明细（后台线程解析完推给界面）
     strprev = Signal(object)        # STR 顺序预览（后台线程 -> 界面）
     save_result = Signal(bool, str)
+    plot_prog = Signal(int, int)          # 导出 PDF：已完成 / 总数
+    plot_result = Signal(bool, str)       # 导出 PDF：成功?, 路径或错误
     upd_found = Signal(str, str, str, str)
     upd_none = Signal(str, str, str)
     upd_notes = Signal(str, str, str, bool)
     upd_error = Signal(str)
     upd_progress = Signal(int)
+    upd_detail = Signal(str)      # 下载明细：已下多少 / 总大小 / 速度
+    upd_log = Signal(str)         # 下载过程写进界面日志（测速、换源等）
     upd_ready = Signal(str)
 
 
@@ -1698,6 +2088,188 @@ class StrOrderPreview(QWidget):
 
 
 
+class PrintDialog(QDialog):
+    """导出 PDF：勾选要打印的布局 + 选打印设备 / 纸型 + 选输出位置。"""
+
+    def __init__(self, parent, layouts, prechecked, devices, default_device,
+                 media_provider, out_dir, file_name):
+        super().__init__(parent)
+        self.setWindowTitle("导出 PDF")
+        self.setMinimumWidth(580)
+        self._media_provider = media_provider
+        self._media_cache = {}
+        self.data = {}
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 18, 20, 16)
+        v.setSpacing(12)
+
+        title = QLabel("导出 PDF")
+        title.setObjectName("PageTitle")
+        v.addWidget(title)
+        sub = QLabel("勾选要打印的布局；会按列表顺序逐张打印，最后合成一个多页 PDF。")
+        sub.setObjectName("Hint")
+        sub.setWordWrap(True)
+        v.addWidget(sub)
+
+        self.list = QListWidget()
+        self.list.setMinimumHeight(190)
+        preset = set(prechecked or [])
+        for nm in layouts:
+            it = QListWidgetItem(nm)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            # 没指定默认勾选（比如不是刚跑完流程）就全勾上
+            it.setCheckState(Qt.Checked if (not preset or nm in preset) else Qt.Unchecked)
+            self.list.addItem(it)
+        v.addWidget(self.list)
+
+        hb = QHBoxLayout()
+        hb.setSpacing(8)
+        for txt, state in (("全选", True), ("全不选", False)):
+            b = QPushButton(txt)
+            b.setFixedHeight(30)
+            b.clicked.connect(lambda _=False, s=state: self._check_all(s))
+            hb.addWidget(b)
+        self.count_hint = QLabel("")
+        self.count_hint.setObjectName("Hint")
+        hb.addWidget(self.count_hint, 1)
+        v.addLayout(hb)
+
+        g = QGridLayout()
+        g.setHorizontalSpacing(12)
+        g.setVerticalSpacing(10)
+        g.addWidget(QLabel("打印设备"), 0, 0)
+        self.dev = NoWheelCombo()
+        self.dev.setMinimumWidth(360)
+        for d in devices:
+            self.dev.addItem(d)
+        if default_device in devices:
+            self.dev.setCurrentIndex(devices.index(default_device))
+        g.addWidget(self.dev, 0, 1)
+        g.addWidget(QLabel("纸型"), 1, 0)
+        self.media = NoWheelCombo()
+        g.addWidget(self.media, 1, 1)
+        g.addWidget(QLabel("输出目录"), 2, 0)
+        dh = QHBoxLayout()
+        dh.setSpacing(8)
+        self.dir = QLineEdit(out_dir or "")
+        dh.addWidget(self.dir, 1)
+        db = QPushButton("浏览…")
+        db.setFixedHeight(30)
+        db.clicked.connect(self._pick_dir)
+        dh.addWidget(db)
+        g.addLayout(dh, 2, 1)
+        g.addWidget(QLabel("文件名"), 3, 0)
+        self.name = QLineEdit(file_name or "")
+        g.addWidget(self.name, 3, 1)
+        v.addLayout(g)
+
+        self.hint = QLabel("")
+        self.hint.setObjectName("Hint")
+        self.hint.setWordWrap(True)
+        v.addWidget(self.hint)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        cancel = QPushButton("取消")
+        cancel.setFixedHeight(34)
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(cancel)
+        self.ok = QPushButton("开始导出")
+        self.ok.setObjectName("Primary")
+        self.ok.setFixedHeight(34)
+        self.ok.clicked.connect(self._accept)
+        btns.addWidget(self.ok)
+        v.addLayout(btns)
+
+        self.list.itemChanged.connect(self._sync_hint)
+        self.dir.textChanged.connect(self._sync_hint)
+        self.name.textChanged.connect(self._sync_hint)
+        self.dev.currentIndexChanged.connect(self._reload_media)
+        self._reload_media()
+        self._sync_hint()
+
+    # ---- 内部 ----
+    def _check_all(self, state):
+        for i in range(self.list.count()):
+            self.list.item(i).setCheckState(Qt.Checked if state else Qt.Unchecked)
+
+    def checked_layouts(self):
+        out = []
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if it.checkState() == Qt.Checked:
+                out.append(it.text())
+        return out
+
+    def out_name(self):
+        nm = (self.name.text() or "").strip() or "MAP文件"
+        if not nm.lower().endswith(".pdf"):
+            nm += ".pdf"
+        return nm
+
+    def _sync_hint(self, *_a):
+        n = len(self.checked_layouts())
+        self.count_hint.setText("已勾选 %d 个布局" % n)
+        d = (self.dir.text() or "").strip()
+        where = os.path.join(d, self.out_name()) if d else self.out_name()
+        self.hint.setText("输出：%s（先逐张打印到临时文件，合并成功后临时文件自动删掉）" % where)
+        self.ok.setEnabled(n > 0)
+
+    def _pick_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择导出目录",
+                                             (self.dir.text() or "").strip())
+        if d:
+            self.dir.setText(d)
+
+    def _reload_media(self, *_a):
+        dev = self.dev.currentText()
+        keep = self.media.currentData() if self.media.count() else None
+        self.media.clear()
+        self.media.addItem("随布局页面设置（不改纸型）", "")
+        pairs = self._media_cache.get(dev)
+        if pairs is None:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                pairs = list(self._media_provider(dev) or []) if self._media_provider else []
+            except Exception:
+                pairs = []
+            finally:
+                QApplication.restoreOverrideCursor()
+            self._media_cache[dev] = pairs
+        for label, canon in pairs:
+            self.media.addItem(label, canon)
+        if keep:
+            idx = self.media.findData(keep)
+            if idx >= 0:
+                self.media.setCurrentIndex(idx)
+        if self.media.count() <= 1:
+            self.hint.setText(self.hint.text() +
+                              "\n（没读到这个设备的纸型清单，将按图纸原来的纸型打印）")
+
+    def _accept(self):
+        if not self.checked_layouts():
+            QMessageBox.warning(self, "导出 PDF", "至少要勾选一个布局。")
+            return
+        d = (self.dir.text() or "").strip()
+        if not d:
+            QMessageBox.warning(self, "导出 PDF", "请填输出目录。")
+            return
+        if not os.path.isdir(d):
+            if QMessageBox.question(self, "导出 PDF", "目录不存在：\n%s\n\n要新建吗？" % d) != QMessageBox.Yes:
+                return
+            try:
+                os.makedirs(d, exist_ok=True)
+            except Exception as e:
+                QMessageBox.warning(self, "导出 PDF", "建目录失败：%s" % e)
+                return
+        self.data = {"layouts": self.checked_layouts(),
+                     "device": self.dev.currentText(),
+                     "media": self.media.currentData() or "",
+                     "out_path": os.path.join(d, self.out_name())}
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1709,11 +2281,15 @@ class MainWindow(QMainWindow):
         self.bus.done.connect(self.on_done)
         self.bus.status.connect(self.on_status)
         self.bus.save_result.connect(self.on_save_result)
+        self.bus.plot_prog.connect(self.on_plot_prog)
+        self.bus.plot_result.connect(self.on_plot_result)
         self.bus.upd_found.connect(self.on_upd_found)
         self.bus.upd_none.connect(self.on_upd_none)
         self.bus.upd_notes.connect(self.on_upd_notes)
         self.bus.upd_error.connect(self.on_upd_error)
         self.bus.upd_progress.connect(self.on_upd_progress)
+        self.bus.upd_detail.connect(self.on_upd_detail)
+        self.bus.upd_log.connect(self.on_upd_log)
         self.bus.upd_ready.connect(self.on_upd_ready)
         self.edits = {}
         self.checkbox = {}
@@ -1726,12 +2302,17 @@ class MainWindow(QMainWindow):
         self._upd_tag = ""
         self._upd_install = False
         self._upd_silent = False
+        self._upd_pct = 0
+        self._upd_detail = ""
+        self._upd_logged = -1
         self.total = 0
         self.done_n = 0
         self.run_status = ""
         self._prog_path = None
         self._prog_len = 0
         self._poll_timer = None
+        self._generated_layouts = []      # 本次生成的布局名（导出 PDF 默认勾这些）
+        self._print_prefs = {}            # 上次选过的设备/纸型/目录（只在本次运行内记）
         self._build_ui()
         self.set_cfg(load_config())
         # 起始页/结束页 失焦或按回车时，按范围自动算出“复制数量”（不逐字触发，避免卡输入）
@@ -2213,6 +2794,11 @@ class MainWindow(QMainWindow):
         self.save_btn.setFixedHeight(38)
         self.save_btn.setEnabled(False)
         self.save_btn.clicked.connect(self.on_save_dwg)
+        self.pdf_btn = QPushButton("导出 PDF")
+        self.pdf_btn.setFixedHeight(38)
+        self.pdf_btn.setEnabled(False)
+        self.pdf_btn.clicked.connect(self.on_export_pdf)
+        fv.addWidget(self.pdf_btn)
         fv.addWidget(self.save_btn)
         v.addWidget(fin)
         return page
@@ -2386,8 +2972,11 @@ class MainWindow(QMainWindow):
         self._ai_step = ensure_ai_lsp() is not None
         self._finish_ready = False
         self._phase = ""
+        self._generated_layouts = list(_names)
         self.save_btn.setEnabled(False)
         self.save_btn.setText("下载")
+        self.pdf_btn.setEnabled(False)
+        self.pdf_btn.setText("导出 PDF")
         self.finish_title.setText("生成完成后，点右下角「下载」选择保存位置")
         self.finish_hint.setText("不会再自动保存到“默认保存目录”，选完路径才写文件")
         # 读取配置里的 AI 自动识别参数
@@ -2541,6 +3130,94 @@ class MainWindow(QMainWindow):
             self.finish_hint.setText(msg)
             self.log_msg("保存失败：" + msg)
 
+    # ---------------- 导出 PDF ----------------
+    def on_export_pdf(self):
+        """点「导出 PDF」：列出当前图纸的布局，勾选后逐张打印并合并成一个 PDF。"""
+        cfg = self.cfg()
+        acad, msg = cad_connect()
+        if not acad:
+            QMessageBox.warning(self, "导出 PDF", msg or "连不上 CAD。")
+            return
+        doc = cad_doc_or_none(acad)
+        if doc is None:
+            QMessageBox.warning(self, "导出 PDF", "CAD 里没有打开的图纸。")
+            return
+        # 当前打开的是不是配置里的目标图纸？不是就先问一句，免的导错图
+        try:
+            cur = str(doc.FullName or "")
+            want = (cfg.get("dwg") or "").strip()
+            if (want and cur
+                    and os.path.basename(cur).lower() != os.path.basename(want).lower()):
+                if QMessageBox.question(
+                        self, "导出 PDF",
+                        "当前 CAD 里打开的是：\n%s\n\n和配置里的目标图纸不同：\n%s\n\n"
+                        "仍要继续吗？" % (cur, want)) != QMessageBox.Yes:
+                    return
+        except Exception:
+            pass
+        layouts = cad_layout_names(doc)
+        if not layouts:
+            QMessageBox.warning(self, "导出 PDF", "这张图里没有可打印的布局。")
+            return
+        devices = cad_plot_devices(doc)
+        if not devices:
+            QMessageBox.warning(self, "导出 PDF",
+                                "没读到 PDF 类打印设备。\n请确认 ZWCAD 里有 PDF 打印配置"
+                                "（例如 DWG to PDF.pc5 / ZWPLOT_PDF.pc5）。")
+            return
+        default_dev = self._print_prefs.get("device")
+        if default_dev not in devices:
+            default_dev = next((d for d in devices if d.lower().startswith("dwg to pdf")), "")
+        if not default_dev:
+            default_dev = devices[0]
+        out_dir = (self._print_prefs.get("dir") or cfg.get("outputDir")
+                   or os.path.join(os.path.expanduser("~"), "Desktop"))
+        fname = (cfg.get("newName") or "").strip() or "MAP文件"
+
+        def media_provider(dev):
+            return cad_plot_media(doc, dev)
+
+        dlg = PrintDialog(self, layouts, self._generated_layouts, devices, default_dev,
+                          media_provider, out_dir, fname)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        data = dlg.data
+        self._print_prefs["device"] = data["device"]
+        self._print_prefs["dir"] = os.path.dirname(data["out_path"])
+        self.pdf_btn.setEnabled(False)
+        self.pdf_btn.setText("正在导出…")
+        self.content_stack.setCurrentIndex(1)
+        self.status_label.setText("正在导出 PDF…")
+        self.page_label.setText("逐张打印布局，全部打完再合并成一个 PDF")
+        self.pbar.setValue(0)
+        self.log_msg("导出 PDF：设备 %s；布局 %d 个 → %s"
+                     % (data["device"], len(data["layouts"]), data["out_path"]))
+        threading.Thread(target=plot_worker,
+                         args=(data["layouts"], data["device"], data["media"],
+                               data["out_path"], self.bus), daemon=True).start()
+
+    def on_plot_prog(self, done_n, total):
+        self.status_label.setText("正在导出 PDF %d / %d" % (done_n, total))
+        self.page_label.setText("正在打印布局 %d / %d（打完再合并）" % (done_n, total))
+        if total:
+            self.pbar.setValue(int(round(min(1.0, done_n / float(total)) * 100)))
+
+    def on_plot_result(self, ok, msg):
+        self.pdf_btn.setEnabled(True)
+        self.pdf_btn.setText("再次导出…" if ok else "导出 PDF")
+        if ok:
+            self.pbar.setValue(100)
+            self.status_label.setText("PDF 已导出")
+            self.page_label.setText(msg)
+            self.finish_title.setText("PDF 已导出")
+            self.finish_hint.setText(msg)
+            self.log_msg("PDF 已导出：" + msg)
+        else:
+            self.status_label.setText("导出 PDF 失败")
+            self.page_label.setText(msg)
+            self.log_msg("导出 PDF 失败：" + msg)
+            QMessageBox.warning(self, "导出 PDF", msg)
+
     # ---------------- 在线更新 ----------------
     def on_upd_click(self):
         if self._upd_install:
@@ -2551,6 +3228,7 @@ class MainWindow(QMainWindow):
     def on_check_update(self, silent=False):
         self._upd_silent = bool(silent)
         if not silent:
+            self.upd_label.setFixedWidth(190)
             self.upd_label.setText("正在检查更新…")
         self.upd_btn.setEnabled(False)
         self._upd_install = False
@@ -2616,6 +3294,7 @@ class MainWindow(QMainWindow):
         self.upd_btn.setEnabled(True)
         if not self._upd_install:
             self.upd_btn.setText("检查更新")
+        self.upd_label.setFixedWidth(190)
         self.upd_label.setText("检查更新失败")
         self.log_msg(msg)
         QTimer.singleShot(6000, lambda: self.upd_label.setText(""))
@@ -2626,17 +3305,38 @@ class MainWindow(QMainWindow):
             return
         self.upd_btn.setEnabled(False)
         self.upd_btn.setText("正在下载…")
-        self.upd_label.setText("正在下载 0%")
+        self._upd_pct = 0
+        self._upd_detail = ""
+        self._upd_logged = -1
+        self._render_upd_progress()
         self.log_msg("开始下载更新 %s…" % self._upd_tag)
         threading.Thread(target=update_download_worker,
                          args=(self._upd_url, self.bus), daemon=True).start()
 
     def on_upd_progress(self, pct):
-        self.upd_label.setText("正在下载 %3d%%" % pct)   # 补空格，位数固定，不会左右跳
-        if pct and pct % 10 == 0:
-            self.log_msg("下载更新 %d%%" % pct)
+        self._upd_pct = pct
+        self._render_upd_progress()
+        if pct and pct % 10 == 0 and pct != self._upd_logged:
+            self._upd_logged = pct
+            self.log_msg("下载更新 %d%%%s"
+                         % (pct, ("　" + self._upd_detail) if self._upd_detail else ""))
+
+    def on_upd_detail(self, text):
+        self._upd_detail = text or ""
+        self._render_upd_progress()
+
+    def on_upd_log(self, text):
+        self.log_msg(text)
+
+    def _render_upd_progress(self):
+        """头部那行：百分比 + 已下/总大小 + 速度（没有明细时只显示百分比）。"""
+        pct = getattr(self, "_upd_pct", 0)
+        det = getattr(self, "_upd_detail", "")
+        self.upd_label.setFixedWidth(360)      # 下载时放开宽度，放得下大小和速度
+        self.upd_label.setText(("正在下载 %3d%%" % pct) + ("　" + det if det else ""))
 
     def on_upd_ready(self, path):
+        self.upd_label.setFixedWidth(190)
         self.upd_label.setText("下载完成")
         self.upd_btn.setEnabled(True)
         ok, msg = apply_update(path)
@@ -2830,10 +3530,13 @@ class MainWindow(QMainWindow):
                                                         for t2, p2, d2 in _slow)))
                 self.save_btn.setEnabled(True)
                 self.save_btn.setText("下载")
+                self.pdf_btn.setEnabled(True)
+                self.pdf_btn.setText("导出 PDF")
                 self.finish_title.setText("执行完成，共 %d 个布局 —— 请选择保存位置"
                                           % (self.total or self.done_n or 0))
-                self.finish_hint.setText("点右边按钮选路径，会连到 CAD 用 SAVEAS 写成你选的文件"
-                                         "（此时 STR 号也已画好，会一起存进去）")
+                self.finish_hint.setText("「下载」= 连到 CAD 用 SAVEAS 存 DWG；"
+                                         "「导出 PDF」= 勾选布局打印成 PDF 并合并成一个文件"
+                                         "（此时 STR 号也已画好，会一起进去）")
         elif hard_err:
             self.run_status = "出错：" + (txt.strip()[-200:])
             finished = True
