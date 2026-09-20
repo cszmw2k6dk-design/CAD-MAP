@@ -783,7 +783,7 @@ def str_label_box(angle, text_len, lh):
 
 
 def row_avoid_offsets(cells, anchor_y, obstacles, box_sizes, soft_boxes=(),
-                      soft_zero=False, gap=0.15):
+                      soft_zero=False, gap=0.15, pads=None):
     """一排的号统一上下挪多少：返回偏移像素（+ = 往下）；没有任何可行位置返回 None。
 
     cells:     这一排的格子 [(cx, cy, 小框, 原框, 拆几行, 类型串数), ...]
@@ -793,9 +793,12 @@ def row_avoid_offsets(cells, anchor_y, obstacles, box_sizes, soft_boxes=(),
     soft_boxes: [(x1, y1, x2, y2), ...] 别的号的框（**原位**）。对这些只要求
                 "不比原来压得更厉害"，免得把号挪到隔壁排的号上、两排叠在一起。
     soft_zero: True = 对别的号要求"一点都不压"（第一轮没位置时的退让方案）。
+    pads:      每个号背景填充的外扩量（像素，和 cells 等长；None = 0）。
+               硬约束只看文字框；候选位置里优先挑"连白底也不压"的那个。
     """
     if not cells or not obstacles or not box_sizes:
         return 0.0
+    pads = list(pads) if pads else [0.0] * len(cells)
     # 公共可动区间：每个号都得留在自己那根 Typical 列里
     lo = hi = None
     for it, (_bw, bh) in zip(cells, box_sizes):
@@ -847,6 +850,18 @@ def row_avoid_offsets(cells, anchor_y, obstacles, box_sizes, soft_boxes=(),
         if any(a - 1e-9 < d < b + 1e-9 for a, b in bad):
             continue
         ok.append(d)
+    if ok:
+        # 文字框都不压的候选里，优先挑"连背景填充也不压"的那个；其次动得最少
+        def _soft(d):
+            tot = 0.0
+            for it, (bwid, bh), p in zip(cells, box_sizes, pads):
+                if p <= 0:
+                    continue
+                tot += _overlap_area(it[0], anchor_y + d, (bwid + 2.0 * p, bh + 2.0 * p),
+                                     obstacles)
+            return tot
+        ok.sort(key=lambda d: (_soft(d), abs(d), -d))
+        return ok[0]
     if not ok:
         # 整根 Typical 都被压住、挪到哪里都要压点什么：退一步挑"压得最轻、又离原位最近"的，
         # 不走原来直接返回 None（= 一动不动的老行为，最后就是整片号压在底图文字上）。
@@ -855,32 +870,58 @@ def row_avoid_offsets(cells, anchor_y, obstacles, box_sizes, soft_boxes=(),
             if d < lo - 1e-9 or d > hi + 1e-9:
                 continue
             score = sum(w for a, b, w in pen if a - 1e-9 < d < b + 1e-9)
-            key = (score, abs(d), -d)
+            soft = 0.0
+            for it, (bwid, bh), p in zip(cells, box_sizes, pads):
+                if p > 0:
+                    soft += _overlap_area(it[0], anchor_y + d, (bwid + 2.0 * p, bh + 2.0 * p),
+                                          obstacles)
+            key = (score, soft, abs(d), -d)
             if best_key is None or key < best_key:
                 best, best_key = d, key
         return best            # 一个候选都不在区间里才返回 None
-    ok.sort(key=lambda d: (abs(d), -d))             # 动得最少优先；一样近就往下
-    return ok[0]
+
+
+def _overlap_area(cx, cy, box, obstacles):
+    """这个号的框（中心 cx,cy）和障碍框重叠的总面积（像素²）。
+
+    只用来判断"挪了到底有没有变好" —— 单个号找不到完全干净的位置时，
+    别把它挪到压得更多的地方。
+    """
+    bw, bh = box
+    x1, x2 = cx - bw / 2.0, cx + bw / 2.0
+    y1, y2 = cy - bh / 2.0, cy + bh / 2.0
+    area = 0.0
+    for ox1, oy1, ox2, oy2 in obstacles:
+        ix = min(x2, float(ox2)) - max(x1, float(ox1))
+        iy = min(y2, float(oy2)) - max(y1, float(oy1))
+        if ix > 0 and iy > 0:
+            area += ix * iy
+    return area
 
 
 def avoid_cells_offsets(ordered, ys, obstacles, label_ratio=0.0, page_h=0.0,
-                        text_len=5, med_h=None):
+                        text_len=5, med_h=None, bg_pad=0.0):
     """按排算出每个号的避让偏移（像素，和 ordered 等长）。
 
     ordered 已按顺序排好；ys 是每个号当前的高度（对齐后同一排相同）。
     obstacles 是这一页的底图文字框（页像素、y 从上往下）；传空就不挪。
+    bg_pad：STR 号背景填充的外扩量（× 字高）。画出来的是"文字 + 白底"，
+            只按文字框避让会让白底压住底图上的 LBD 标号，所以要一起算进来。
     """
     n = len(ordered)
     off = [0.0] * n
     if not n or not obstacles:
         return off
+    pad = max(0.0, float(bg_pad or 0.0))
     boxes = []
+    pads = []
     for (_cx, _cy, _b, ob, _nn, _tt) in ordered:
         bw, bh = ob["x2"] - ob["x1"], ob["y2"] - ob["y1"]
         ang = 90 if bh > bw else 0
         lh = ((float(label_ratio) * float(page_h)) if label_ratio > 0
               else min(bw, bh)) * 1.4
-        boxes.append(str_label_box(ang, text_len, lh))
+        boxes.append(str_label_box(ang, text_len, lh))   # 硬约束：文字框
+        pads.append(pad * lh)                            # 软目标：背景填充外扩
     keys = cell_row_keys(ordered, med_h)
     rows = {}
     for i in range(n):
@@ -898,12 +939,29 @@ def avoid_cells_offsets(ordered, ys, obstacles, label_ratio=0.0, page_h=0.0,
         ay = _vals_median([ys[i] for i in idxs])
         # 先找"既避开底图文字、又不比原来更压到别的号"的位置；再退一步要求"一点都不压别的号"
         d = row_avoid_offsets(row_cells, ay, obstacles, row_boxes,
-                              [where[j] for j in range(n) if j not in sel])
+                              [where[j] for j in range(n) if j not in sel],
+                              pads=[pads[i] for i in idxs])
         if d is None:
             d = row_avoid_offsets(row_cells, ay, obstacles, row_boxes,
-                                  [where[j] for j in range(n) if j not in sel], soft_zero=True)
+                                  [where[j] for j in range(n) if j not in sel], soft_zero=True,
+                                  pads=[pads[i] for i in idxs])
         if d is None:
-            d = 0.0
+            # 整排找不到公共位置：这一排的号各自找（宁可这一排不齐，也别压住底图文字）
+            others = [where[j] for j in range(n) if j not in sel]
+            for i in idxs:
+                di = row_avoid_offsets([ordered[i]], ys[i], obstacles, [boxes[i]], others,
+                                       pads=[pads[i]])
+                if di is None:
+                    di = row_avoid_offsets([ordered[i]], ys[i], obstacles, [boxes[i]], others,
+                                           soft_zero=True, pads=[pads[i]])
+                # 只有确实比"原地不动"压得更少才挪，别越挪越糟
+                box_p = (boxes[i][0] + 2.0 * pads[i], boxes[i][1] + 2.0 * pads[i])
+                if di and _overlap_area(ordered[i][0], ys[i] + di, box_p, obstacles) \
+                        < _overlap_area(ordered[i][0], ys[i], box_p, obstacles) - 1e-6:
+                    off[i] = di
+                else:
+                    off[i] = 0.0
+            continue
         if d:
             for i in idxs:
                 off[i] = d
@@ -1407,7 +1465,7 @@ def debug_page_map(json_path):
 
 def rack_lines_from_debug(json_path, prefix="STR", digits=2, page_map=None,
                            order=DEFAULT_STR_ORDER, split=None, info=None,
-                           align=False, avoid=None):
+                           align=False, avoid=None, avoid_pad=0.0):
     """识别结果 debug JSON -> 支架号行（L 行：页号 fx fy STRxx 角度 字高占页比）。
 
     按所属 LBD 区域(Node 框) 分组、组内行优先（上→下、左→右）编号，每组从 01 起；
@@ -1487,7 +1545,8 @@ def rack_lines_from_debug(json_path, prefix="STR", digits=2, page_map=None,
                         ordered,
                         [a[1] for a in anchors] if anchors else [it[1] for it in ordered],
                         _obs, label_ratio=gratio, page_h=H, med_h=med_h,
-                        text_len=len(prefix) + max(digits, len(str(len(ordered)))))
+                        text_len=len(prefix) + max(digits, len(str(len(ordered)))),
+                        bg_pad=avoid_pad)
                     if _obs else None)
             for k, (cx, cy, b, ob, _n, _t) in enumerate(ordered, 1):
                 ax, ay = anchors[k - 1] if anchors else (cx, cy)
@@ -1506,7 +1565,8 @@ def rack_lines_from_debug(json_path, prefix="STR", digits=2, page_map=None,
 
 
 def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_map=None,
-                             order=DEFAULT_STR_ORDER, split=None, align=False, avoid=None):
+                             order=DEFAULT_STR_ORDER, split=None, align=False, avoid=None,
+                             avoid_pad=0.0):
     """识别结果 debug JSON -> CAD 读的 L 行（和 X-AnyLabeling 那条路输出同一套格式）。
 
         L <页号> <fx> <fy> <名称> <角度> <字高占页比>      fx/fy 归一化、y 从下往上
@@ -1621,7 +1681,8 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
                         ordered,
                         [a[1] for a in anchors] if anchors else [it[1] for it in ordered],
                         _obs, label_ratio=gratio, page_h=H, med_h=med_h,
-                        text_len=len(prefix) + max(digits, len(str(len(ordered)))))
+                        text_len=len(prefix) + max(digits, len(str(len(ordered)))),
+                        bg_pad=avoid_pad)
                     if _obs else None)
             for k, (cx, cy, b, ob, _n, _t) in enumerate(ordered, 1):
                 ax, ay = anchors[k - 1] if anchors else (cx, cy)

@@ -625,6 +625,17 @@ def build_extract_file(cfg, out_path, prog_path=None):
                 pass
         avoid = boxes or None
         detail["avoid"] = sum(len(v) for v in (boxes or {}).values())
+        # STR 号是"文字 + 背景填充(白底)"画出来的：白底比文字框大一圈，
+        # 避让时不算白底的话，白底照样会盖住底图上的 LBD 标号。
+        # 外扩量按填充间隙的一半估（实测口径；关掉背景填充就不外扩）。
+        try:
+            _bg_on = str(cfg.get("strBgOn", "1")).strip() not in (
+                "0", "", "关", "否", "off", "false", "False")
+            _gap = float(str(cfg.get("strBgGap", "1.0")).strip() or 1.0) if _bg_on else 0.0
+        except Exception:
+            _gap = 1.0
+        _avoid_pad = min(1.0, max(0.0, _gap)) * 0.5
+        detail["avoid_pad"] = round(_avoid_pad, 3)
 
     # 1) 标注/编号结果：LBD 名称 + 支架号都在 JSON 里
     if kind == "anylabeling":
@@ -639,7 +650,8 @@ def build_extract_file(cfg, out_path, prog_path=None):
             and _lr_extract_debug is not None):
         try:
             r = _lr_extract_debug(jp, out_path, prefix=pre, page_map=pgmap,
-                                  order=order, split=split, align=align, avoid=avoid)
+                                  order=order, split=split, align=align, avoid=avoid,
+                                  avoid_pad=_avoid_pad)
         except Exception as e:
             r = {"ok": False, "error": str(e)}
         if r.get("ok") and r["lbd"]:
@@ -673,7 +685,8 @@ def build_extract_file(cfg, out_path, prog_path=None):
         try:
             _sinfo = {}
             rl, nstr, _np = _lr_rack_lines(jp, pre, page_map=pgmap, order=order,
-                                           split=split, info=_sinfo, align=align, avoid=avoid)
+                                           split=split, info=_sinfo, align=align, avoid=avoid,
+                                           avoid_pad=_avoid_pad)
             detail["split"] = _sinfo.get("split") or ""
         except Exception as e:
             rl, nstr, rack_err = [], 0, str(e)
@@ -694,7 +707,7 @@ def build_extract_file(cfg, out_path, prog_path=None):
     # 兜底：PDF 文字层没给出 LBD 行（无文字层的扫描件等），用 debug JSON 的区域中心
     if detail["lbd"] == 0 and kind == "debug" and _lr_extract_debug is not None:
         r = _lr_extract_debug(jp, out_path, prefix=pre, order=order, split=split,
-                              align=align, avoid=avoid)
+                              align=align, avoid=avoid, avoid_pad=_avoid_pad)
         detail["split"] = r.get("split") or detail.get("split") or ""
         if r.get("ok"):
             detail["lbd"], detail["str"] = r["lbd"], r["str"]

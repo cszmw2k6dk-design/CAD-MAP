@@ -22,6 +22,10 @@
 (setq *PdfLayout_AiStrColor* 7)     ; STR 标签字色 (ACI 色号; 0/负数 = 不设色, 随图层)
 (setq *PdfLayout_AiLabelColor* 7)   ; LBD 标签字色 (仅当由 AI 侧画 LBD 时用)
 (setq *PdfLayout_AiStrPrefix* "STR") ; rack label prefix (orchestrator sets it; CIR belongs to PDFGRID)
+
+;; 标签文件里的所有名字都画出来(T)；默认 nil = 只画 STR 前缀的号 ——
+;; 免得识别结果里的类名（Node / Node9 / Typical 之类）被当成号画到图上。
+(setq *PdfLayout_AiDrawAll* nil)
 (setq *PdfLayout_AiSkipLbd* T)        ; T = 不画识别出的 LBD 标签(改由 Excel 导入)
 (setq *PdfLayout_AiBoxW* 0.0)
 (setq *PdfLayout_AiBoxH* 0.0)
@@ -162,7 +166,7 @@
       out)))
 
 ;; 画一批标签(坐标已经是模型空间坐标), 返回实际画了几个
-(defun PdfLayout_AiDrawLabels (labels / doc blk lay txtH rad m i pt name it ang hgt autoH usedH oldBg oldGap isStr tcol)
+(defun PdfLayout_AiDrawLabels (labels / doc blk lay txtH rad m i pt name it ang hgt autoH usedH oldBg oldGap isStr tcol nmU pfxU)
   (if (not labels)
     nil
     (progn
@@ -197,10 +201,15 @@
         (setq rad (* ang (/ pi 180.0)))
         ;; LBD 标签交给 Excel 导入(PdfLayout_auto.lsp)去画, AI 这边只画 STR 号;
         ;; 要恢复 AI 画 LBD, 把 *PdfLayout_AiSkipLbd* 设为 nil 即可。
-        (setq m (if (and *PdfLayout_AiSkipLbd* (wcmatch (strcase name) "*LBD*"))
-                  nil
+        (setq nmU (strcase name))
+        (setq pfxU (strcase (if *PdfLayout_AiStrPrefix* *PdfLayout_AiStrPrefix* "STR")))
+        (setq m (if (if *PdfLayout_AiDrawAll*
+                      (not (and *PdfLayout_AiSkipLbd* (wcmatch nmU "*LBD*")))
+                      (or (wcmatch nmU (strcat pfxU "*"))
+                          (and (not *PdfLayout_AiSkipLbd*) (wcmatch nmU "*LBD*"))))
                   (vl-catch-all-apply 'vla-AddMText
-                    (list blk (vlax-3d-point pt) 0.0 name))))
+                    (list blk (vlax-3d-point pt) 0.0 name))
+                  nil))
         (if (and m (not (vl-catch-all-error-p m)))
           (progn
             (vl-catch-all-apply 'vla-put-Height (list m txtH))

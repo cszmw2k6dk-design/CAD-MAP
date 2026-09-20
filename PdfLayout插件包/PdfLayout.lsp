@@ -887,6 +887,94 @@
   n
 )
 
+;;;-------------------------------------------------------------
+;;; PDF 底图专用图层
+;;; 为什么：底图原来落在当前层，和标号挤在一起，在模型空间改标号时
+;;; 拾取框经常选中压在最下面的 PDF 参考底图。
+;;; 做法：整轮跑完（或手动执行 PDFLOCK）时，把模型空间里的 PDF 参考底图
+;;; 统一挪到「PDF底图」层并锁定 —— 锁定图层上的对象点不中（显示、捕捉、
+;;; 打印都不受影响），标号在 LBD标签 / PDF-AUTO-NUM 层上照常能选能改。
+;;; 要移动或缩放底图：先执行 PDFUNLOCK，改完再执行 PDFLOCK。
+;;;-------------------------------------------------------------
+(setq *PdfLayout_UnderlayLayer* "PDF底图")
+
+(defun PdfLayout_UnderlayLayerObj ()
+  ;; 需要就建「PDF底图」层，返回图层对象
+  (PdfLayout_EnsureLayer *PdfLayout_UnderlayLayer*)
+)
+
+(defun PdfLayout_UnderlaySetLock (on / lay)
+  ;; 锁/解锁「PDF底图」层；锁的是能不能被选中，不影响底图的显示和打印
+  (setq lay (PdfLayout_UnderlayLayerObj))
+  (if (and lay (not (vl-catch-all-error-p lay)))
+    (vl-catch-all-apply 'vla-put-Lock (list lay (if on :vlax-true :vlax-false)))
+  )
+  lay
+)
+
+(defun PdfLayout_UnderlayUnlock ()
+  ;; 本轮要动底图（导入/排列）之前先解锁，免得移动被锁层挡住
+  (PdfLayout_UnderlaySetLock nil)
+  (princ)
+)
+
+(defun PdfLayout_EnsureLabelLayers (/ lay)
+  ;; 标号层保持「打开 + 解冻 + 解锁」，别让锁层反过来挡住写标号
+  (foreach ln (list "LBD标签" "PDF-AUTO-NUM" "PDF网格文字")
+    (setq lay (PdfLayout_EnsureLayer ln))
+    (if (and lay (not (vl-catch-all-error-p lay)))
+      (progn
+        (vl-catch-all-apply 'vla-put-LayerOn (list lay :vlax-true))
+        (vl-catch-all-apply 'vla-put-Freeze (list lay :vlax-false))
+        (vl-catch-all-apply 'vla-put-Lock (list lay :vlax-false))
+      )
+    )
+  )
+  (princ)
+)
+
+(defun PdfLayout_ParkUnderlays (/ doc ms lay n obj)
+  ;; 把模型空间里的 PDF 参考底图全部挪到「PDF底图」层，返回处理个数
+  (setq doc (vla-get-ActiveDocument (vlax-get-Acad-Object)))
+  (setq ms (vla-get-ModelSpace doc))
+  (setq lay (PdfLayout_UnderlayLayerObj))
+  (setq n 0)
+  (vlax-for obj ms
+    (if (PdfLayout_IsUnderlay (vla-get-ObjectName obj))
+      (if (not (vl-catch-all-error-p
+                 (vl-catch-all-apply 'vla-put-Layer
+                                     (list obj *PdfLayout_UnderlayLayer*))))
+        (setq n (1+ n))
+      )
+    )
+  )
+  n
+)
+
+(defun PdfLayout_LockUnderlays (/ n)
+  ;; 底图进专用层 + 锁层；顺手保证标号层可用
+  (PdfLayout_UnderlaySetLock nil)          ;; 先解锁，保证能改底图的图层
+  (setq n (PdfLayout_ParkUnderlays))
+  (PdfLayout_UnderlaySetLock T)
+  (PdfLayout_EnsureLabelLayers)
+  n
+)
+
+(defun c:PDFLOCK (/ n)
+  ;; 手动锁：把底图收进「PDF底图」层并锁定
+  (setq n (PdfLayout_LockUnderlays))
+  (princ (strcat "\n[PDF底图] 已把 " (itoa n) " 个底图移到「" *PdfLayout_UnderlayLayer*
+                 "」层并锁定；要移动底图请先执行 PDFUNLOCK。"))
+  (princ)
+)
+
+(defun c:PDFUNLOCK ()
+  ;; 手动解锁：要移动或缩放底图时用
+  (PdfLayout_UnderlaySetLock nil)
+  (princ (strcat "\n[PDF底图] 「" *PdfLayout_UnderlayLayer*
+                 "」层已解锁，可以移动或缩放底图；改完记得执行 PDFLOCK 锁回去。"))
+  (princ)
+)
 (defun PdfLayout_ListObjectNames (/ doc ms out obj)
   ;; 诊断用：列出模型空间所有对象的 ObjectName
   (setq doc (vla-get-ActiveDocument (vlax-get-Acad-Object)))
@@ -913,6 +1001,7 @@
   ;; 仅用 PDFATTACH 自动导入：整份 PDF 由 ZWCAD 按页生成参考底图对象，
   ;; 通过导入前后实体列表对比找出新增对象并返回；
   ;; 若导入页数与 PDF 页数不符，可在弹窗中勾选“弹窗选页”手动选择页面
+  (PdfLayout_UnderlayUnlock)
   (setq oldNames (PdfLayout_EntityNameList))
   (if *PdfLayout_Debug*
     (progn
@@ -982,6 +1071,7 @@
   ;; 命令行模式下输入 ~ 强制弹出文件选择窗口（ZWCAD 官方机制），
   ;; 之后插入点/比例/旋转已自动填好，用户只需选文件、全选页面、点确定；
   ;; 完成后自动识别新增底图并返回，适合 144 页这类多页 PDF
+  (PdfLayout_UnderlayUnlock)
   (setq oldNames (PdfLayout_EntityNameList))
   (princ "\n正在启动 PDFATTACH 选页窗口…")
   (princ "\n请在窗口中选择 PDF，并在页面列表按住 Ctrl 全选需要的页面（或点第一页、Shift 点最后一页），点确定；")
@@ -1150,6 +1240,7 @@
   ;; 再逐个移动到对应竖线标记的位置（页角对齐标记角），并包裹撤销；
   ;; 用 vla-Move 整体移动（ZWCAD 的 PDF 底图不支持直接改插入点），
   ;; 移动后校验新位置，未到位会给出警告
+  (PdfLayout_UnderlayUnlock)
   (setq doc (vla-get-ActiveDocument (vlax-get-Acad-Object)))
   (setq ms (vla-get-ModelSpace doc))
   (setq pages nil i 0 nDone 0)
@@ -1199,6 +1290,7 @@
 (defun PdfLayout_ArrangeObjsToMarkers (objs markers / pages i m p pt bb obj nDone res newBb)
   ;; 把指定对象（新导入的底图）按 左→右/上→下 排序后移动到竖线标记位置，
   ;; 用 vla-Move 移动（对任何对象有效），不依赖对象名识别；移动后校验是否到位
+  (PdfLayout_UnderlayUnlock)
   (setq pages nil i 0 nDone 0)
   (foreach obj objs
     (setq bb (PdfLayout_GetExtentsSafeObj obj))
@@ -2138,6 +2230,7 @@
       (PdfLayout_Alert msgText)
     )
   )
+  (PdfLayout_LockUnderlays)          ;; 这一轮跑完：底图进专用层并锁层
   ok
 )
 
@@ -2451,6 +2544,7 @@
   )
   (setq *PdfLayout_ArrangeOnly* nil)
   (setq *PdfLayout_ArrangeOnlyName* nil)
+  (PdfLayout_LockUnderlays)          ;; 只排序也要上锁
   (princ)
 )
 

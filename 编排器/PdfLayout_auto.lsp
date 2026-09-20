@@ -20,8 +20,117 @@
         (setq f (open *PdfLayout_ProgPath* "a"))
         (if f (progn (princ msg f) (princ "\n" f) (close f))))
       nil))
+  (if (= (strcase msg) "RUN_DONE")
+    (progn
+      ;; ① STR 号已经画完：让 LBD 标签反过来避让一下（用 CAD 里的真实包围盒）
+      (vl-catch-all-apply 'PdfLayout_LbdAvoidStr nil)
+      ;; ② 底图收进「PDF底图」层并锁定，免得在模型空间改标号时误点到底图
+      (if (not (vl-catch-all-error-p (vl-catch-all-apply 'PdfLayout_LockUnderlays nil)))
+        (princ "\n[PDF底图] 底图已移到「PDF底图」层并锁定（要移动底图先执行 PDFUNLOCK）")
+      )
+    )
+  )
 )
 
+;;;-------------------------------------------------------------
+;;; LBD 标签反过来避让 STR 号（STR 号画完之后跑一趟）
+;;; 用 CAD 里真实的包围盒判断（不再靠 Python 估算）：把压住 STR 号的
+;;; LBD 标签上下挪 1.5 / 3 倍字高，挪到不压为止；都挪不开就保持原位。
+;;; 手动执行：LBDAVOIDSTR
+;;;-------------------------------------------------------------
+(defun PdfLayout_ObjBox (obj / mn mx r)
+  (setq mn nil mx nil)
+  (setq r (vl-catch-all-apply '(lambda () (vla-GetBoundingBox obj 'mn 'mx))))
+  (if (and (not (vl-catch-all-error-p r)) mn mx)
+    (list (vlax-safearray->list mn) (vlax-safearray->list mx))
+  )
+)
+
+(defun PdfLayout_BoxShift (bb dx dy)
+  ;; 包围盒平移后的两个角点（左下、右上）
+  (list (list (+ (car (car bb)) dx) (+ (cadr (car bb)) dy))
+        (list (+ (car (cadr bb)) dx) (+ (cadr (cadr bb)) dy)))
+)
+
+(defun PdfLayout_HitCount (bb layer selfE / ss p1 p2 i n)
+  ;; 这个框(crossing)里有几个该图层上的文字（selfE = 自己，排除掉）
+  (setq p1 (car bb) p2 (cadr bb) n 0)
+  (setq ss (ssget "_C" p1 p2 (list '(0 . "MTEXT,TEXT") (cons 8 layer))))
+  (if ss
+    (progn
+      (setq i 0)
+      (while (< i (sslength ss))
+        (if (or (null selfE) (/= (ssname ss i) selfE))
+          (setq n (1+ n))
+        )
+        (setq i (1+ i))
+      )
+    )
+  )
+  n
+)
+
+(defun PdfLayout_LbdAvoidStr (/ doc ms obj labs lab bb h selfE step n0 key best bestKey
+                              cand dx i0 nTot nMoved strLay)
+  (vl-load-com)
+  (setq strLay (if (and *PdfLayout_AiLayer* (/= *PdfLayout_AiLayer* "")) *PdfLayout_AiLayer* "PDF-AUTO-NUM"))
+  (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
+  (setq ms (vla-get-ModelSpace doc))
+  (setq labs nil)
+  (vlax-for obj ms
+    (if (= (strcase (vl-catch-all-apply 'vla-get-Layer (list obj))) "LBD标签")
+      (setq labs (cons obj labs))
+    )
+  )
+  (if (not labs)
+    (progn (princ "\n[LBD避让STR] 模型空间里没有 LBD 标签，跳过。") (princ))
+    (progn
+      ;; 窗口选择要在模型空间里做（当前在布局标签页时先切过去，完事再切回）
+      (setq i0 (getvar "CTAB"))
+      (if (/= (strcase i0) "MODEL") (setvar "CTAB" "Model"))
+      (setq nTot 0 nMoved 0)
+      (foreach lab labs
+        (setq bb (PdfLayout_ObjBox lab))
+        (if bb
+          (progn
+            (setq nTot (1+ nTot))
+            (setq selfE (vlax-vla-object->ename lab))
+            (setq n0 (PdfLayout_HitCount bb strLay selfE))
+            (if (> n0 0)
+              (progn
+                (setq h (vl-catch-all-apply 'vla-get-Height (list lab)))
+                (setq h (if (and (numberp h) (> h 0.0)) h 0.05))
+                (setq step (* 1.5 h))
+                (setq best nil bestKey nil)
+                (foreach dx (list 0.0 step (- 0.0 step) (* 2.0 step) (* -2.0 step))
+                  (setq cand (PdfLayout_BoxShift bb 0.0 dx))
+                  (setq key (list (PdfLayout_HitCount cand strLay selfE)
+                                  (PdfLayout_HitCount cand "LBD标签" selfE)
+                                  (abs dx)))
+                  (if (or (null bestKey) (< key bestKey))
+                    (setq best dx bestKey key)
+                  )
+                )
+                (if (and best (/= best 0.0))
+                  (progn
+                    (vl-catch-all-apply 'vla-Move
+                      (list lab (vlax-3d-point 0.0 0.0 0.0) (vlax-3d-point 0.0 best 0.0)))
+                    (setq nMoved (1+ nMoved))
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+      (if (/= (strcase i0) "MODEL") (vl-catch-all-apply 'setvar (list "CTAB" i0)))
+      (princ (strcat "\n[LBD避让STR] 检查 LBD 标签 " (itoa nTot)
+                     " 个，压住 STR 号并挪开的 " (itoa nMoved) " 个。"))
+    )
+  )
+  (princ)
+)
+(defun c:LBDAVOIDSTR () (PdfLayout_LbdAvoidStr))
 ;;; 计时(毫秒)：优先 MILLISECS，取不到就用 DATE 的当天比例换算（只为进度显示）
 (defun PdfLayout_NowMs (/ v)
   (setq v (vl-catch-all-apply 'getvar (list "MILLISECS")))
