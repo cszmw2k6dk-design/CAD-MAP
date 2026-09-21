@@ -13,7 +13,7 @@
 (setq *PdfLayout_LbdRegionScale* 0.0)
 
 ;;; 进度写入(覆盖写，供外部轮询)
-(defun PdfLayout_Prog (msg)
+(defun PdfLayout_Prog (msg / _ar)
   (if *PdfLayout_ProgPath*
     (vl-catch-all-apply
       '(lambda (/ f)
@@ -23,7 +23,10 @@
   (if (= (strcase msg) "RUN_DONE")
     (progn
       ;; ① STR 号已经画完：让 LBD 标签反过来避让一下（用 CAD 里的真实包围盒）
-      (vl-catch-all-apply 'PdfLayout_LbdAvoidStr nil)
+      (setq _ar (vl-catch-all-apply 'PdfLayout_LbdAvoidStr nil))
+      (if (vl-catch-all-error-p _ar)
+        (princ (strcat "\n[LBD避让STR] 出错：" (vl-catch-all-error-message _ar)))
+      )
     )
   )
 )
@@ -66,6 +69,18 @@
   n
 )
 
+;;; 三元组按字典序比大小。AutoLISP 的 < 只能比数字/字符串，
+;;; 直接拿两个列表去比会报「用于比较的参数类型不正确」。
+(defun PdfLayout_KeyLess (a b)
+  (if (= (car a) (car b))
+    (if (= (cadr a) (cadr b))
+      (< (caddr a) (caddr b))
+      (< (cadr a) (cadr b))
+    )
+    (< (car a) (car b))
+  )
+)
+
 (defun PdfLayout_LbdAvoidStr (/ doc ms obj labs lab bb h selfE step n0 key best bestKey
                               cand dx i0 nTot nMoved strLay)
   (vl-load-com)
@@ -103,7 +118,7 @@
                   (setq key (list (PdfLayout_HitCount cand strLay selfE)
                                   (PdfLayout_HitCount cand "LBD标签" selfE)
                                   (abs dx)))
-                  (if (or (null bestKey) (< key bestKey))
+                  (if (or (null bestKey) (PdfLayout_KeyLess key bestKey))
                     (setq best dx bestKey key)
                   )
                 )
