@@ -23,6 +23,12 @@ try:
                              rack_types_from_json as _lr_rack_types,
                              preview_group as _lr_preview,
                              STR_ORDER_LABELS as _LR_ORDER_LABELS,
+                             QUAD_DEFAULT_ORDERS as _LR_QUAD_DEFAULTS,
+                             preview_quadrants as _lr_quad_preview,
+                             parse_quad_map as _lr_parse_quad_map,
+                             STR_ORDER_TEXT as _LR_ORDER_TEXT,
+                             order_demo_cells as _lr_demo_cells,
+                             quad_note as _lr_quad_note,
                              rack_types_text as _lr_rack_text,
                              set_rack_len_hints as _lr_set_hints,
                              lbd_label_boxes as _lr_lbd_boxes)
@@ -30,12 +36,15 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_candidates = _lr_json_kind = _lr_extract_debug = None
     _lr_write_regions = _lr_write_regions_sheets = None
     _lr_preview = _LR_ORDER_LABELS = None
+    _LR_QUAD_DEFAULTS = _lr_quad_preview = _lr_quad_note = None
+    _lr_parse_quad_map = None
+    _LR_ORDER_TEXT = _lr_demo_cells = None
     _lr_rack_lines = _lr_page_map = None
     _lr_rack_types = _lr_rack_text = _lr_set_hints = None
     _lr_lbd_boxes = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.40"
+APP_VERSION = "2.50"
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
@@ -52,6 +61,11 @@ FIELDS = [
     ("rackPrefix", "支架命名前缀"),
     ("strHeight", "STR 字高(typical宽倍数)"),
     ("strOrder", "STR 编号顺序(8 种)"),
+    ("strQuadOn", "按汇流箱四象限规律命名(开关)"),
+    ("strQuadI", "象限 I 右上 的 STR 顺序"),
+    ("strQuadII", "象限 II 左上 的 STR 顺序"),
+    ("strQuadIII", "象限 III 左下 的 STR 顺序"),
+    ("strQuadIV", "象限 IV 右下 的 STR 顺序"),
     ("rackAlign", "STR 号自动对齐"),
     ("rackAvoid", "避开 LBD 标签(底图+CAD)"),
     ("rackTypes", "支架类型"), ("rackSplit", "拆不拆"), ("rackStringLen", "单串长度(FT)"),
@@ -74,6 +88,14 @@ DEFAULTS = {
     "rackPrefix": "STR",
     "strHeight": "1.4",           # STR 号字高 = typical 条带宽(支架框短边)的倍数
     "strOrder": "2",
+    # 象限 STR 顺序：以本页汇流箱(Box)的几何中心为原点，LBD 区域中心落在哪个象限就用哪个
+    # 顺序编号那一片支架（0 = 该象限不改、用全局的 strOrder）。四个下拉框见 QUAD_FIELDS。
+    # strQuadOn = 0 时整条规则关掉：四个下拉的选值留着不动，但一律按全局 strOrder 编号。
+    "strQuadOn": "1",
+    "strQuadI": (_LR_QUAD_DEFAULTS or {}).get("I", "4"),
+    "strQuadII": (_LR_QUAD_DEFAULTS or {}).get("II", "8"),
+    "strQuadIII": (_LR_QUAD_DEFAULTS or {}).get("III", "7"),
+    "strQuadIV": (_LR_QUAD_DEFAULTS or {}).get("IV", "2"),
     "rackAlign": "1",
     "rackAvoid": "1",
     "rackTypes": "", "rackSplit": "不拆", "rackStringLen": "",
@@ -94,6 +116,36 @@ STR_ORDER_CHOICES = _LR_ORDER_LABELS or [
     ("7 行优先: 上→下行、行内右→左", "7"),
     ("8 行优先: 下→上行、行内右→左", "8"),
 ]
+# 象限 STR 顺序：四个象限各一个下拉框（值 = 8 种顺序的序号，0 = 该象限用全局顺序）。
+# 原点 = 本页汇流箱(Box)的几何中心（识别结果 yolo_box_detection_results 的 Box 小框），
+# 判据 = LBD 区域(Node 框)的中心，轴 = 图纸正交轴（u 右为正、v 上为正）。
+# 页面上没有汇流箱、或区域中心压在轴上（死区）时，用上面的「STR 编号顺序」。
+QUAD_FIELDS = (("strQuadI", "I 右上"), ("strQuadII", "II 左上"),
+               ("strQuadIII", "III 左下"), ("strQuadIV", "IV 右下"))
+QUAD_CN = {"I": "右上", "II": "左上", "III": "左下", "IV": "右下"}
+_QUAD_CN2CODE = {v: k for k, v in QUAD_CN.items()}
+# 顺序号 -> 说明文字（象限预览的抬头用）
+STR_ORDER_TEXT = _LR_ORDER_TEXT or {v: l for (l, v) in STR_ORDER_CHOICES}
+# 示意格子：这个顺序在 3x3 里怎么走（lbd_regions.order_demo_cells 的等价实现）
+_DEMO_TABLE = {          # 顺序 -> (主轴, 主轴方向, 带内方向)
+    "1": ("X", +1, +1), "2": ("Y", +1, +1), "3": ("X", -1, +1), "4": ("Y", -1, +1),
+    "5": ("X", +1, -1), "6": ("X", -1, -1), "7": ("Y", +1, -1), "8": ("Y", -1, -1),
+}
+
+
+def demo_cells(order, cols=3, rows=3):
+    """这个顺序的示意格子：返回 [{"n", "col", "row"}, ...]（lbd_regions 的同一套规则）。"""
+    if _lr_demo_cells is not None:
+        try:
+            return _lr_demo_cells(order, cols, rows)
+        except Exception:
+            pass
+    axis, mdir, sdir = _DEMO_TABLE.get(str(order), _DEMO_TABLE["2"])
+    cells = [{"col": c, "row": r} for r in range(rows) for c in range(cols)]
+    key = ((lambda it: (mdir * it["row"], sdir * it["col"])) if axis == "Y"
+           else (lambda it: (mdir * it["col"], sdir * it["row"])))
+    out = sorted(cells, key=key)
+    return [{"n": i + 1, "col": c["col"], "row": c["row"]} for i, c in enumerate(out)]
 
 COLOR_CHOICES = [("红", "1"), ("黄", "2"), ("绿", "3"), ("青", "4"),
                  ("蓝", "5"), ("洋红", "6"), ("白", "7"), ("灰", "8")]
@@ -102,14 +154,21 @@ SECTIONS = [
                   ("pdf", "PDF 文件路径"), ("xlsx", "LBD 名称 Excel"),
                   ("jsonPath", "识别结果 JSON文件"),
                   ("newName", "新文件名(可空)")]),
-    ("PDF 与标签", [("pageStart", "起始页"), ("pageEnd", "结束页(0=全部)"),
-                  ("importPages", "导入页码(0=全部)"),
-                  ("count", "复制数量(0=按识别)"),
-                  ("textHeight", "标签高度(模型单位, 0=自动)"), ("labelBgColor", "标签背景色"),
-                  ("labelTextColor", "LBD 标签字色"),
-                  ("labelBgGap", "背景遮挡间隙(倍)"),
-                  ("margin", "视口边距(mm)"),
-                  ("regionInset", "区域对准留白(%)")]),
+    # PDF：底图从哪几页来、怎么对准视口
+    ("PDF", [("pageStart", "起始页"), ("pageEnd", "结束页(0=全部)"),
+             ("importPages", "导入页码(0=全部)"),
+             ("count", "复制数量(0=按识别)"),
+             ("margin", "视口边距(mm)"),
+             ("regionInset", "区域对准留白(%)")]),
+    # 标签：LBD 标签长什么样 + STR 号按哪个方向填（四象限规则原来在「支架」页，挪到这里）
+    ("标签", [("textHeight", "标签高度(模型单位, 0=自动)"), ("labelBgColor", "标签背景色"),
+             ("labelTextColor", "LBD 标签字色"),
+             ("labelBgGap", "背景遮挡间隙(倍)"),
+             ("strQuadOn", "按汇流箱(Box)四象限规律命名"),
+             ("strQuadI", "象限 I 右上 的顺序"),
+             ("strQuadII", "象限 II 左上 的顺序"),
+             ("strQuadIII", "象限 III 左下 的顺序"),
+             ("strQuadIV", "象限 IV 右下 的顺序")]),
     ("支架", [("rackPrefix", "命名前缀(支架号)"),
             ("rackTypes", "支架类型(串数:长度FT)"),
             ("rackSplit", "拆不拆"),
@@ -430,6 +489,67 @@ def rack_prefix(cfg):
     return p or "STR"
 
 
+def quad_on(cfg):
+    """「按汇流箱(Box)四象限规律命名」这个总开关是否打开（默认开）。"""
+    v = str((cfg or {}).get("strQuadOn", "1") or "0").strip()
+    return v not in ("0", "", "关", "否", "off", "false", "False")
+
+
+def quad_orders_from_cfg(cfg):
+    """界面四个象限下拉框 -> {I..IV: 顺序}（0 = 该象限不改，取全局 strOrder）。
+
+    预览画图用：不管选了没有，四个象限都要有个号可显示。
+    """
+    c = cfg or {}
+    g = str(c.get("strOrder", "2") or "2").strip() or "2"
+    if g not in ("1", "2", "3", "4", "5", "6", "7", "8"):
+        g = "2"
+    if not quad_on(c):
+        return {q: g for q in ("I", "II", "III", "IV")}       # 开关关了：四个都按全局
+    out = {}
+    for key, q in (("strQuadI", "I"), ("strQuadII", "II"),
+                   ("strQuadIII", "III"), ("strQuadIV", "IV")):
+        v = str(c.get(key, "0") or "0").strip()
+        out[q] = v if v in ("1", "2", "3", "4", "5", "6", "7", "8") else g
+    return out
+
+
+def quad_map_spec(cfg):
+    """界面四个象限下拉框 -> lbd_regions 认的象限顺序表（"右上=4; 左上=8; …"）。
+
+    选「0 用全局顺序」的象限不写进去 —— 那边就按全局顺序编号；四个都是 0 时返回 ""，
+    等于这套规则不用（和以前完全一样）。
+    """
+    c = cfg or {}
+    if not quad_on(c):
+        return ""                                  # 开关关了：一律按全局顺序（下拉的选值留着）
+    parts = []
+    for key, q in (("strQuadI", "I"), ("strQuadII", "II"),
+                   ("strQuadIII", "III"), ("strQuadIV", "IV")):
+        v = str(c.get(key, "0") or "0").strip()
+        if v in ("1", "2", "3", "4", "5", "6", "7", "8"):
+            parts.append("%s=%s" % (QUAD_CN.get(q, q), v))
+    return "; ".join(parts)
+
+
+def parse_quad_spec(text):
+    """配置里那一行 "右上=4; 左上=8" -> {"I": "4", "II": "8"}（认不出来返回 {}）。"""
+    if _lr_parse_quad_map is not None:
+        try:
+            return _lr_parse_quad_map(text)
+        except Exception:
+            return {}
+    out = {}
+    for part in re.split(r"[;,，、\s]+", str(text or "")):
+        m = re.match(r"^([^=:：]+?)\s*[=:：]\s*([1-8])$", part)
+        if not m:
+            continue
+        q = _QUAD_CN2CODE.get(m.group(1).strip())
+        if q:
+            out[q] = m.group(2)
+    return out
+
+
 def rack_split_spec(cfg):
     """界面「支架」页的「拆不拆」-> lbd_regions.parse_rack_split() 认的文字。
 
@@ -564,6 +684,11 @@ def build_extract_file(cfg, out_path, prog_path=None):
         p1 = 0
     pre = rack_prefix(cfg)
     order = str(cfg.get("strOrder", "2") or "2").strip() or "2"
+    # 象限编号规则：以离每个 LBD 区域最近的汇流箱(Box)中心为原点判象限，
+    # 用象限顺序表里对应的顺序编号那一片的 STR 号（见 lbd_regions.quad_order_map）。
+    # 四个象限的顺序都在界面上选；选「0 用全局顺序」的象限不写进表，就不改那一片。
+    quad_rule = ""
+    quad_map = quad_map_spec(cfg)
     # 界面明细行的「长度FT」（没填的用串数当比例）-> lbd_regions：
     # 拆分要靠它判「哪一列属于哪一类」，不然只能全拆或全不拆。
     apply_rack_len_hints(cfg)
@@ -602,6 +727,7 @@ def build_extract_file(cfg, out_path, prog_path=None):
     #   2) CAD 里我们画的 LBD 标签（位置=识别区域中心，字高=区域宽 x 倍数）——
     #      按同样规则算出来，不然号会压在刚填好的 LBD 名字上。
     avoid = None
+    _avoid_pad = 0.0        # 关掉避让时也要有值：下面几条输出路径都会用到它
     detail["avoid"] = 0
     detail["avoid_cad"] = 0
     if (kind == "debug"
@@ -651,12 +777,14 @@ def build_extract_file(cfg, out_path, prog_path=None):
         try:
             r = _lr_extract_debug(jp, out_path, prefix=pre, page_map=pgmap,
                                   order=order, split=split, align=align, avoid=avoid,
-                                  avoid_pad=_avoid_pad)
+                                  avoid_pad=_avoid_pad,
+                                  quad_rule=quad_rule, quad_map=quad_map)
         except Exception as e:
             r = {"ok": False, "error": str(e)}
         if r.get("ok") and r["lbd"]:
             detail.update(lbd=r["lbd"], str=r["str"], pos="region")
             detail["split"] = r.get("split") or ""
+            detail["quad"] = r.get("quad") or {}
             _tip = ""
             if pgmap:
                 _pgs = sorted(pgmap)
@@ -664,9 +792,11 @@ def build_extract_file(cfg, out_path, prog_path=None):
                         % (len(pgmap), _pgs[0], _pgs[-1], len(pgmap)))
             if detail["split"]:
                 _tip += "；" + detail["split"]
+            if _lr_quad_note:
+                _tip += _lr_quad_note(detail["quad"])
             _tip += avoid_note(detail)
             return True, ("识别结果：LBD %d 个（位置=识别到的 LBD 区域框中心）"
-                          " + 支架号 %d 个（按 LBD 分组行优先编号）%s"
+                          " + 支架号 %d 个（按 LBD 分组编号：默认行优先，选了象限规则就按象限走）%s"
                           % (r["lbd"], r["str"], _tip)), detail
 
     # 3) LBD 行：Python 从 PDF 文字层提（位置=图纸上 LBD 文字的正下方）—— 老行为 / 关掉开关时走这条
@@ -686,8 +816,10 @@ def build_extract_file(cfg, out_path, prog_path=None):
             _sinfo = {}
             rl, nstr, _np = _lr_rack_lines(jp, pre, page_map=pgmap, order=order,
                                            split=split, info=_sinfo, align=align, avoid=avoid,
-                                           avoid_pad=_avoid_pad)
+                                           avoid_pad=_avoid_pad,
+                                           quad_rule=quad_rule, quad_map=quad_map)
             detail["split"] = _sinfo.get("split") or ""
+            detail["quad"] = _sinfo.get("quad") or {}
         except Exception as e:
             rl, nstr, rack_err = [], 0, str(e)
         if rl:
@@ -707,11 +839,15 @@ def build_extract_file(cfg, out_path, prog_path=None):
     # 兜底：PDF 文字层没给出 LBD 行（无文字层的扫描件等），用 debug JSON 的区域中心
     if detail["lbd"] == 0 and kind == "debug" and _lr_extract_debug is not None:
         r = _lr_extract_debug(jp, out_path, prefix=pre, order=order, split=split,
-                              align=align, avoid=avoid, avoid_pad=_avoid_pad)
+                              align=align, avoid=avoid, avoid_pad=_avoid_pad,
+                              quad_rule=quad_rule, quad_map=quad_map)
         detail["split"] = r.get("split") or detail.get("split") or ""
+        detail["quad"] = r.get("quad") or {}
         if r.get("ok"):
             detail["lbd"], detail["str"] = r["lbd"], r["str"]
             _stip = ("；" + detail["split"]) if detail.get("split") else ""
+            if _lr_quad_note:
+                _stip += _lr_quad_note(detail["quad"])
             _stip += avoid_note(detail)
             return True, ("识别结果 JSON：%d 页、LBD %d 个（按区域中心）、支架号 %d 个"
                           "（PDF 文字层没读到 LBD 文字，位置按区域中心放）%s"
@@ -733,9 +869,11 @@ def build_extract_file(cfg, out_path, prog_path=None):
               % (len(pgmap), _rng, len(pgmap))
     if detail.get("split"):
         tip += "；" + detail["split"]
+    if _lr_quad_note:
+        tip += _lr_quad_note(detail.get("quad"))
     tip += avoid_note(detail)
     return True, ("标签 %d 行：LBD %d 个（Python 从 PDF 文字层识别）"
-                  " + 支架号 %d 个（按 LBD 分组行优先编号）%s"
+                  " + 支架号 %d 个（按 LBD 分组编号：默认行优先，选了象限规则就按象限走）%s"
                   % (detail["lbd"] + detail["str"], detail["lbd"], detail["str"], tip)), detail
 
 
@@ -1892,6 +2030,7 @@ class Bus(QObject):
     status = Signal(str)
     racks = Signal(list)          # 支架类型明细（后台线程解析完推给界面）
     strprev = Signal(object)        # STR 顺序预览（后台线程 -> 界面）
+    quadprev = Signal(object)       # 象限预览（后台线程 -> 界面）
     save_result = Signal(bool, str)
     plot_prog = Signal(int, int)          # 导出 PDF：已完成 / 总数
     plot_result = Signal(bool, str)       # 导出 PDF：成功?, 路径或错误
@@ -2065,8 +2204,10 @@ class StrOrderPreview(QWidget):
         pad, head, gap = 12, 22, 6
         w = max(40, self.width() - 2 * pad)
         h = max(30, self.height() - 2 * pad - head)
-        cw = max(28, min(96, int(w / self.cols)))
-        chh = max(20, min(44, int(h / self.rows)))
+        # 格子尺寸按可用面积算，能缩就缩：格子多的时候整片都画得下（以前是固定下限，
+        # 行/列一多就顶出控件、下半截看不见）
+        cw = max(9.0, min(96.0, float(w) / self.cols))
+        chh = max(9.0, min(44.0, float(h) / self.rows))
         ox = pad + max(0, int((w - cw * self.cols) / 2.0))
         oy = pad + head + max(0, int((h - chh * self.rows) / 2.0))
         p.setPen(QColor("#39424e"))
@@ -2075,12 +2216,13 @@ class StrOrderPreview(QWidget):
 
         def cell(i):
             it = self.items[i]
-            return (ox + it[1] * cw, oy + it[2] * chh, cw - gap, chh - gap)
+            return (ox + it[1] * cw, oy + it[2] * chh, max(6.0, cw - gap),
+                    max(6.0, chh - gap))
 
         pts = []
         for i in range(len(self.items)):
             x, y, w2, h2 = cell(i)
-            pts.append((x + w2 // 2, y + h2 // 2))
+            pts.append((int(x + w2 / 2.0), int(y + h2 / 2.0)))
         p.setPen(QColor("#b9c6d6"))
         for i in range(1, len(pts)):
             p.drawLine(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1])
@@ -2095,10 +2237,126 @@ class StrOrderPreview(QWidget):
             else:
                 p.setBrush(QColor("#eef3f9"))
                 p.setPen(QColor("#8aa0b8"))
-            p.drawRect(x, y, w2, h2)
+            p.drawRect(int(x), int(y), int(w2), int(h2))
             p.setPen(QColor("#33414f"))
-            p.drawText(x, y, w2, h2, Qt.AlignCenter, it[0])
+            _s = str(it[0])
+            _fm = p.fontMetrics()
+            if _fm.horizontalAdvance(_s) + 2 <= w2:
+                p.drawText(int(x), int(y), int(w2), int(h2), Qt.AlignCenter, _s)
+            else:                     # 格子太窄：字缩到格子外面一点，至少能认出号
+                p.drawText(int(x + w2 / 2.0 - _fm.horizontalAdvance(_s) / 2.0),
+                           int(y + h2 / 2.0 - 7), _fm.horizontalAdvance(_s) + 2, 14,
+                           Qt.AlignCenter, _s)
 
+
+
+class QuadPreview(QWidget):
+    """象限预览：只画**规律示意图**，不看识别结果也不用选 JSON。
+
+    中间是原点（= 汇流箱 Box 的几何中心），四个象限各画一小片格子（3 列 x 3 行），
+    格子里的号按这个象限当前选的顺序排出来，连线就是编号走向 —— 换一个顺序，
+    号立刻换位置，8 种顺序的差别一眼能看出来。
+    """
+
+    COLORS = {"I": ("#eaf7ec", "#2e8b57"), "II": ("#e9f0fb", "#31589c"),
+              "III": ("#fdf1e4", "#c1701c"), "IV": ("#f4eafc", "#7a49a6")}
+    GREY = ("#eef2f6", "#93a2b2")
+    COLS, ROWS = 3, 3          # 示意格子：3 列 x 3 行，行优先/列优先一眼能分出来
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.orders = {}
+        self.hint = "四个象限各用什么顺序（原点 = 本页汇流箱 Box 的几何中心）"
+        self.setMinimumHeight(300)
+        self.setObjectName("StrPreview")
+
+    def set_data(self, orders=None, hint=""):
+        self.orders = dict(orders or {})
+        if hint:
+            self.hint = hint
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.fillRect(self.rect(), QColor("#ffffff"))
+        p.setPen(QColor("#ccd3dc"))
+        p.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        f = p.font()
+        f.setPointSize(max(7, f.pointSize() - 1))
+        p.setFont(f)
+        pad, head = 12, 20
+        p.setPen(QColor("#39424e"))
+        p.drawText(pad, 2, max(10, self.width() - 2 * pad), head,
+                   Qt.AlignLeft | Qt.AlignVCenter, "象限预览：%s" % self.hint)
+        top = head + 4
+        aw = max(40, self.width() - 2 * pad)
+        ah = max(40, self.height() - pad - top)
+        cx0, cy0 = pad + aw // 2, top + ah // 2
+        # 四个象限的底色（图像坐标 y 向下：上 = y 小）
+        quads = {"I": (cx0, top, pad + aw, cy0), "II": (pad, top, cx0, cy0),
+                 "III": (pad, cy0, cx0, top + ah), "IV": (cx0, cy0, pad + aw, top + ah)}
+        for q in ("I", "II", "III", "IV"):
+            fill, _line = self.COLORS.get(q, self.GREY)
+            x1, y1, x2, y2 = quads[q]
+            p.fillRect(x1, y1, max(1, x2 - x1 - 1), max(1, y2 - y1 - 1), QColor(fill))
+        p.setPen(QColor("#c8d2dc"))
+        p.drawLine(pad, cy0, pad + aw, cy0)
+        p.drawLine(cx0, top, cx0, top + ah)
+        p.setPen(QColor("#d02020"))
+        p.setBrush(QColor("#d02020"))
+        p.drawEllipse(cx0 - 3, cy0 - 3, 6, 6)
+        for q in ("I", "II", "III", "IV"):
+            x1, y1, x2, y2 = quads[q]
+            self._draw_quad(p, q, x1, y1, x2, y2)
+
+    def _draw_quad(self, p, q, X1, Y1, X2, Y2):
+        """一个象限：抬头写「哪个方位 + 用哪条顺序」，下面画 3x3 的号怎么走。"""
+        fill, line = self.COLORS.get(q, self.GREY)
+        _o = str(self.orders.get(q) or "0")
+        _txt = STR_ORDER_TEXT.get(_o, "") or ""
+        _txt = _txt.split(":", 1)[-1].strip() if ":" in _txt else _txt
+        inner, top = 8, q in ("I", "II")
+        p.setPen(QColor(line))
+        p.drawText(X1 + inner, (Y1 + 3) if top else (Y2 - 19),
+                   max(40, (X2 - X1) - 2 * inner), 16, Qt.AlignLeft | Qt.AlignVCenter,
+                   "%s %s → %s %s" % (q, QUAD_CN.get(q, ""), _o, _txt[:10]))
+        # 3x3 示意格子：号按这个顺序排（和正式编号同一套规则，见 order_demo_cells）
+        cells = demo_cells(_o, self.COLS, self.ROWS)
+        gal = max(10, (X2 - X1) - 2 * inner)
+        gah = max(10, (Y2 - Y1) - 26 - inner)
+        cw = min(38.0, gal / float(self.COLS))
+        chh = min(30.0, gah / float(self.ROWS))
+        gw, gh = cw * self.COLS, chh * self.ROWS
+        ox = (X1 + X2) / 2.0 - gw / 2.0
+        oy = (Y1 + Y2) / 2.0 + (8 if top else -8) - gh / 2.0
+        oy = max(Y1 + 22 if top else Y1 + 4, min(oy, Y2 - gh - 4))
+        fm = p.fontMetrics()
+        centers = {}
+        for c in cells:
+            x = ox + c["col"] * cw
+            y = oy + c["row"] * chh
+            p.setBrush(QColor("#ffffff"))
+            p.setPen(QColor(line))
+            p.drawRect(int(x), int(y), int(max(8.0, cw - 4)), int(max(8.0, chh - 4)))
+            centers[c["n"]] = (x + (cw - 4) / 2.0, y + (chh - 4) / 2.0)
+        p.setPen(QColor("#9fb0c4"))
+        for n in range(1, len(cells)):
+            if n in centers and (n + 1) in centers:
+                p.drawLine(int(centers[n][0]), int(centers[n][1]),
+                           int(centers[n + 1][0]), int(centers[n + 1][1]))
+        for c in cells:
+            _s = "%02d" % c["n"]
+            _w = fm.horizontalAdvance(_s)
+            x = ox + c["col"] * cw
+            y = oy + c["row"] * chh
+            p.setPen(QColor("#1f2b3a"))
+            if _w + 4 <= cw - 4:
+                p.drawText(int(x), int(y), int(max(8.0, cw - 4)), int(max(8.0, chh - 4)),
+                           Qt.AlignCenter, _s)
+            else:
+                p.drawText(int(x + cw / 2 - _w / 2), int(y + chh / 2 - 7), _w + 2, 14,
+                           Qt.AlignCenter, _s)
 
 
 class PrintDialog(QDialog):
@@ -2290,6 +2548,7 @@ class MainWindow(QMainWindow):
         self.bus.prog.connect(self.on_prog)
         self.bus.racks.connect(self.on_rack_types)
         self.bus.strprev.connect(self.on_str_preview)
+        self.bus.quadprev.connect(self.on_quad_preview)
         self.bus.err.connect(self.on_err)
         self.bus.done.connect(self.on_done)
         self.bus.status.connect(self.on_status)
@@ -2468,6 +2727,7 @@ class MainWindow(QMainWindow):
         form.setHorizontalSpacing(14)
         form.setVerticalSpacing(10)
         rack_panel = None
+        label_panel = None
         if sec_title == "选项":
             r = 0
             for key, txt, init in [("overwrite", "覆盖同名布局", False),
@@ -2482,17 +2742,23 @@ class MainWindow(QMainWindow):
                 r += 1
             # 标签位置固定模型空间（界面不再给选）：CAD 侧「填到布局」要按当前布局的最大视口
             # 把模型坐标换成图纸坐标，多布局/视口不规则时容易错位；见 cfg() 里的 labelWhere = "M"。
-        elif sec_title == "支架":
+        else:
             # 支架类型 + 拆不拆：每类支架可以选 不拆 / 2行 / 3行；
             # 选了几行，这个支架框就沿长边均分成几行，每行各一个 STR 号；
             # 号按上面的「STR 编号顺序」在整个 LBD 区域里走一个顺序，不是同一张支架连号。
             # 哪一列属于哪一类，按框长比例对「长度FT」（见 lbd_regions.rack_type_indices）。
             r = 0
             for key, label in keys:
+                if key == "strQuadOn":
+                    # 标签页里给「四象限规矩」这一段单独起个小标题，和上面的标签设置分开
+                    sub = QLabel("STR 编号方向 · 按汇流箱(Box)四象限规矩")
+                    sub.setObjectName("FieldLabel")
+                    form.addWidget(sub, r, 0, 1, 2)
+                    r += 1
                 lb = QLabel(label)
                 lb.setObjectName("FieldLabel")
                 form.addWidget(lb, r, 0)
-                if key in ("strBgColor", "strTextColor"):
+                if key in ("strBgColor", "strTextColor", "labelBgColor", "labelTextColor"):
                     cb = NoWheelCombo()
                     cb.setObjectName("Field")
                     cb.setMinimumWidth(320)
@@ -2500,14 +2766,21 @@ class MainWindow(QMainWindow):
                         cb.addItem(cname, aci)
                     self.combo[key] = cb
                     form.addWidget(cb, r, 1)
-                elif key == "strOrder":
+                elif key in ("strOrder",) + tuple(k for k, _t in QUAD_FIELDS):
                     cb = NoWheelCombo()
                     cb.setObjectName("Field")
                     cb.setMinimumWidth(320)
-                    for label, val in STR_ORDER_CHOICES:
-                        cb.addItem(label, val)
+                    if key == "strOrder":
+                        for label, val in STR_ORDER_CHOICES:
+                            cb.addItem(label, val)
+                    else:
+                        # 象限下拉：第一项是「0 = 这个象限不改」，其余就是 8 种顺序
+                        cb.addItem("0 用全局顺序（该象限不改）", "0")
+                        for label, val in STR_ORDER_CHOICES:
+                            cb.addItem(label, val)
                     self.combo[key] = cb
                     cb.currentIndexChanged.connect(lambda *_: self.on_refresh_str_preview())
+                    cb.currentIndexChanged.connect(lambda *_: self.on_refresh_quad_preview())
                     form.addWidget(cb, r, 1)
 
                 elif key in ("strBgOn", "rackAlign", "rackAvoid"):
@@ -2518,40 +2791,47 @@ class MainWindow(QMainWindow):
                     cb.addItem("关", "0")
                     self.combo[key] = cb
                     form.addWidget(cb, r, 1)
+                elif key == "strQuadOn":
+                    cb = NoWheelCombo()
+                    cb.setObjectName("Field")
+                    cb.setMinimumWidth(320)
+                    cb.addItem("开：按四象限规律命名", "1")
+                    cb.addItem("关：一律按「支架」页的全局顺序", "0")
+                    self.combo[key] = cb
+                    cb.currentIndexChanged.connect(lambda *_: self.on_quad_on_changed())
+                    form.addWidget(cb, r, 1)
                 else:
                     edit = QLineEdit()
                     edit.setObjectName("Field")
                     edit.setMinimumWidth(320)
                     self.edits[key] = edit
                     form.addWidget(edit, r, 1)
+                    if key in BROWSE_KEYS:
+                        bb = QPushButton("选择")
+                        bb.clicked.connect(lambda _=False, k=key: self.browse(k))
+                        form.addWidget(bb, r, 2)
                 r += 1
-            rack_panel = self._build_rack_panel()
-        else:
-            for row, (key, label) in enumerate(keys):
-                lb = QLabel(label)
-                lb.setObjectName("FieldLabel")
-                form.addWidget(lb, row, 0)
-                if key in ("labelBgColor", "labelTextColor"):
-                    cb = NoWheelCombo()
-                    cb.setObjectName("Field")
-                    cb.setMinimumWidth(320)
-                    for name, aci in COLOR_CHOICES:
-                        cb.addItem(name, aci)
-                    self.combo[key] = cb
-                    form.addWidget(cb, row, 1)
-                    continue
-                edit = QLineEdit()
-                edit.setObjectName("Field")
-                edit.setMinimumWidth(320)
-                self.edits[key] = edit
-                form.addWidget(edit, row, 1)
-                if key in BROWSE_KEYS:
-                    bb = QPushButton("选择")
-                    bb.clicked.connect(lambda _=False, k=key: self.browse(k))
-                    form.addWidget(bb, row, 2)
+                if key == "strQuadIV":
+                    _qh = QLabel(
+                        "开关关掉时四个下拉全部不生效（一律按「支架」页的全局顺序）；开着时判据是："
+                        "原点 = 本页汇流箱(Box)的几何中心，看这个 LBD 区域中心的方位"
+                        "（u 右为正、v 上为正）——I 右上 / II 左上 / III 左下 / IV 右下；"
+                        "离原点太近（死区）、或这页没有汇流箱时，用全局顺序。"
+                        "改完看下面的「象限预览」——四个小图就是四个象限里的真实样例，"
+                        "换一个顺序，号立刻就换位置。")
+                    _qh.setObjectName("Hint")
+                    _qh.setWordWrap(True)
+                    form.addWidget(_qh, r, 0, 1, 2)
+                    r += 1
+            if sec_title == "标签":
+                label_panel = self._build_label_panel()
+            elif sec_title == "支架":
+                rack_panel = self._build_rack_panel()
         outer.addLayout(form)
         if rack_panel is not None:
             outer.addWidget(rack_panel)
+        if label_panel is not None:
+            outer.addWidget(label_panel)
         outer.addStretch(1)
         sc = QScrollArea()
         sc.setWidgetResizable(True)
@@ -2588,16 +2868,38 @@ class MainWindow(QMainWindow):
         ph.addWidget(self.str_preview_btn)
         self.str_preview_info = QLabel("")
         self.str_preview_info.setObjectName("Hint")
+        self.str_preview_info.setWordWrap(True)       # 同上：说明长了不撑宽整页
         ph.addWidget(self.str_preview_info, 1)
         v.addLayout(ph)
         self.str_preview = StrOrderPreview()
         v.addWidget(self.str_preview)
-
         self.rack_rows = []          # [(串数, 长度QLineEdit, 拆不拆QComboBox)]
         self._rack_types = []        # 当前明细对应的支架类型(来自识别结果)
         self._rack_len_pref = {}     # 串数 -> 长度文本(用户填过/配置里带的)
         self._rack_split_pref = {}   # 串数 -> 拆不拆
         self.refresh_rack_rows([])
+        return box
+
+    def _build_label_panel(self):
+        """标签页下面那块：四象限编号规律的示意图（只看四个下拉，不读识别结果）。"""
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 10, 0, 0)
+        v.setSpacing(6)
+        qh = QHBoxLayout()
+        qh.setSpacing(8)
+        self.quad_preview_btn = QPushButton("刷新象限预览")
+        self.quad_preview_btn.clicked.connect(self.on_refresh_quad_preview)
+        qh.addWidget(self.quad_preview_btn)
+        self.quad_preview_info = QLabel("")
+        self.quad_preview_info.setObjectName("Hint")
+        self.quad_preview_info.setWordWrap(True)      # 说明较长，不换行会把整页撑宽
+        qh.addWidget(self.quad_preview_info, 1)
+        v.addLayout(qh)
+        self.quad_preview = QuadPreview()
+        v.addWidget(self.quad_preview)
+        # 先按默认值画一次（此时界面还没建完，不能用 cfg()）
+        self.quad_preview.set_data(quad_orders_from_cfg(DEFAULTS))
         return box
 
     def _stash_rack_rows(self):
@@ -2714,6 +3016,7 @@ class MainWindow(QMainWindow):
             return
         threading.Thread(target=self._rack_fill_worker, args=(cfg, announce), daemon=True).start()
         self.on_refresh_str_preview()
+        self.on_refresh_quad_preview()
 
     def on_refresh_str_preview(self):
         """按当前 STR 顺序刷新预览（后台读识别结果，不卡界面）。"""
@@ -2738,11 +3041,13 @@ class MainWindow(QMainWindow):
             self.bus.strprev.emit({"hint": "没找到识别结果 JSON：请先在上面选「识别结果 JSON文件」"})
             return
         order = str((cfg or {}).get("strOrder", "2") or "2").strip() or "2"
+        quad_map = quad_map_spec(cfg)
         apply_rack_len_hints(cfg)          # 明细行的长度FT -> 判支架类型（拆分要用）
         split = rack_split_spec(cfg)
         for jp in cands:
             try:
-                d = _lr_preview(jp, order=order, split=split)
+                d = _lr_preview(jp, order=order, split=split,
+                                quad_rule="", quad_map=quad_map)
             except Exception:
                 d = None
             if d:
@@ -2761,6 +3066,52 @@ class MainWindow(QMainWindow):
                                       d.get("hint", ""), d.get("cols", 1), d.get("rows", 1))
         if hasattr(self, "str_preview_info"):
             self.str_preview_info.setText(d.get("hint") or "")
+
+    def on_refresh_quad_preview(self):
+        """按当前四个象限的顺序刷新象限预览（后台读识别结果，不卡界面）。"""
+        if not hasattr(self, "quad_preview"):
+            return
+        try:
+            cfg = self.cfg()
+        except Exception:
+            return
+        self.on_quad_preview({"orders": quad_orders_from_cfg(cfg), "hint": self._quad_hint(cfg)})
+
+    @staticmethod
+    def _quad_hint(cfg):
+        """预览抬头那句话：说清原点、判据，以及总开关是开是关。"""
+        g = str((cfg or {}).get("strOrder", "2") or "2").strip() or "2"
+        _g = STR_ORDER_TEXT.get(g, "")
+        if not quad_on(cfg):
+            return "总开关 = 关：四个象限都按「支架」页的全局顺序 %s" % (_g or g)
+        return ("原点 = 本页汇流箱(Box)的几何中心，LBD 区域中心落在哪个象限就用那个象限的顺序；"
+                "格子里的 01~09 就是这个顺序的走法（某象限选 0 = 用全局顺序 %s）" % (_g or g))
+
+    def on_quad_on_changed(self):
+        """总开关动过：四个象限下拉跟着置灰/恢复，两个预览重算。"""
+        self._sync_quad_enabled()
+        self.on_refresh_str_preview()
+        self.on_refresh_quad_preview()
+
+    def _sync_quad_enabled(self):
+        """「按汇流箱四象限规律命名」关掉时，四个象限下拉置灰（选值留着，重开还是原来的）。"""
+        w = self.combo.get("strQuadOn")
+        on = True if w is None else str(w.currentData()) == "1"
+        for k, _t in QUAD_FIELDS:
+            c = self.combo.get(k)
+            if c is not None:
+                c.setEnabled(on)
+        b = getattr(self, "quad_preview_btn", None)
+        if b is not None:
+            b.setText("刷新象限预览" if on else "刷新象限预览（开关已关）")
+
+    def on_quad_preview(self, data):
+        if not hasattr(self, "quad_preview"):
+            return
+        d = data or {}
+        self.quad_preview.set_data(d.get("orders"), d.get("hint", ""))
+        if hasattr(self, "quad_preview_info"):
+            self.quad_preview_info.setText(d.get("hint") or "")
 
 
 
@@ -2843,6 +3194,8 @@ class MainWindow(QMainWindow):
         c["lbdFromRegion"] = self.checkbox["lbdFromRegion"].isChecked()
         c["rackAuto"] = self.checkbox["rackAuto"].isChecked()
         c["labelWhere"] = "M"          # 固定模型空间（界面不再给「当前布局」选项）
+        # 四个象限的顺序合并成一行存进配置（下游只认这一行，见 quad_map_spec）
+        c["strQuadMap"] = quad_map_spec(c)
         # 支架类型明细行(每类一行)优先：类型自动来自识别结果，长度FT/拆不拆按行填。
         # 长度FT 只按比例用（判「哪一列是哪一类」）；没填的类型用串数当比例，
         # 所以不填也能把两类分开。没有明细行时才用上面手填的 rackTypes/rackSplit。
@@ -2886,6 +3239,18 @@ class MainWindow(QMainWindow):
         self.checkbox["regionFit"].setChecked(bool(c.get("regionFit", True)))
         self.checkbox["lbdFromRegion"].setChecked(bool(c.get("lbdFromRegion", True)))
         self.checkbox["rackAuto"].setChecked(bool(c.get("rackAuto", True)))
+        # 老配置里只有合并那一行 "右上=4;左上=8"（没有四个下拉的值）时，拆回四个下拉
+        if not any(str(c.get(k, "") or "").strip() for k, _q in QUAD_FIELDS):
+            for q, v in (parse_quad_spec(c.get("strQuadMap")) or {}).items():
+                key = {"I": "strQuadI", "II": "strQuadII",
+                       "III": "strQuadIII", "IV": "strQuadIV"}.get(q)
+                w = self.combo.get(key) if key else None
+                if w is not None:
+                    i = w.findData(v)
+                    if i >= 0:
+                        w.setCurrentIndex(i)
+        self._sync_quad_enabled()      # 开关状态 -> 四个象限下拉的可用状态
+        self.on_refresh_quad_preview()  # 载入配置后把象限示意图按新值重画
         # 记忆每个支架类型的长度/拆分，明细行重建时套用
         self._rack_len_pref = {}
         self._rack_split_pref = {}

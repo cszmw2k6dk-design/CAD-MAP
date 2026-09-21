@@ -24,10 +24,6 @@
     (progn
       ;; ① STR 号已经画完：让 LBD 标签反过来避让一下（用 CAD 里的真实包围盒）
       (vl-catch-all-apply 'PdfLayout_LbdAvoidStr nil)
-      ;; ② 底图收进「PDF底图」层并锁定，免得在模型空间改标号时误点到底图
-      (if (not (vl-catch-all-error-p (vl-catch-all-apply 'PdfLayout_LockUnderlays nil)))
-        (princ "\n[PDF底图] 底图已移到「PDF底图」层并锁定（要移动底图先执行 PDFUNLOCK）")
-      )
     )
   )
 )

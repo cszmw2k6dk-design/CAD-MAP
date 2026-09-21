@@ -567,12 +567,195 @@ STR_ORDER_LABELS = [
     ("8 行优先: 下→上行、行内右→左", "8"),
 ]
 DEFAULT_STR_ORDER = "2"
+# 顺序号 -> 说明文字（界面/日志用；STR_ORDER_LABELS 是 (说明, 号) 的列表）
+STR_ORDER_TEXT = {val: lab for (lab, val) in STR_ORDER_LABELS}
 
 
 def norm_order(order):
     """把界面传来的顺序值归一到 "1".."8"（不合法就用默认 "2"）。"""
     key = str(order if order is not None else "").strip()
     return key if key in STR_ORDERS else DEFAULT_STR_ORDER
+
+
+# ------------------------------------------- 按「汇流箱(Box)象限」定 STR 顺序
+# 图纸上一个汇流箱（识别结果里 yolo_box_detection_results 的 Box 小框）周围常围着好几个
+# LBD 区域，散在汇流箱的各个方向。以「汇流箱(Box)的几何中心为原点、图纸正交轴为轴」：
+#     u = 右为正(fx 从左往右)   v = 上为正(fy 从下往上，和 L 行的 fy 同一套)
+# 一个 LBD 区域（判据 = LBD 区域框的中心）落在哪个象限，就用界面「支架」页里给这个象限
+# 选的 STR 顺序编号（四个象限各一个下拉框，见 app.py；0 = 该象限不改、用全局顺序）：
+#     I  右上 (u>0, v>0)      II  左上 (u<0, v>0)
+#     III 左下 (u<0, v<0)     IV  右下 (u>0, v<0)
+# 页面上没有汇流箱(Box)、或 LBD 中心几乎压在轴上(死区)时，用全局顺序，行为不变。
+QUAD_ORDER = ("I", "II", "III", "IV")
+QUAD_CN = {"I": "右上", "II": "左上", "III": "左下", "IV": "右下"}
+_QUAD_ALIAS = {
+    "i": "I", "ii": "II", "iii": "III", "iv": "IV",
+    "1": "I", "2": "II", "3": "III", "4": "IV",
+    "q1": "I", "q2": "II", "q3": "III", "q4": "IV",
+    "右上": "I", "左上": "II", "左下": "III", "右下": "IV",
+}
+# 界面上四个象限下拉框的初值（改成别的直接在下拉里选，或者存进配置再载入）。
+# 现在是「从近端起步·行优先」：近端 = 区域里离汇流箱最近的那个角（引线进来的一头），
+# 从它开始编号、一行一行往远端走 —— 即
+#   右上 I  -> 4 行优先: 下→上行、行内左→右（近端在左下角）
+#   左上 II -> 8 行优先: 下→上行、行内右→左（近端在右下角）
+#   左下 III-> 7 行优先: 上→下行、行内右→左（近端在右上角）
+#   右下 IV -> 2 行优先: 上→下行、行内左→右（近端在左上角）
+QUAD_DEFAULT_ORDERS = {"I": "4", "II": "8", "III": "7", "IV": "2"}
+# 一下就能套用的几套候选（界面预览/命令行都能用）：键 = 序号
+QUAD_PRESETS = {
+    "1": {"I": "4", "II": "8", "III": "7", "IV": "2"},     # 从近端起步·行优先
+    "2": {"I": "5", "II": "6", "III": "3", "IV": "1"},     # 从近端起步·列优先
+    "3": {"I": "7", "II": "2", "III": "4", "IV": "8"},     # 从远端起步·行优先
+    "4": {"I": "3", "II": "1", "III": "5", "IV": "6"},     # 从远端起步·列优先
+}
+DEFAULT_QUAD_RULE = "1"
+QUAD_DEAD_RATIO = 0.5      # 死区：离汇流箱中心不到「汇流箱短边 x 这个倍数」算压在轴上
+
+
+def norm_quad_rule(rule):
+    """预设号 -> "0".."4"（0/认不出来 = 不用预设，见 quad_order_map）。"""
+    key = str(rule if rule is not None else "").strip()
+    return key if (key == "0" or key in QUAD_PRESETS) else "0"
+
+
+def parse_quad_map(text):
+    """界面手填的象限顺序表 -> {"I".."IV": "1".."8"}；认不出来返回 {}。
+
+    认 "右上=4; 左上=8"、"I:2 II:1"、"1=4,2=8" 这几种写法（分隔符 ; , 空格 都行），
+    顺序值就是上面那 8 种顺序的序号。
+    """
+    out = {}
+    if not text:
+        return out
+    for part in re.split(r"[;,，、\s]+", str(text)):
+        if not part:
+            continue
+        m = re.match(r"^([^=:：]+?)\s*[=:：]\s*(\d+)$", part)
+        if not m:
+            continue
+        raw = m.group(1).strip()
+        q = _QUAD_ALIAS.get(raw.lower()) or _QUAD_ALIAS.get(raw)
+        o = m.group(2).strip()
+        if q and o in STR_ORDERS:
+            out[q] = o
+    return out
+
+
+def quad_spec(mapping):
+    """象限顺序表 -> 界面/配置里那一行文字（"右上=4;左上=8;左下=7;右下=2"）。"""
+    return "; ".join("%s=%s" % (QUAD_CN[q], (mapping or {}).get(q, "0")) for q in QUAD_ORDER)
+
+
+def quad_order_map(*specs):
+    """象限 -> STR 顺序。每个参数可以是：
+      * 预设号 "1".."4"（见 QUAD_PRESETS）
+      * 顺序表文字 "右上=4;左上=8;左下=7;右下=2"（见 parse_quad_map）
+      * 字典 {"I": "4", ...}
+    多个参数按先后顺序叠加（后面的覆盖前面的）。返回 {} 表示这套规则不用（全用全局顺序）。
+    """
+    out = {}
+    for spec in specs:
+        if not spec:
+            continue
+        if isinstance(spec, dict):
+            for q, o in spec.items():
+                qq = _QUAD_ALIAS.get(str(q).strip().lower()) or _QUAD_ALIAS.get(str(q).strip())
+                oo = str(o).strip()
+                if qq and oo in STR_ORDERS:
+                    out[qq] = oo
+            continue
+        key = norm_quad_rule(spec)
+        if key in QUAD_PRESETS:
+            out.update(QUAD_PRESETS[key])
+            continue
+        out.update(parse_quad_map(spec))
+    return {q: o for q, o in out.items() if o and o != "0"}
+
+
+def lbd_symbol_centers(page_data):
+    """一页 yolo_box_detection_results 的 data -> 汇流箱(Box 小框) 的 [(中心点, bbox), ...]。"""
+    out = []
+    for det in (page_data or {}).get("detections") or []:
+        b = det.get("bbox") or {}
+        if not all(k in b for k in ("x1", "y1", "x2", "y2")):
+            continue
+        out.append((_center(b), b))
+    return out
+
+
+def quadrant_of(origin, box, point):
+    """点落在以 origin 为原点的第几象限（图纸坐标，y 向上）。
+
+    origin = 汇流箱(Box)中心；box = 汇流箱的 bbox（只用来定死区大小）；
+    point = LBD 区域中心（原图像素，y 向下 —— 这里转成 y 向上再判）。
+    返回 "I"~"IV"，落在死区（几乎压在轴上/原点上，象限判不准）返回 ""。
+    """
+    u = point[0] - origin[0]
+    v = -(point[1] - origin[1])
+    side = min(float(box["x2"]) - float(box["x1"]), float(box["y2"]) - float(box["y1"]))
+    dead = max(1.0, side) * QUAD_DEAD_RATIO
+    if abs(u) < dead or abs(v) < dead:
+        return ""
+    if v > 0:
+        return "I" if u > 0 else "II"
+    return "IV" if u > 0 else "III"
+
+
+def quad_orders_for_nodes(nodes, symbols, mapping):
+    """一页里每个 LBD 区域 -> (它所在的象限, 该用的 STR 顺序)。
+
+    nodes:   [{"bbox": {...}}, ...]（LBD 区域框，原图像素）
+    symbols: [(中心点, bbox), ...] 这一页的汇流箱(Box)，见 lbd_symbol_centers()
+    mapping: {"I".."IV": "1".."8"}，见 quad_order_map()
+    原点取「离这个 LBD 区域最近的那个汇流箱」。返回 ({区域下标: (象限, 顺序)}, {象限: 个数})。
+    没有汇流箱、没开这套规则、判不准（死区）的区域不会出现在结果里 —— 调用方用全局顺序兜底。
+    """
+    if not mapping or not symbols:
+        return {}, {}
+    per, cnt = {}, {}
+    for i, n in enumerate(nodes):
+        c = _center(n["bbox"])
+        best_d, best_o, best_b = None, None, None
+        for oc, ob in symbols:
+            dd = (c[0] - oc[0]) ** 2 + (c[1] - oc[1]) ** 2
+            if best_d is None or dd < best_d:
+                best_d, best_o, best_b = dd, oc, ob
+        if best_o is None:
+            continue
+        q = quadrant_of(best_o, best_b, c)
+        o = mapping.get(q) if q else None
+        if not o:
+            continue
+        per[i] = (q, o)
+        cnt[q] = cnt.get(q, 0) + 1
+    return per, cnt
+
+
+def quad_names_by_index(nodes, per):
+    """{区域下标: (象限, 顺序)} -> {LBD 名字: (象限, 顺序)}（按节点的 name 字段）。"""
+    out = {}
+    for i, v in (per or {}).items():
+        nm = nodes[i].get("name") if 0 <= i < len(nodes) else None
+        if nm:
+            out[nm] = v
+    return out
+
+
+def quad_note(counts):
+    """日志/提示用：按汇流箱象限定过编号方向的区域数 + 各象限分布。"""
+    if not counts:
+        return ""
+    n = sum(counts.values())
+    parts = ["%s %d" % (QUAD_CN.get(q, q), counts[q]) for q in QUAD_ORDER if counts.get(q)]
+    return "；按汇流箱(Box)象限定了 %d 个 LBD 的编号方向（%s）" % (n, "、".join(parts))
+
+
+def merge_quad_counts(dst, src):
+    """把一页的象限统计并进总表。"""
+    for q, n in (src or {}).items():
+        dst[q] = dst.get(q, 0) + n
+    return dst
 
 
 def _band(vals, tol):
@@ -1465,13 +1648,20 @@ def debug_page_map(json_path):
 
 def rack_lines_from_debug(json_path, prefix="STR", digits=2, page_map=None,
                            order=DEFAULT_STR_ORDER, split=None, info=None,
-                           align=False, avoid=None, avoid_pad=0.0):
+                           align=False, avoid=None, avoid_pad=0.0,
+                           quad_rule="0", quad_map=""):
     """识别结果 debug JSON -> 支架号行（L 行：页号 fx fy STRxx 角度 字高占页比）。
 
     按所属 LBD 区域(Node 框) 分组、组内行优先（上→下、左→右）编号，每组从 01 起；
     竖条 90°、横条 0°，字高按框短边。没落在任何 LBD 区域里的支架不编号 ——
     和 frame_detect/map_lbd_str.py 的规则一致（那种框视为干扰）。
 
+    order: 全局 STR 编号顺序（8 种之一，见 STR_ORDERS），没有象限规则时全用它。
+    quad_rule / quad_map: 按「汇流箱(Box)象限」自动换顺序 —— 以离该 LBD 区域最近的
+           汇流箱中心为原点，看这个区域落在第几象限（I 右上 / II 左上 / III 左下 /
+           IV 右下），用象限顺序表里对应的那个顺序编号；没汇流箱的页、判不准的死区、
+           以及 quad_rule="0" 时仍用 order。quad_rule 是预设表（见 QUAD_RULES），
+           quad_map 是界面手填的覆盖表（如 "右上=4;左上=8"）。见 quad_order_map()。
     split: 界面「支架」页每类的「拆不拆」（例 "13=3行; 9=不拆"，见 parse_rack_split()）。
            选了 N 行的支架框会沿长边均分成 N 行、每行各一个号；号按界面上选的顺序在
            整个 LBD 区域里走同一个顺序（同一张支架的几格不再连号，见 sort_cells_by_order()）。
@@ -1491,6 +1681,10 @@ def rack_lines_from_debug(json_path, prefix="STR", digits=2, page_map=None,
         page_size[pg.get("page_number")] = (pg.get("width") or 0, pg.get("height") or 0)
     trk = {p.get("page_number"): (p.get("data") or {})
            for p in doc.get("yolo_tracker_detection_results") or []}
+    box_pages = {p.get("page_number"): (p.get("data") or {})
+                 for p in doc.get("yolo_box_detection_results") or []}
+    qmap = quad_order_map(quad_rule, quad_map)
+    quad_counts = {}
     digits = max(1, int(digits or 2))
     split_map = parse_rack_split(split)
     types = rack_types_from_doc(doc) if split_enabled(split_map) else []
@@ -1530,10 +1724,14 @@ def rack_lines_from_debug(json_path, prefix="STR", digits=2, page_map=None,
         heights.sort()
         med_h = heights[len(heights) // 2] if heights else 1.0
         med_w = _med_width(typs)
+        # 这个 LBD 区域落在汇流箱的哪个象限 -> 用哪套顺序（没命中就用全局 order）
+        qper, qcnt = quad_orders_for_nodes(nodes, lbd_symbol_centers(box_pages.get(pg)), qmap)
+        merge_quad_counts(quad_counts, qcnt)
         for _key, items in groups.items():
-            racks = sort_items_by_order(items, med_h, order, med_w)
+            _order = (qper.get(_key) or ("", order))[1]
+            racks = sort_items_by_order(items, med_h, _order, med_w)
             # 拆开后按"格子"重排：一个 LBD 里的 STR 号在整片区域里走同一个顺序
-            ordered = sort_cells_by_order(expand_racks(racks, order), order, med_h, med_w)
+            ordered = sort_cells_by_order(expand_racks(racks, _order), _order, med_h, med_w)
             merge_counts(counts, count_splits(racks))
             # 自动对齐：同一排的号统一到一条排线上（只动高度，横向不动）
             anchors = (align_cell_anchors(ordered, med_h, med_w,
@@ -1561,12 +1759,13 @@ def rack_lines_from_debug(json_path, prefix="STR", digits=2, page_map=None,
                 n_str += 1
     if info is not None:
         info["split"] = note or split_note(counts)
+        info["quad"] = quad_counts
     return lines, n_str, n_pages
 
 
 def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_map=None,
                              order=DEFAULT_STR_ORDER, split=None, align=False, avoid=None,
-                             avoid_pad=0.0):
+                             avoid_pad=0.0, quad_rule="0", quad_map=""):
     """识别结果 debug JSON -> CAD 读的 L 行（和 X-AnyLabeling 那条路输出同一套格式）。
 
         L <页号> <fx> <fy> <名称> <角度> <字高占页比>      fx/fy 归一化、y 从下往上
@@ -1577,6 +1776,9 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
       frame_detect/map_lbd_str.py 的规则一致）；竖条 90°、横条 0°，字高按框短边。
       没落在任何 LBD 区域里的支架视为干扰，不编号（和 map_lbd_str.py 一样）。
 
+    order: 全局 STR 编号顺序（8 种之一）；quad_rule / quad_map: 按「汇流箱(Box)象限」给
+           每个 LBD 区域单独换顺序（见 quad_order_map() 和 rack_lines_from_debug()）——
+           以离该区域最近的汇流箱中心为原点判象限，命中就用象限表里的顺序，否则用 order。
     split: 界面「支架」页每类的「拆不拆」（例 "13=3行; 9=不拆"）：选了 N 行的支架框
            沿长边均分成 N 行、每行各一个号；号按界面上选的顺序在整个 LBD 区域里走
            同一个顺序（同一张支架的几格不再连号）。
@@ -1600,10 +1802,14 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
            for p in doc.get("ocr_node_name_results") or []}
     trk = {p.get("page_number"): (p.get("data") or {})
            for p in doc.get("yolo_tracker_detection_results") or []}
+    box_pages = {p.get("page_number"): (p.get("data") or {})
+                 for p in doc.get("yolo_box_detection_results") or []}
     if not trk:
         return {"ok": False, "error": "这份 JSON 里没有 yolo_tracker_detection_results，"
                                       "不是识别结果 debug JSON"}
 
+    qmap = quad_order_map(quad_rule, quad_map)
+    quad_counts = {}
     digits = max(1, int(digits or 2))
     split_map = parse_rack_split(split)
     types = rack_types_from_doc(doc) if split_enabled(split_map) else []
@@ -1666,10 +1872,15 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
         heights.sort()
         med_h = heights[len(heights) // 2] if heights else 1.0
         med_w = _med_width(typs)
+        # 这个 LBD 组落在汇流箱的哪个象限 -> 用哪套顺序（没命中就用全局 order）
+        qper, qcnt = quad_orders_for_nodes(nodes, lbd_symbol_centers(box_pages.get(pg)), qmap)
+        merge_quad_counts(quad_counts, qcnt)
+        qname = quad_names_by_index(nodes, qper)
         for _grp, items in groups.items():
-            racks = sort_items_by_order(items, med_h, order, med_w)
+            _order = (qname.get(_grp) or ("", order))[1]
+            racks = sort_items_by_order(items, med_h, _order, med_w)
             # 拆开后按"格子"重排：一个 LBD 里的 STR 号在整片区域里走同一个顺序
-            ordered = sort_cells_by_order(expand_racks(racks, order), order, med_h, med_w)
+            ordered = sort_cells_by_order(expand_racks(racks, _order), _order, med_h, med_w)
             merge_counts(counts, count_splits(racks))
             # 自动对齐：同一排的号统一到一条排线上（只动高度，横向不动）
             anchors = (align_cell_anchors(ordered, med_h, med_w,
@@ -1703,7 +1914,7 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
         return {"ok": False, "error": "写提取文件失败：%s" % e}
     return {"ok": True, "lines": len(lines), "lbd": n_lbd, "str": n_str,
             "pages": n_pages, "path": os.path.abspath(out_path),
-            "split": note or split_note(counts)}
+            "split": note or split_note(counts), "quad": quad_counts}
 
 
 def page_region_bounds(json_path):
@@ -1849,7 +2060,8 @@ def _med_width(typs):
     return ws[len(ws) // 2] if ws else 1.0
 
 
-def preview_group(json_path, order=DEFAULT_STR_ORDER, prefix="STR", digits=2, split=None):
+def preview_group(json_path, order=DEFAULT_STR_ORDER, prefix="STR", digits=2, split=None,
+                  quad_rule="0", quad_map=""):
     """给界面预览用：取第一张有 Tracker 的图里"支架最多的那个 LBD 组"。
 
     返回 {"page": 页号, "group": 组名, "cols": 列数, "rows": 行数,
@@ -1859,6 +2071,8 @@ def preview_group(json_path, order=DEFAULT_STR_ORDER, prefix="STR", digits=2, sp
 
     split: 界面「支架」页每类的「拆不拆」；选了行的支架在预览里也按拆后的格子画，
             编号和实际画到图上的一致（一个 LBD 走同一个顺序，同一张支架的几格不再连号）。
+    quad_rule / quad_map: 按「汇流箱(Box)象限」给这个 LBD 组换顺序（同实际输出），
+            预览的提示里会写明它落在哪个象限、用的是哪个顺序。
     """
     try:
         with open(json_path, encoding="utf-8") as f:
@@ -1869,7 +2083,10 @@ def preview_group(json_path, order=DEFAULT_STR_ORDER, prefix="STR", digits=2, sp
            for p in doc.get("ocr_node_name_results") or []}
     trk = {p.get("page_number"): (p.get("data") or {})
            for p in doc.get("yolo_tracker_detection_results") or []}
+    box_pages = {p.get("page_number"): (p.get("data") or {})
+                 for p in doc.get("yolo_box_detection_results") or []}
     order = norm_order(order)
+    qmap = quad_order_map(quad_rule, quad_map)
     digits = max(1, int(digits or 2))
     page_size = {}
     for pgd in (doc.get("input_data") or {}).get("pages") or []:
@@ -1914,9 +2131,12 @@ def preview_group(json_path, order=DEFAULT_STR_ORDER, prefix="STR", digits=2, sp
         med_h = heights[len(heights) // 2] if heights else 1.0
         med_w = _med_width(typs)
         gname = max(groups, key=lambda k: len(groups[k]))       # 支架最多的那个组
-        racks = sort_items_by_order(groups[gname], med_h, order, med_w)
+        qper, _qcnt = quad_orders_for_nodes(nodes, lbd_symbol_centers(box_pages.get(pg)), qmap)
+        qname = quad_names_by_index(nodes, qper)
+        gq, g_order = qname.get(gname) or ("", order)
+        racks = sort_items_by_order(groups[gname], med_h, g_order, med_w)
         # 拆成几行的按拆后的格子画、按格子排号（一个 LBD 走同一个顺序）
-        items = sort_cells_by_order(expand_racks(racks, order), order, med_h, med_w)
+        items = sort_cells_by_order(expand_racks(racks, g_order), g_order, med_h, med_w)
         merge_counts(counts, count_splits(racks))
 
         # 行 = (排号, 第几格) —— 和编号、自动对齐同一套判据（不看号的像素高度）；
@@ -1936,12 +2156,169 @@ def preview_group(json_path, order=DEFAULT_STR_ORDER, prefix="STR", digits=2, sp
                  rpos[(keys[i][0], keys[i][1])]) for i in range(len(items))]
         hint = "第 %s 页 · %s · %d 个号（%s ~ %s）" % (pg, gname, len(data),
                                                         data[0][0], data[-1][0])
+        if gq:
+            _lab = STR_ORDER_TEXT.get(g_order) or ("顺序 " + g_order)
+            hint += "；象限 %s(%s) -> %s" % (gq, QUAD_CN.get(gq, gq), _lab)
         extra = note or split_note(counts)
         if extra:
             hint += "；" + extra
         return {"page": pg, "group": gname, "items": data, "count": len(data),
-                "cols": ncols, "rows": len(row_ids), "order": order,
+                "cols": ncols, "rows": len(row_ids), "order": g_order, "quad": gq,
                 "hint": hint}
+    return None
+
+
+def order_demo_cells(order=DEFAULT_STR_ORDER, cols=3, rows=3):
+    """给界面画「这个顺序大概怎么走」用的示意格子（默认 3 列 x 3 行）。
+
+    用的是和正式编号同一套规则（STR_ORDERS：主轴 / 主轴方向 / 带内方向），所以预览里
+    号怎么走和真正画到图上的一致。行号 0 = 最上面一行、列号 0 = 最左边一列。
+    返回 [{"n": 第几号, "col": 列, "row": 行}, ...]（按号 1..N 的顺序）。
+    """
+    axis, main_dir, sec_dir = STR_ORDERS[norm_order(order)]
+    cells = [{"col": c, "row": r} for r in range(max(1, int(rows)))
+             for c in range(max(1, int(cols)))]
+    if axis == "Y":            # 行优先：先按排分带（上/下），带内按左右
+        key = lambda it: (main_dir * it["row"], sec_dir * it["col"])      # noqa: E731
+    else:                      # 列优先：先按列分带（左/右），列内按上下
+        key = lambda it: (main_dir * it["col"], sec_dir * it["row"])      # noqa: E731
+    out = sorted(cells, key=key)
+    return [{"n": i + 1, "col": c["col"], "row": c["row"]} for i, c in enumerate(out)]
+
+
+def preview_quadrants(json_path, *specs, order=DEFAULT_STR_ORDER, split=None, prefix="STR",
+                      digits=2):
+    """象限预览数据：找第一页「有汇流箱(Box)、也有 LBD 区域」的图，给四个象限各配一个
+    真实的 LBD 组当样例，**按这一象限当前选的顺序把它的 STR 号算出来**给界面画小图 ——
+    换个顺序，小图里的号立刻就变，能直接看出不同顺序的差别。
+
+    返回 {page, w, h, box:(cx,cy,bw,bh), counts, panels, hint}：
+      panels = [{"quad", "cn", "order", "label", "name", "count",
+                 "cells": [{"n": 1, "x0","y0","x1","y1"}, ...]}]
+      cells 的坐标是**相对这一组自己的包围盒**归一化的（左上角 0,0，y 向下），
+      号就是这一组最终会画到图上的 STR 号；该象限没有区域时 cells = []。
+    没有汇流箱 / 读不到就返回 None。specs 见 quad_order_map()，order = 全局顺序（某个
+    象限没单独选、或整条规则关掉时用它）。
+    """
+    try:
+        with open(json_path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except Exception:
+        return None
+    page_size = {}
+    for pg in (doc.get("input_data") or {}).get("pages") or []:
+        page_size[pg.get("page_number")] = (pg.get("width") or 0, pg.get("height") or 0)
+    trk = {p.get("page_number"): (p.get("data") or {})
+           for p in doc.get("yolo_tracker_detection_results") or []}
+    box_pages = {p.get("page_number"): (p.get("data") or {})
+                 for p in doc.get("yolo_box_detection_results") or []}
+    ocr = {p.get("page_number"): (p.get("data") or [])
+           for p in doc.get("ocr_node_name_results") or []}
+    mapping = quad_order_map(*specs)
+    fallback = norm_order(order)
+    digits = max(1, int(digits or 2))
+    split_map = parse_rack_split(split)
+    types = rack_types_from_doc(doc) if split_enabled(split_map) else []
+    for pg in sorted(p for p in trk if isinstance(p, int)):
+        W, H = page_size.get(pg, (0, 0))
+        if not W or not H:
+            continue
+        symbols = lbd_symbol_centers(box_pages.get(pg))
+        nodes, typs = _page_boxes((trk.get(pg) or {}).get("detections"))
+        if not symbols or not nodes or not typs:
+            continue
+        name_by_key = {}
+        for r in ocr.get(pg) or []:
+            nb = r.get("node_bbox") or {}
+            if not all(k in nb for k in ("x1", "y1", "x2", "y2")):
+                continue
+            key = (round(nb["x1"], 1), round(nb["y1"], 1),
+                   round(nb["x2"], 1), round(nb["y2"], 1))
+            name_by_key[key] = (r.get("final_node_name")
+                                or r.get("preliminary_node_name") or "").strip()
+        for n in nodes:
+            b = n["bbox"]
+            key = (round(b["x1"], 1), round(b["y1"], 1),
+                   round(b["x2"], 1), round(b["y2"], 1))
+            n["name"] = name_by_key.get(key, "")
+        per, cnt = quad_orders_for_nodes(nodes, symbols, mapping)
+        rows = []
+        for i, n in enumerate(nodes):
+            b = n["bbox"]
+            q, o = per.get(i, ("", ""))
+            rows.append({"name": n.get("name") or ("区域 %d" % (i + 1)),
+                         "bbox": (b["x1"], b["y1"], b["x2"], b["y2"]),
+                         "quad": q, "order": o})
+
+        # 每个象限挑一个真实的 LBD 组当样例（号最多的那个），照它实际的顺序算一遍号
+        tmap = rack_type_indices({pg: (trk.get(pg) or {})}, page_size, types, split_map)[0] \
+            if types else {}
+        groups, heights = {}, []
+        for ti, t in enumerate(typs):
+            b = t["bbox"]
+            heights.append(b["y2"] - b["y1"])
+            p = _assign_parent(b, nodes)
+            if p is None or not p.get("name"):
+                continue
+            cx, cy = _center(b)
+            _rows, tkey = 1, None
+            idx = (tmap.get(pg) or [])[ti] if ti < len(tmap.get(pg) or []) else None
+            if idx is not None and idx < len(types):
+                tkey = types[idx].get("strings")
+                _rows = rack_split_rows(split_map, tkey)
+            groups.setdefault(nodes.index(p), []).append((cx, cy, b, _rows, tkey))
+        heights.sort()
+        med_h = heights[len(heights) // 2] if heights else 1.0
+        med_w = _med_width(typs)
+        sample = {}                      # 象限 -> (号个数, cells)
+        for ni, items in groups.items():
+            q = per.get(ni, ("", ""))[0]
+            if not q:
+                continue                     # 死区 / 没判到象限的不进小图
+            _order = per[ni][1]
+            racks = sort_items_by_order(items, med_h, _order, med_w)
+            cells = sort_cells_by_order(expand_racks(racks, _order), _order, med_h, med_w)
+            if not cells:
+                continue
+            if q not in sample or len(cells) > len(sample[q][1]):
+                sample[q] = (ni, cells)
+
+        panels = []
+        for q in QUAD_ORDER:
+            _o = mapping.get(q) or fallback
+            cell_rows = []
+            ni, cells = sample.get(q, (None, []))
+            if cells:
+                xs = [c[2]["x1"] for c in cells] + [c[2]["x2"] for c in cells]
+                ys = [c[2]["y1"] for c in cells] + [c[2]["y2"] for c in cells]
+                gx1, gx2 = min(xs), max(xs)
+                gy1, gy2 = min(ys), max(ys)
+                gw = max(1.0, gx2 - gx1)
+                gh = max(1.0, gy2 - gy1)
+                for k, c in enumerate(cells, 1):
+                    b = c[2]
+                    cell_rows.append({
+                        "n": k,
+                        "x0": (b["x1"] - gx1) / gw, "y0": (b["y1"] - gy1) / gh,
+                        "x1": (b["x2"] - gx1) / gw, "y1": (b["y2"] - gy1) / gh})
+            panels.append({"quad": q, "cn": QUAD_CN.get(q, q), "order": _o,
+                           "label": STR_ORDER_TEXT.get(_o, ""),
+                           "name": (nodes[ni].get("name") if ni is not None else ""),
+                           "count": len(cell_rows), "cells": cell_rows})
+
+        oc, ob = symbols[0]
+        bw, bh = ob["x2"] - ob["x1"], ob["y2"] - ob["y1"]
+        hint = ("第 %s 页 · 汇流箱(Box) %d 个 · LBD 区域 %d 个"
+                % (pg, len(symbols), len(rows)))
+        if mapping:
+            _parts = ["%s %d" % (QUAD_CN.get(q, q), cnt[q]) for q in QUAD_ORDER if cnt.get(q)]
+            hint += "；按象限定过顺序的 %d 个%s" % (
+                sum(cnt.values()), ("（" + "、".join(_parts) + "）") if _parts else "")
+        else:
+            hint += "；没选象限顺序：四个象限都用全局顺序 %s" % fallback
+        return {"page": pg, "w": W, "h": H,
+                "box": (oc[0], oc[1], bw, bh),
+                "nodes": rows, "counts": cnt, "panels": panels, "hint": hint}
     return None
 
 
