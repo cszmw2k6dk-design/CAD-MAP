@@ -1078,6 +1078,8 @@ def run_gui(path=None, smoke=False, memtest=0.0):
             self._pending = None
             self.edited = {}
             self._pixmap = None
+            self.clip = []                 # 复制/粘贴框用的内部剪贴板
+            self._paste_n = 0
             self.settings = load_settings()
             self.pdf = self.settings.get("pdf") or ""
             self.dpi = int(self.settings.get("dpi") or 0)
@@ -1111,6 +1113,14 @@ def run_gui(path=None, smoke=False, memtest=0.0):
             a = QAction("撤销", self)
             a.setShortcut(QKeySequence("Ctrl+Z"))
             a.triggered.connect(self.on_undo)
+            tb.addAction(a)
+            a = QAction("复制框", self)
+            a.setToolTip("把选中的框复制到剪贴板（Ctrl+C），可以粘到别的页")
+            a.triggered.connect(self.on_copy)
+            tb.addAction(a)
+            a = QAction("粘贴框", self)
+            a.setToolTip("粘贴刚复制的框（Ctrl+V），每贴一次自动错开一点")
+            a.triggered.connect(self.on_paste)
             tb.addAction(a)
             a = QAction("适应窗口", self)
             a.setShortcut(QKeySequence("Ctrl+0"))
@@ -1594,6 +1604,13 @@ def run_gui(path=None, smoke=False, memtest=0.0):
 
         def keyPressEvent(self, ev):
             k = ev.key()
+            ctrl = bool(ev.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            if ctrl and k == Qt.Key.Key_C:
+                self.on_copy()
+                return
+            if ctrl and k == Qt.Key.Key_V:
+                self.on_paste()
+                return
             if k == Qt.Key.Key_Escape:
                 self.on_escape()
                 return
@@ -1629,6 +1646,50 @@ def run_gui(path=None, smoke=False, memtest=0.0):
             if self.canvas.mode != "select":
                 self.set_mode("select")
                 self.statusBar().showMessage("已退出画框模式", 3000)
+
+        def on_copy(self):
+            sel = [i for i in self.scene.selectedItems() if isinstance(i, BoxItem)]
+            if not sel:
+                self.statusBar().showMessage("先选中要复制的框（可以框选多个）", 4000)
+                return
+            self.clip = [copy.deepcopy(it.shape_data) for it in sel]
+            for s in self.clip:
+                # 复制出来的是"新框"：不能再认原来那条编号记录，否则回写时两个框抢一条记录
+                s["ocr_index"] = None
+            self._paste_n = 0
+            self.statusBar().showMessage(
+                "已复制 %d 个框；切到目标页按 Ctrl+V 粘贴（每贴一次自动错开）" % len(self.clip), 6000)
+
+        def on_paste(self):
+            if not self.pm:
+                return
+            if not self.clip:
+                self.statusBar().showMessage("剪贴板里还没有框：先选中再按 Ctrl+C", 4000)
+                return
+            self._paste_n += 1
+            step = 24 * self._paste_n
+            self.begin_change()
+            self.scene.clearSelection()
+            made = 0
+            for s in self.clip:
+                b = list(s["bbox"])
+                x1 = min(max(0.0, b[0] + step), max(0.0, self.pm.width - 2.0))
+                y1 = min(max(0.0, b[1] + step), max(0.0, self.pm.height - 2.0))
+                x2 = min(max(x1 + 1.0, b[2] + step), float(self.pm.width))
+                y2 = min(max(y1 + 1.0, b[3] + step), float(self.pm.height))
+                ns = copy.deepcopy(s)
+                ns["bbox"] = [x1, y1, x2, y2]
+                ns["ocr_index"] = None
+                self.pm.shapes.append(ns)
+                it = BoxItem(ns)
+                self.scene.addItem(it)
+                self.items.append(it)
+                it.setSelected(True)
+                made += 1
+            self.end_change()
+            self.on_selection()
+            self.statusBar().showMessage(
+                "已粘贴 %d 个框（错开 %d 像素；再按 Ctrl+V 再贴一份）" % (made, step), 6000)
 
         def on_undo(self):
             if not self.undo:
@@ -1805,6 +1866,30 @@ def run_gui(path=None, smoke=False, memtest=0.0):
         win.on_escape()
         e2 = (win.canvas.mode == "select")
         print("ESC：画到一半取消 %s；再按回到选择模式 %s" % (e1, e2))
+        # 复制粘贴：选中两个框 -> 复制 -> 粘贴两次，看数量与错开量
+        win.scene.clearSelection()
+        for it in win.items[:2]:
+            it.setSelected(True)
+        win.on_copy()
+        n_before = len(win.items)
+        win.on_paste()
+        n_mid = len(win.items)
+        win.on_paste()
+        n_after = len(win.items)
+        pasted = win.scene.selectedItems()
+        print("复制粘贴：选中 2 个 -> 复制 -> 粘贴两次 %d -> %d -> %d（每次 +2）"
+              % (n_before, n_mid, n_after))
+        print("   粘贴后选中 %d 个，新增框的 ocr_index 都是 None: %s"
+              % (len(pasted), all(p.shape_data.get("ocr_index") is None for p in pasted)))
+        # 跨页粘贴：复制 -> 翻到下一页 -> 粘贴
+        win.scene.clearSelection()
+        win.items[0].setSelected(True)
+        win.on_copy()
+        win.goto_offset(1)
+        n_page2 = len(win.items)
+        win.on_paste()
+        print("跨页粘贴：第 %d 页 %d -> %d 个框"
+              % (win.page, n_page2, len(win.items)))
         return 0
     return app.exec()
 
