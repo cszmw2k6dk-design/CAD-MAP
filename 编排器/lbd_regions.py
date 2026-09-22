@@ -1026,6 +1026,14 @@ def row_avoid_offsets(cells, anchor_y, obstacles, box_sizes, soft_boxes=(),
     cands = [0.0, lo, hi]
     for a, b in bad:
         cands += [a - 0.5, b + 0.5]
+    # 再把整个可动区间细扫一遍（只试"禁区边界"会漏掉真正的空位）
+    _step = max(1.0, 0.25 * min(float(bh) for (_bw, bh) in box_sizes))
+    _n = int((hi - lo) / _step) + 1
+    if _n > 400:
+        _step = (hi - lo) / 400.0
+        _n = 400
+    for _k in range(_n + 1):
+        cands.append(lo + _k * _step)
     ok = []
     for d in cands:
         if d < lo - 1e-9 or d > hi + 1e-9:
@@ -1128,23 +1136,8 @@ def avoid_cells_offsets(ordered, ys, obstacles, label_ratio=0.0, page_h=0.0,
             d = row_avoid_offsets(row_cells, ay, obstacles, row_boxes,
                                   [where[j] for j in range(n) if j not in sel], soft_zero=True,
                                   pads=[pads[i] for i in idxs])
-        if d is None:
-            # 整排找不到公共位置：这一排的号各自找（宁可这一排不齐，也别压住底图文字）
-            others = [where[j] for j in range(n) if j not in sel]
-            for i in idxs:
-                di = row_avoid_offsets([ordered[i]], ys[i], obstacles, [boxes[i]], others,
-                                       pads=[pads[i]])
-                if di is None:
-                    di = row_avoid_offsets([ordered[i]], ys[i], obstacles, [boxes[i]], others,
-                                           soft_zero=True, pads=[pads[i]])
-                # 只有确实比"原地不动"压得更少才挪，别越挪越糟
-                box_p = (boxes[i][0] + 2.0 * pads[i], boxes[i][1] + 2.0 * pads[i])
-                if di and _overlap_area(ordered[i][0], ys[i] + di, box_p, obstacles) \
-                        < _overlap_area(ordered[i][0], ys[i], box_p, obstacles) - 1e-6:
-                    off[i] = di
-                else:
-                    off[i] = 0.0
-            continue
+        # 走到这儿说明这一排连"压得最轻"的位置都没找到（例如支架比号还矮）：
+        # 整排必须同高是硬要求，不让这一排的号各自散着挪，保持原位。
         if d:
             for i in idxs:
                 off[i] = d
@@ -1637,12 +1630,21 @@ def debug_page_map(json_path):
     with open(json_path, encoding="utf-8") as f:
         doc = json.load(f)
     pages = set()
+    # 只认"真的有东西"的页：有些 JSON（比如标注工具生成的空白文档）会给每一页都写一条
+    # 空记录，那种页不算图纸，否则重编号会退化成 1:1，底图页号就对不上了。
     for key in ("yolo_tracker_detection_results", "yolo_box_detection_results",
                 "ocr_node_name_results"):
         for p in doc.get(key) or []:
             pg = p.get("page_number")
-            if isinstance(pg, int):
-                pages.add(pg)
+            if not isinstance(pg, int):
+                continue
+            data = p.get("data")
+            if isinstance(data, dict):
+                if data.get("detections"):
+                    pages.add(pg)
+            elif isinstance(data, list):
+                if data:
+                    pages.add(pg)
     return {pg: i + 1 for i, pg in enumerate(sorted(pages))}
 
 
@@ -1705,6 +1707,11 @@ def rack_lines_from_debug(json_path, prefix="STR", digits=2, page_map=None,
         if not typs or not nodes:
             continue
         n_pages += 1
+
+        # 底图印刷文字框（障碍）：CAD 侧摆 LBD 标签时拿它避让（画 STR 号那边也用同一批）
+        for (_a, _b, _c, _d) in ((avoid or {}).get(pg_out) or []):
+            lines.append("O\t%d\t%.6f\t%.6f\t%.6f\t%.6f"
+                         % (pg_out, _a, _b, _c, _d))
 
         groups, heights = {}, []
         for ti, t in enumerate(typs):
@@ -1849,18 +1856,29 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
                 continue
             cx, cy = _center(b)
             # 第 7 列 = LBD 区域(Node)宽 / 页高：CAD 端字高 = 该比例 x 底图高 x 倍数(1.4)
-            lines.append("L\t%d\t%.6f\t%.6f\t%s\t0\t%.6f"
+            # 第 8/9 列 = 这个区域的上下限(fy，y 从下往上)：CAD 侧摆标签时不许出这个范围
+            lines.append("L\t%d\t%.6f\t%.6f\t%s\t0\t%.6f\t%.6f\t%.6f"
                          % (pg_out, cx / float(W), 1.0 - cy / float(H), n["name"],
-                            max(1.0, b["x2"] - b["x1"]) / float(H)))
+                            max(1.0, b["x2"] - b["x1"]) / float(H),
+                            1.0 - b["y2"] / float(H), 1.0 - b["y1"] / float(H)))
             n_lbd += 1
 
+        # 底图印刷文字框（障碍）：CAD 侧画 STR 号、摆 LBD 标签时都拿它避让。
+        for (_a, _b, _c, _d) in ((avoid or {}).get(pg_out) or []):
+            lines.append("O\t%d\t%.6f\t%.6f\t%.6f\t%.6f"
+                         % (pg_out, _a, _b, _c, _d))
+
+        # 按"区域下标"分组，而不是按区域名字 —— 区域还没填名字时也要能把支架号编出来
+        # （名字只影响 LBD 标签，和 STR 号该怎么排没关系）。
+        node_ix = {id(n): i for i, n in enumerate(nodes)}
         groups, heights = {}, []
         for ti, t in enumerate(typs):
             b = t["bbox"]
             heights.append(b["y2"] - b["y1"])
             p = _assign_parent(b, nodes)
-            if p is None or not p.get("name"):
-                continue
+            if p is None:
+                continue                      # 不在任何 LBD 区域内：不编号
+            pi = node_ix.get(id(p))
             cx, cy = _center(b)
             # 这一类支架要拆几行（认不出类型就 1 = 不拆，保持原样）
             rows, tkey = 1, None
@@ -1868,16 +1886,16 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
             if idx is not None and idx < len(types):
                 tkey = types[idx].get("strings")
                 rows = rack_split_rows(split_map, tkey)
-            groups.setdefault(p["name"], []).append((cx, cy, b, rows, tkey))
+            groups.setdefault(pi, []).append((cx, cy, b, rows, tkey))
         heights.sort()
         med_h = heights[len(heights) // 2] if heights else 1.0
         med_w = _med_width(typs)
         # 这个 LBD 组落在汇流箱的哪个象限 -> 用哪套顺序（没命中就用全局 order）
         qper, qcnt = quad_orders_for_nodes(nodes, lbd_symbol_centers(box_pages.get(pg)), qmap)
         merge_quad_counts(quad_counts, qcnt)
-        qname = quad_names_by_index(nodes, qper)
-        for _grp, items in groups.items():
-            _order = (qname.get(_grp) or ("", order))[1]
+        for _gi, items in groups.items():
+            # 象限顺序按"区域下标"查（qper 就是按下标给的），没命中就用全局 order
+            _order = (qper.get(_gi) or ("", order))[1]
             racks = sort_items_by_order(items, med_h, _order, med_w)
             # 拆开后按"格子"重排：一个 LBD 里的 STR 号在整片区域里走同一个顺序
             ordered = sort_cells_by_order(expand_racks(racks, _order), _order, med_h, med_w)

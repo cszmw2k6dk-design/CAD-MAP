@@ -23,7 +23,10 @@
   (if (= (strcase msg) "RUN_DONE")
     (progn
       ;; ① STR 号已经画完：让 LBD 标签反过来避让一下（用 CAD 里的真实包围盒）
-      (setq _ar (vl-catch-all-apply 'PdfLayout_LbdAvoidStr nil))
+      (setq _ar (vl-catch-all-apply 'PdfLayout_LbdPlace nil))
+      (if (vl-catch-all-error-p _ar)
+        (setq _ar (vl-catch-all-apply 'PdfLayout_LbdAvoidStr nil))
+      )
       (if (vl-catch-all-error-p _ar)
         (princ (strcat "\n[LBD避让STR] 出错：" (vl-catch-all-error-message _ar)))
       )
@@ -141,7 +144,217 @@
   )
   (princ)
 )
-(defun c:LBDAVOIDSTR () (PdfLayout_LbdAvoidStr))
+;;; =============================================================
+;;; LBD label final placement   (ASCII only: this file is GBK)
+;;;  - STR numbers are the fixed part: they never move here.
+;;;  - a label may only move up/down, and only inside its own LBD
+;;;    region (L line columns 8/9 give that region fy range).
+;;;  - it must not cover STR numbers, the printed text boxes on the
+;;;    underlay (O lines) or other LBD labels.
+;;;  - among free spots, the one closest to the region centre wins.
+;;;  - runs after the STR numbers are drawn (PdfLayout_Prog RUN_DONE).
+;;; =============================================================
+(setq *PdfLayout_LbdStepMax* 6)
+
+(defun PdfLayout_RectMake (bb)
+  ;; ((x1 y1)(x2 y2)) -> (x1 y1 x2 y2)
+  (if bb
+    (list (car (car bb)) (cadr (car bb)) (car (cadr bb)) (cadr (cadr bb)))
+  )
+)
+
+(defun PdfLayout_RectBox (r)
+  ;; (x1 y1 x2 y2) -> ((x1 y1)(x2 y2)) for ssget
+  (list (list (car r) (cadr r)) (list (nth 2 r) (nth 3 r)))
+)
+
+(defun PdfLayout_RectOver (a b)
+  ;; T if two (x1 y1 x2 y2) rects overlap
+  (and a b
+       (< (car a) (nth 2 b)) (> (nth 2 a) (car b))
+       (< (cadr a) (nth 3 b)) (> (nth 3 a) (cadr b)))
+)
+
+(defun PdfLayout_RectShiftY (r dy)
+  (list (car r) (+ (cadr r) dy) (nth 2 r) (+ (nth 3 r) dy))
+)
+
+(defun PdfLayout_RectHits (r lst / n)
+  (setq n 0)
+  (foreach x lst (if (PdfLayout_RectOver r x) (setq n (1+ n))))
+  n
+)
+
+(defun PdfLayout_OtherRects (labs en / out)
+  (setq out nil)
+  (foreach x labs (if (/= (car x) en) (setq out (append out (list (caddr x))))))
+  out
+)
+
+;;; lexicographic compare of two number lists (works for any length)
+(defun PdfLayout_KeyLt (a b)
+  (if a
+    (if b
+      (cond
+        ((< (car a) (car b)) T)
+        ((> (car a) (car b)) nil)
+        (T (PdfLayout_KeyLt (cdr a) (cdr b)))
+      )
+      T
+    )
+    nil
+  )
+)
+
+;;; O <page> <fx1> <fy1> <fx2> <fy2>  = printed text boxes on the underlay
+(defun PdfLayout_ObsRead (path / f line parts out)
+  (setq out nil)
+  (setq f (if path (open path "r") nil))
+  (if f
+    (progn
+      (while (setq line (read-line f))
+        (setq parts (PdfLayout_SplitTab line))
+        (if (and (> (length parts) 5) (= (car parts) "O"))
+          (setq out (append out (list (list (atoi (nth 1 parts))
+                                            (atof (nth 2 parts)) (atof (nth 3 parts))
+                                            (atof (nth 4 parts)) (atof (nth 5 parts))))))
+        )
+      )
+      (close f)
+    )
+  )
+  out
+)
+
+;;; L <pg> <fx> <fy> <name> <ang> <h> <ymin> <ymax>  = label + its region range
+(defun PdfLayout_RngRead (path / f line parts out)
+  (setq out nil)
+  (setq f (if path (open path "r") nil))
+  (if f
+    (progn
+      (while (setq line (read-line f))
+        (setq parts (PdfLayout_SplitTab line))
+        (if (and (> (length parts) 8) (= (car parts) "L"))
+          (setq out (append out (list (list (atoi (nth 1 parts))
+                                            (atof (nth 2 parts)) (atof (nth 3 parts))
+                                            (atof (nth 7 parts)) (atof (nth 8 parts))))))
+        )
+      )
+      (close f)
+    )
+  )
+  out
+)
+
+(defun PdfLayout_RngFind (lst pg fx fy / hit)
+  (setq hit nil)
+  (foreach r lst
+    (if (and (not hit) (= (car r) pg)
+             (< (abs (- (cadr r) fx)) 1e-9) (< (abs (- (caddr r) fy)) 1e-9))
+      (setq hit r)
+    )
+  )
+  hit
+)
+
+;;; model space rects of the printed boxes (O lines) for one page
+(defun PdfLayout_ObsForPage (pg pmin bw bh / out)
+  (setq out nil)
+  (foreach o *PdfLayout_ObsAll*
+    (if (= (car o) pg)
+      (setq out (append out (list (list (+ (car pmin) (* (nth 1 o) bw))
+                                        (+ (cadr pmin) (* (nth 2 o) bh))
+                                        (+ (car pmin) (* (nth 3 o) bw))
+                                        (+ (cadr pmin) (* (nth 4 o) bh))))))
+    )
+  )
+  out
+)
+
+;;; place every LBD label: only up/down, inside its region, no overlap with
+;;; STR numbers / printed boxes / other labels, closest to the region centre
+(defun PdfLayout_LbdPlace (/ doc ms labLay strLay labs obj bb r en h step k s off rng lo hi
+                             ctr ctr0 cand oc hc obc lbc key best bestKey nTot nMoved)
+  (vl-load-com)
+  (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
+  (setq ms (vla-get-ModelSpace doc))
+  (setq labLay "LBD标签")
+  (setq strLay (if (and *PdfLayout_AiLayer* (/= *PdfLayout_AiLayer* ""))
+                 *PdfLayout_AiLayer* "PDF-AUTO-NUM"))
+  (if (not (numberp *PdfLayout_LbdStepMax*)) (setq *PdfLayout_LbdStepMax* 6))
+  (setq labs nil)
+  (vlax-for obj ms
+    (if (= (strcase (vl-catch-all-apply 'vla-get-Layer (list obj))) (strcase labLay))
+      (progn
+        (setq bb (PdfLayout_ObjBox obj))
+        (if bb
+          (setq labs (append labs (list (list (vlax-vla-object->ename obj) obj
+                                              (PdfLayout_RectMake bb)))))
+        )
+      )
+    )
+  )
+  (setq nTot (length labs) nMoved 0)
+  (foreach it labs
+    (setq en (car it) obj (cadr it) r (caddr it))
+    (setq h (vl-catch-all-apply 'vla-get-Height (list obj)))
+    (setq h (if (and (numberp h) (> h 0.0)) h 0.05))
+    (setq step (* 1.5 h))
+    (setq rng (assoc en *PdfLayout_LbdRange*))
+    (if rng
+      (progn
+        (setq lo (+ (cadr rng) (/ h 2.0)))
+        (setq hi (- (caddr rng) (/ h 2.0)))
+        (setq ctr0 (/ (+ (cadr rng) (caddr rng)) 2.0))
+      )
+      (progn (setq lo nil) (setq hi nil)
+             (setq ctr0 (* 0.5 (+ (cadr r) (nth 3 r)))))
+    )
+    ;; region shorter than the text: no room to move, keep the drawn place
+    (if (and lo (> lo hi)) (progn (setq lo nil) (setq hi nil)))
+    (setq ctr (* 0.5 (+ (cadr r) (nth 3 r))))
+    (setq best nil bestKey nil)
+    (setq k 0)
+    (while (<= k (fix *PdfLayout_LbdStepMax*))
+      (foreach s (if (= k 0) (list 0.0) (list (float k) (- 0.0 (float k))))
+        (setq off (* s step))
+        (setq cand (PdfLayout_RectShiftY r off))
+        (setq oc (* 0.5 (+ (cadr cand) (nth 3 cand))))
+        (if (or (null lo) (and (>= oc (- lo 1e-9)) (<= oc (+ hi 1e-9))))
+          (progn
+            (setq hc (PdfLayout_HitCount (PdfLayout_RectBox cand) strLay en))
+            (setq obc (PdfLayout_RectHits cand *PdfLayout_ObsRects*))
+            (setq lbc (PdfLayout_RectHits cand (PdfLayout_OtherRects labs en)))
+            (setq key (list hc obc lbc (abs (- oc ctr0)) (abs off)))
+            (if (or (null bestKey) (PdfLayout_KeyLt key bestKey))
+              (setq best off bestKey key)
+            )
+          )
+        )
+      )
+      (setq k (1+ k))
+    )
+    (if (and best (/= best 0.0))
+      (progn
+        (vl-catch-all-apply 'vla-Move
+          (list obj (vlax-3d-point 0.0 0.0 0.0) (vlax-3d-point 0.0 best 0.0)))
+        (setq labs
+          (mapcar '(lambda (x)
+                     (if (= (car x) en)
+                       (list en obj (PdfLayout_RectShiftY r best))
+                       x))
+                  labs))
+        (setq nMoved (1+ nMoved))
+      )
+    )
+  )
+  (PdfLayout_Prog (strcat "LBD_PLACE labels=" (itoa nTot) " moved=" (itoa nMoved)))
+  (princ (strcat "\n[LBD-PLACE] labels " (itoa nTot) ", moved " (itoa nMoved) "."))
+  (princ)
+)
+
+(defun c:LBDAVOIDSTR () (PdfLayout_LbdPlace))
+(defun c:LBDAVOIDSTR_OLD () (PdfLayout_LbdAvoidStr))
 ;;; 计时(毫秒)：优先 MILLISECS，取不到就用 DATE 的当天比例换算（只为进度显示）
 (defun PdfLayout_NowMs (/ v)
   (setq v (vl-catch-all-apply 'getvar (list "MILLISECS")))
@@ -317,6 +530,11 @@
       )
       (setq sheetMap nil)
       (if (and xlsx (/= xlsx "")) (setq sheetMap (PdfLayout_ReadAllLbdLabels xlsx)))
+      (setq *PdfLayout_ObsAll* (PdfLayout_ObsRead outPath))
+      (setq *PdfLayout_RngAll* (PdfLayout_RngRead outPath))
+      (setq *PdfLayout_ObsRects* nil)
+      (setq *PdfLayout_LbdRange* nil)
+      (PdfLayout_Prog (strcat "LBD_OBS " (itoa (length *PdfLayout_ObsAll*))))
       (setq underlays (PdfLayout_GetPdfUnderlays))
       (setq ms (vla-get-ModelSpace (vla-get-ActiveDocument (vlax-get-Acad-Object))))
       (if autoTxt
@@ -357,6 +575,8 @@
             (setq pmin (car bb) pmax (cadr bb))
             (setq bw (- (car pmax) (car pmin)))
             (setq bh (- (cadr pmax) (cadr pmin)))
+            (setq *PdfLayout_ObsRects*
+              (append *PdfLayout_ObsRects* (PdfLayout_ObsForPage pgnum pmin bw bh)))
             ;; 这一页的 LBD 标签先按「行(上→下) + 行内 x(左→右)」排好 —— 后面按这个顺序画，
             ;; 才有"隔一个往下错一行"的整齐效果（原来是按提取文件里的先后顺序画）
             (setq pgIt nil)
@@ -436,6 +656,14 @@
                               (setq lay (PdfLayout_EnsureLayer "LBD标签"))
                               (if (and lay (not (vl-catch-all-error-p lay)))
                                 (vl-catch-all-apply 'vla-put-Layer (list mObj "LBD标签")))
+                              (setq _rng (PdfLayout_RngFind *PdfLayout_RngAll* pgnum fx fy))
+                              (if _rng
+                                (setq *PdfLayout_LbdRange*
+                                  (append *PdfLayout_LbdRange*
+                                    (list (list (vlax-vla-object->ename mObj)
+                                                (+ (cadr pmin) (* (nth 3 _rng) bh))
+                                                (+ (cadr pmin) (* (nth 4 _rng) bh))))))
+                              )
                               (setq nDone (1+ nDone))
                               (setq nPgDone (1+ nPgDone))
                                (setq lastRight rgt)

@@ -44,7 +44,7 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_lbd_boxes = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.50"
+APP_VERSION = "2.51"
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
@@ -723,9 +723,12 @@ def build_extract_file(cfg, out_path, prog_path=None):
     detail["pages"] = len(pgmap) if pgmap else 0
 
     # STR 号要避开的障碍（带背景填充的号压上去会把名字盖掉）：
-    #   1) 底图上本来就印着的 LBD 标号 —— PDF 文字层；
-    #   2) CAD 里我们画的 LBD 标签（位置=识别区域中心，字高=区域宽 x 倍数）——
-    #      按同样规则算出来，不然号会压在刚填好的 LBD 名字上。
+    # 底图上本来就印着的 LBD 标号 —— 直接用 PDF 文字层的框（位置是实测的，准）。
+    # 我们自己画的 LBD 标签不在这里预估了：它的字高在模型单位里是「标签高度」，
+    # 换算成页像素要底图模型尺寸（这里没有），而且 CAD 画的时候还有"上下错行"，
+    # 预估出来的框不准（老代码 scale=0 时甚至塌成 0 尺寸的一个点）。
+    # 改成：CAD 画完 STR 号之后，由标签自己上下让位（真实包围盒判定），
+    # 见 PdfLayout_auto.lsp 的 PdfLayout_LbdPlace。
     avoid = None
     _avoid_pad = 0.0        # 关掉避让时也要有值：下面几条输出路径都会用到它
     detail["avoid"] = 0
@@ -738,17 +741,6 @@ def build_extract_file(cfg, out_path, prog_path=None):
                 boxes = pdf_lbd_boxes(pdf, p0, p1, pgmap)
             except Exception:
                 boxes = {}
-        if _lr_lbd_boxes is not None:
-            try:
-                _lens = read_xlsx_lbd_labels(cfg.get("xlsx"))
-                # LBD 标签字高统一用「标签高度」那格(模型单位)，这里没有模型尺寸可比，
-                # 按插件自动档同一套换算估标签大小（scale=0 -> (页宽+页高)/150 像素）
-                _lb = _lr_lbd_boxes(jp, scale=0.0, lens=_lens, page_map=pgmap)
-                for _pg, _bx in (_lb or {}).items():
-                    boxes.setdefault(_pg, []).extend(_bx)
-                    detail["avoid_cad"] += len(_bx)
-            except Exception:
-                pass
         avoid = boxes or None
         detail["avoid"] = sum(len(v) for v in (boxes or {}).values())
         # STR 号是"文字 + 背景填充(白底)"画出来的：白底比文字框大一圈，
@@ -838,7 +830,10 @@ def build_extract_file(cfg, out_path, prog_path=None):
 
     # 兜底：PDF 文字层没给出 LBD 行（无文字层的扫描件等），用 debug JSON 的区域中心
     if detail["lbd"] == 0 and kind == "debug" and _lr_extract_debug is not None:
-        r = _lr_extract_debug(jp, out_path, prefix=pre, order=order, split=split,
+        # 注意要带 page_map：这条兜底同样要按「底图顺序号」写页号，
+        # 漏了它（以前就是漏的）行会写成 JSON 里的原始页号，CAD 那边一张都对不上。
+        r = _lr_extract_debug(jp, out_path, prefix=pre, page_map=pgmap,
+                              order=order, split=split,
                               align=align, avoid=avoid, avoid_pad=_avoid_pad,
                               quad_rule=quad_rule, quad_map=quad_map)
         detail["split"] = r.get("split") or detail.get("split") or ""
@@ -3860,30 +3855,33 @@ class MainWindow(QMainWindow):
                 self.page_label.setText("按页进度 ｜ " + " ｜ ".join(
                     t for t in (self._pg_txt.get("LBD"), self._pg_txt.get("AI")) if t))
         # 当前阶段自己的 done/total：只用这两个数画进度条，别的阶段完成到多少都不影响
-        _ph = getattr(self, "_phase", "") or "LAYOUT"
-        self._phase = _ph
-        self.done_n, self.total = {
-            "REGION": (getattr(self, "_reg_done", 0), getattr(self, "_reg_total", 0)),
-            "LBD": (getattr(self, "_lbd_done", 0), getattr(self, "_lbd_total", 0)),
-            "AI": (getattr(self, "_ai_done", 0), getattr(self, "_ai_total", 0)),
-        }.get(_ph, (getattr(self, "_lay_done", 0), getattr(self, "_lay_total", 0)))
-        if self.total:
-            self.done_n = min(self.done_n, self.total)
-            self.run_status = {
-                "REGION": "正在按 LBD 区域上下限对准视口 %d / %d",
-                "LBD": "正在写 LBD 标签 %d / %d",
-                "AI": "正在画 STR 号 %d / %d",
-            }.get(_ph, "正在批量布局… 已创建 %d / %d 个") % (self.done_n, self.total)
-        else:
-            self.run_status = {
-                "REGION": "正在按 LBD 区域上下限对准视口…",
-                "LBD": "正在写 LBD 标签…",
-                "AI": "正在画 STR 号…",
-            }.get(_ph, "正在批量布局…")
-            # 这一阶段还没报总数（刚切过来）：别把上一阶段"已对准 12 / 12"留在下面
-            if hasattr(self, "count_label"):
-                self.count_label.setText(("已对准  ? / ?" if _ph == "REGION"
-                                          else "已绘制  ? / ?"))
+        # 注意：CAD 还没报任何阶段进度时 _phase 是空的（这时还在连接/打开 DWG），
+        # 这种"空阶段"**不能**当成 LAYOUT —— 否则每 150ms 就会把状态文字写成
+        # "正在批量布局…"，把"正在连接 / 启动 ZWCAD…"顶掉，界面上看着就是一直跳。
+        _ph = getattr(self, "_phase", "")
+        if _ph:
+            self.done_n, self.total = {
+                "REGION": (getattr(self, "_reg_done", 0), getattr(self, "_reg_total", 0)),
+                "LBD": (getattr(self, "_lbd_done", 0), getattr(self, "_lbd_total", 0)),
+                "AI": (getattr(self, "_ai_done", 0), getattr(self, "_ai_total", 0)),
+            }.get(_ph, (getattr(self, "_lay_done", 0), getattr(self, "_lay_total", 0)))
+            if self.total:
+                self.done_n = min(self.done_n, self.total)
+                self.run_status = {
+                    "REGION": "正在按 LBD 区域上下限对准视口 %d / %d",
+                    "LBD": "正在写 LBD 标签 %d / %d",
+                    "AI": "正在画 STR 号 %d / %d",
+                }.get(_ph, "正在批量布局… 已创建 %d / %d 个") % (self.done_n, self.total)
+            else:
+                self.run_status = {
+                    "REGION": "正在按 LBD 区域上下限对准视口…",
+                    "LBD": "正在写 LBD 标签…",
+                    "AI": "正在画 STR 号…",
+                }.get(_ph, "正在批量布局…")
+                # 这一阶段还没报总数（刚切过来）：别把上一阶段"已对准 12 / 12"留在下面
+                if hasattr(self, "count_label"):
+                    self.count_label.setText(("已对准  ? / ?" if _ph == "REGION"
+                                              else "已绘制  ? / ?"))
         if "STEP_SAVE" in up:
             self.run_status = "打印 / 导出…"
         finished = False
