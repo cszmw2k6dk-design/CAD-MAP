@@ -18,6 +18,7 @@
 !/编排器/
 !/PdfLayout插件包/
 !/frame_detect/
+!/标注工具/
 
 # ---- 编排器：打包产物 / 缓存 / 旧存档 ----
 /编排器/build/
@@ -57,6 +58,16 @@
 /frame_detect/**/*.log
 /frame_detect/**/*.txt
 /frame_detect/**/*.zip
+
+# ---- 标注工具：只留源码 + 说明 + 启动脚本，运行期产物不进仓库 ----
+/标注工具/render_cache/
+/标注工具/dist/
+/标注工具/build_exe/
+/标注工具/annotator_settings.json
+/标注工具/smoke_*.json
+/标注工具/*_annotated.json
+/标注工具/*.exe
+/标注工具/*.zip
 
 # ---- 通用 ----
 __pycache__/
