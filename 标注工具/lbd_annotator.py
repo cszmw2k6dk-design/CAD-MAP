@@ -1075,6 +1075,7 @@ def run_gui(path=None, smoke=False, memtest=0.0):
             self.pm = None
             self.items = []
             self.undo = []
+            self.redo = []
             self._pending = None
             self.edited = {}
             self._pixmap = None
@@ -1113,6 +1114,11 @@ def run_gui(path=None, smoke=False, memtest=0.0):
             a = QAction("撤销", self)
             a.setShortcut(QKeySequence("Ctrl+Z"))
             a.triggered.connect(self.on_undo)
+            tb.addAction(a)
+            a = QAction("重做", self)
+            a.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
+            a.setToolTip("重做刚撤销的操作（Ctrl+Y 或 Ctrl+Shift+Z）")
+            a.triggered.connect(self.on_redo)
             tb.addAction(a)
             a = QAction("复制框", self)
             a.setToolTip("把选中的框复制到剪贴板（Ctrl+C），可以粘到别的页")
@@ -1239,6 +1245,7 @@ def run_gui(path=None, smoke=False, memtest=0.0):
             self.update_pdf_button()
             self.edited.clear()
             self.undo.clear()
+            self.redo.clear()
             self.cmb_page.blockSignals(True)
             self.cmb_page.clear()
             for n in doc.page_numbers():
@@ -1483,6 +1490,8 @@ def run_gui(path=None, smoke=False, memtest=0.0):
             now = [(i, dict(s)) for i, s in enumerate(self.pm.shapes)]
             if now != self._pending:
                 self.undo.append((self.page, self._pending))
+                del self.undo[:-50]        # 只留最近 50 步，别无限涨
+                self.redo.clear()          # 有了新改动，"重做"就失效了（和常见编辑器一致）
                 self.mark_dirty()
             self._pending = None
 
@@ -1693,9 +1702,24 @@ def run_gui(path=None, smoke=False, memtest=0.0):
 
         def on_undo(self):
             if not self.undo:
-                self.statusBar().showMessage("没有可撤销的操作", 3000)
+                self.statusBar().showMessage("没有可撤销的操作（Ctrl+Y 可以重做）", 3000)
                 return
             page, snap = self.undo.pop()
+            self.redo.append((self.page, [(i, dict(s)) for i, s in enumerate(self.pm.shapes)]))
+            self._restore(page, snap)
+            self.statusBar().showMessage("已撤销；想还原按 Ctrl+Y", 4000)
+
+        def on_redo(self):
+            if not self.redo:
+                self.statusBar().showMessage("没有可重做的操作", 3000)
+                return
+            page, snap = self.redo.pop()
+            self.undo.append((self.page, [(i, dict(s)) for i, s in enumerate(self.pm.shapes)]))
+            self._restore(page, snap)
+            self.statusBar().showMessage("已重做", 3000)
+
+        def _restore(self, page, snap):
+            """把某一页恢复成快照的样子（撤销/重做共用）。"""
             if page != self.page:
                 self.goto_page(page)
             self.pm.shapes = [dict(s) for _i, s in snap]
@@ -1890,6 +1914,18 @@ def run_gui(path=None, smoke=False, memtest=0.0):
         win.on_paste()
         print("跨页粘贴：第 %d 页 %d -> %d 个框"
               % (win.page, n_page2, len(win.items)))
+        # 撤销 / 重做
+        n0 = len(win.items)
+        win.on_undo()
+        n_undo = len(win.items)
+        win.on_redo()
+        n_redo = len(win.items)
+        win.on_undo()
+        n_undo2 = len(win.items)
+        print("撤销/重做：%d ->(撤销) %d ->(重做) %d ->(再撤销) %d  重做栈 %d"
+              % (n0, n_undo, n_redo, n_undo2, len(win.redo)))
+        print("   期望 粘贴前/撤销后一致、重做后回到粘贴后: %s"
+              % ("通过" if (n_redo == n0 and n_undo == n_page2 and n_undo2 == n_page2) else "不一致！"))
         return 0
     return app.exec()
 
