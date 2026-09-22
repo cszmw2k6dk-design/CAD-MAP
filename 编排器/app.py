@@ -92,10 +92,10 @@ DEFAULTS = {
     # 顺序编号那一片支架（0 = 该象限不改、用全局的 strOrder）。四个下拉框见 QUAD_FIELDS。
     # strQuadOn = 0 时整条规则关掉：四个下拉的选值留着不动，但一律按全局 strOrder 编号。
     "strQuadOn": "1",
-    "strQuadI": (_LR_QUAD_DEFAULTS or {}).get("I", "4"),
-    "strQuadII": (_LR_QUAD_DEFAULTS or {}).get("II", "8"),
-    "strQuadIII": (_LR_QUAD_DEFAULTS or {}).get("III", "7"),
-    "strQuadIV": (_LR_QUAD_DEFAULTS or {}).get("IV", "2"),
+    "strQuadI": (_LR_QUAD_DEFAULTS or {}).get("I", "5"),
+    "strQuadII": (_LR_QUAD_DEFAULTS or {}).get("II", "6"),
+    "strQuadIII": (_LR_QUAD_DEFAULTS or {}).get("III", "3"),
+    "strQuadIV": (_LR_QUAD_DEFAULTS or {}).get("IV", "1"),
     "rackAlign": "1",
     "rackAvoid": "1",
     "rackTypes": "", "rackSplit": "不拆", "rackStringLen": "",
