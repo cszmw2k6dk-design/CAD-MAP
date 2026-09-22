@@ -1703,18 +1703,34 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 self.statusBar().showMessage("剪贴板里还没有框：先选中再按 Ctrl+C", 4000)
                 return
             self._paste_n += 1
-            step = 24 * self._paste_n
+            clip = self.clip
+            # 偏移量按"这一组框的包围盒"算：贴出来正好排在旁边，而不是原位叠着。
+            # （之前固定错开 24 像素，页面有上千像素宽时肉眼几乎看不出偏移，
+            #   看着就是一堆框挤在一起。）
+            gx1 = min(s["bbox"][0] for s in clip)
+            gy1 = min(s["bbox"][1] for s in clip)
+            gx2 = max(s["bbox"][2] for s in clip)
+            gy2 = max(s["bbox"][3] for s in clip)
+            gap = 12.0
+            dx = ((gx2 - gx1) + gap) * self._paste_n
+            dy = ((gy2 - gy1) + gap) * self._paste_n
+            W, H = float(self.pm.width), float(self.pm.height)
+            # 整组不越界：越界就把整组挪回来，组内相对位置不变（不会挤在页面边上）
+            if gx2 + dx > W:
+                dx -= (gx2 + dx - W)
+            if gy2 + dy > H:
+                dy -= (gy2 + dy - H)
+            if gx1 + dx < 0:
+                dx = -gx1
+            if gy1 + dy < 0:
+                dy = -gy1
             self.begin_change()
             self.scene.clearSelection()
             made = 0
-            for s in self.clip:
-                b = list(s["bbox"])
-                x1 = min(max(0.0, b[0] + step), max(0.0, self.pm.width - 2.0))
-                y1 = min(max(0.0, b[1] + step), max(0.0, self.pm.height - 2.0))
-                x2 = min(max(x1 + 1.0, b[2] + step), float(self.pm.width))
-                y2 = min(max(y1 + 1.0, b[3] + step), float(self.pm.height))
+            for s in clip:
+                b = s["bbox"]
                 ns = copy.deepcopy(s)
-                ns["bbox"] = [x1, y1, x2, y2]
+                ns["bbox"] = [b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy]
                 ns["ocr_index"] = None
                 self.pm.shapes.append(ns)
                 it = BoxItem(ns)
@@ -1725,7 +1741,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.end_change()
             self.on_selection()
             self.statusBar().showMessage(
-                "已粘贴 %d 个框（错开 %d 像素；再按 Ctrl+V 再贴一份）" % (made, step), 6000)
+                "已粘贴 %d 个框（整组错开 %.0f×%.0f 像素，排在旁边不重叠；"
+                "再按 Ctrl+V 再贴一份）" % (made, dx, dy), 6000)
 
         def on_undo(self):
             if not self.undo:
@@ -1844,6 +1861,22 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         print("   两页底图本来就不同: %s" % (img0 != img1))
         win.goto_page(p1)
         print("   第 %d 页那个框还在: %s" % (p1, len(win.items) == n1 + 1))
+        # 全量对比：这一页每个框的坐标，翻页往返前后必须完全一致
+        def snap_all():
+            return sorted(tuple(round(v, 1) for v in it.shape_data["bbox"])
+                          for it in win.items)
+
+        win.goto_page(p1)
+        s_before = snap_all()
+        win.goto_page(p0)
+        win.goto_page(p1)
+        s_after = snap_all()
+        print("第 %d 页全部 %d 个框逐个对比: %s"
+              % (p1, len(s_before), "完全一致" if s_before == s_after else "有变化！"))
+        if s_before != s_after:
+            for a, b in list(zip(s_before, s_after))[:8]:
+                if a != b:
+                    print("     变了: %s -> %s" % (a, b))
         return 0
     if smoke:
         if not path:
@@ -1962,6 +1995,11 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
               % (n_before, n_mid, n_after))
         print("   粘贴后选中 %d 个，新增框的 ocr_index 都是 None: %s"
               % (len(pasted), all(p.shape_data.get("ocr_index") is None for p in pasted)))
+        orig_boxes = {tuple(round(v, 1) for v in it.shape_data["bbox"])
+                      for it in win.items[:n_before]}
+        new_boxes = [tuple(round(v, 1) for v in p.shape_data["bbox"]) for p in pasted]
+        print("   粘贴的框和原框位置完全重合的个数: %d（应为 0，否则就是'挤在一起'）"
+              % sum(1 for b in new_boxes if b in orig_boxes))
         # 跨页粘贴：复制 -> 翻到下一页 -> 粘贴
         win.scene.clearSelection()
         win.items[0].setSelected(True)
