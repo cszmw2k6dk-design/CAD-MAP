@@ -1053,7 +1053,7 @@ def make_gui_classes():
     return BoxItem, Canvas, COLORS
 
 
-def run_gui(path=None, smoke=False, memtest=0.0):
+def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QAction, QImage, QKeySequence, QPixmap
     from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFormLayout,
@@ -1119,6 +1119,10 @@ def run_gui(path=None, smoke=False, memtest=0.0):
             a.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
             a.setToolTip("重做刚撤销的操作（Ctrl+Y 或 Ctrl+Shift+Z）")
             a.triggered.connect(self.on_redo)
+            tb.addAction(a)
+            a = QAction("重载本页", self)
+            a.setToolTip("把当前页恢复成上次打开/保存时的样子（画乱了的出口；可用 Ctrl+Z 撤销）")
+            a.triggered.connect(self.on_reload_page)
             tb.addAction(a)
             a = QAction("复制框", self)
             a.setToolTip("把选中的框复制到剪贴板（Ctrl+C），可以粘到别的页")
@@ -1490,7 +1494,7 @@ def run_gui(path=None, smoke=False, memtest=0.0):
             now = [(i, dict(s)) for i, s in enumerate(self.pm.shapes)]
             if now != self._pending:
                 self.undo.append((self.page, self._pending))
-                del self.undo[:-50]        # 只留最近 50 步，别无限涨
+                del self.undo[:-200]       # 只留最近 200 步，别无限涨（一步快照很小）
                 self.redo.clear()          # 有了新改动，"重做"就失效了（和常见编辑器一致）
                 self.mark_dirty()
             self._pending = None
@@ -1615,10 +1619,13 @@ def run_gui(path=None, smoke=False, memtest=0.0):
             k = ev.key()
             ctrl = bool(ev.modifiers() & Qt.KeyboardModifier.ControlModifier)
             if ctrl and k == Qt.Key.Key_C:
-                self.on_copy()
+                if not ev.isAutoRepeat():
+                    self.on_copy()
                 return
             if ctrl and k == Qt.Key.Key_V:
-                self.on_paste()
+                # 过滤键盘自动重复：不然按住 Ctrl+V 一秒钟就会贴出几十份框
+                if not ev.isAutoRepeat():
+                    self.on_paste()
                 return
             if k == Qt.Key.Key_Escape:
                 self.on_escape()
@@ -1655,6 +1662,26 @@ def run_gui(path=None, smoke=False, memtest=0.0):
             if self.canvas.mode != "select":
                 self.set_mode("select")
                 self.statusBar().showMessage("已退出画框模式", 3000)
+
+        def on_reload_page(self, quiet=False):
+            """把当前页恢复成「上次打开/保存时」的样子 —— 画乱了/粘多了的出口。"""
+            if not self.pm:
+                return
+            if not quiet and QMessageBox.question(
+                    self, "重载本页",
+                    "把第 %d 页恢复成上次打开 / 保存时的样子？\n\n"
+                    "这一页上后来画的、改的、粘的都会丢掉，别的页不受影响。"
+                    % self.page) != QMessageBox.StandardButton.Yes:
+                return
+            self.begin_change()
+            self.pm.load()
+            self.pm.dirty = True
+            self._rebuild_items()
+            self.end_change()
+            self.refresh_info()
+            self.on_selection()
+            self.statusBar().showMessage(
+                "第 %d 页已恢复（Ctrl+Z 可以撤销这次恢复）" % self.page, 6000)
 
         def on_copy(self):
             sel = [i for i in self.scene.selectedItems() if isinstance(i, BoxItem)]
@@ -1787,6 +1814,36 @@ def run_gui(path=None, smoke=False, memtest=0.0):
         print("READY dpi=%s 页=%s 框=%d 底图=%s"
               % (win.dpi, win.page, len(win.items), win._img_note), flush=True)
         time.sleep(float(memtest))
+        return 0
+    if roundtrip:
+        # 复现「一页画完 -> 翻下一页 -> 再翻回来」：看框会不会串页、底图会不会花
+        pgs = win.dbg.page_numbers()
+        p0 = pgs[0]
+        print("起始页 %d，共 %d 页，当前 %d 个框" % (p0, len(pgs), len(win.items)), flush=True)
+        win.goto_page(p0)
+        n0 = len(win.items)
+        win.add_shape("Node", [100, 100, 400, 900])
+        b0 = list(win.items[-1].shape_data["bbox"])
+        img0 = win._pixmap.copy(0, 0, 100, 100).toImage().bits().tobytes()
+        print("第 %d 页画好一个 Node，框数 %d" % (p0, len(win.items)), flush=True)
+        win.goto_offset(1)
+        p1 = win.page
+        n1 = len(win.items)
+        print("翻到第 %d 页，框数 %d" % (p1, n1), flush=True)
+        win.add_shape("Tracker", [200, 200, 600, 300])
+        img1 = win._pixmap.copy(0, 0, 100, 100).toImage().bits().tobytes()
+        print("第 %d 页画好一个 Tracker，框数 %d" % (p1, len(win.items)), flush=True)
+        win.goto_page(p0)
+        print("第 %d 页 %d -> %d 个框；第 %d 页 %d -> %d 个框"
+              % (p0, n0, len(win.items), p1, n1, len(win.items)))
+        print("   回到第 %d 页后框数 = 原来+1: %s" % (p0, len(win.items) == n0 + 1))
+        back = [x for x in win.items if x.shape_data["bbox"] == b0]
+        print("   画的框还在原位: %s" % bool(back))
+        img0b = win._pixmap.copy(0, 0, 100, 100).toImage().bits().tobytes()
+        print("   第 %d 页底图与最初一致: %s" % (p0, img0b == img0))
+        print("   两页底图本来就不同: %s" % (img0 != img1))
+        win.goto_page(p1)
+        print("   第 %d 页那个框还在: %s" % (p1, len(win.items) == n1 + 1))
         return 0
     if smoke:
         if not path:
@@ -1926,6 +1983,23 @@ def run_gui(path=None, smoke=False, memtest=0.0):
               % (n0, n_undo, n_redo, n_undo2, len(win.redo)))
         print("   期望 粘贴前/撤销后一致、重做后回到粘贴后: %s"
               % ("通过" if (n_redo == n0 and n_undo == n_page2 and n_undo2 == n_page2) else "不一致！"))
+        # 翻页往返：框的坐标和底图像素都不能变
+        win.goto_page(first)
+        it_chk = win.items[0]
+        shape_ref = it_chk.shape_data
+        box_before = list(shape_ref["bbox"])
+        pm_before = win.pm
+        pix_before = win._pixmap.copy(0, 0, 120, 120).toImage().bits().tobytes()
+        win.goto_offset(1)
+        win.goto_page(first)
+        same_model = (win.pm is pm_before)
+        in_list = any(s is shape_ref for s in win.pm.shapes)
+        box_after = list(shape_ref["bbox"])
+        pix_after = win._pixmap.copy(0, 0, 120, 120).toImage().bits().tobytes()
+        print("翻页往返：同一个页面模型 %s；框对象还在 %s" % (same_model, in_list))
+        print("   坐标 %s -> %s  %s" % (box_before, box_after,
+                                        "一致" if box_after == box_before else "变了！"))
+        print("   底图像素 %s" % ("一致" if pix_after == pix_before else "变了！"))
         return 0
     return app.exec()
 
@@ -1955,6 +2029,8 @@ def main():
     ap.add_argument("--smoke", action="store_true", help="无显示界面自检（画框/翻页/另存）")
     ap.add_argument("--memtest", action="store_true",
                     help="只载入并显示第一页，然后挂着（外部采样内存用）")
+    ap.add_argument("--roundtrip", action="store_true",
+                    help="复现「画完翻页再翻回来」，检查框和底图有没有乱")
     ap.add_argument("--hold", type=float, default=20.0, help="--memtest 挂多久（秒）")
     ap.add_argument("--out", default=None, help="自检时的输出文件")
     a = ap.parse_args()
@@ -1970,6 +2046,9 @@ def main():
     if a.memtest:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         return run_gui(a.json or DEFAULT_JSON, memtest=a.hold)
+    if a.roundtrip:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        return run_gui(a.json or DEFAULT_JSON, roundtrip=True)
     if a.json and not os.path.exists(a.json):
         print("找不到文件：%s" % a.json)
         return 2
