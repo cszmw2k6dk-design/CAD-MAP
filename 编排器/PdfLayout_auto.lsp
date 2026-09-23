@@ -480,41 +480,7 @@
 )
 
 ;;; LBD 自动识别并填写标签(非交互)
-;;; ── LBD 分表名：拿标签表(Excel)里的分表名去文字里匹配 ─────────────
-;;; 老实现只认 "INV+数字+字母+数字"（PdfLayout_LbdSheetFromText），像
-;;; "1.01-LBD-17"（Yellow Viking 那种）永远认不出来 → 一个标签都填不上。
-;;; 现在：1) 先拿 Excel 里真实存在的分表名去文字里找（取最长的，避免 "1.0" 抢 "1.01"）
-;;;       2) 还认不出 -> 用「第几页 = 第几个分表」的布局名兜底
-(defun PdfLayout_LbdSheetKey (s / i n c out)
-  ;; 只留字母数字、统一大写 —— "INV11A101_LBD_07" 和 "INV11A101-LBD-07" 等价
-  (setq out "" i 1 n (strlen s) s (strcase s))
-  (while (<= i n)
-    (setq c (substr s i 1))
-    (if (or (and (>= c "0") (<= c "9"))
-            (and (>= c "A") (<= c "Z")))
-      (setq out (strcat out c))
-    )
-    (setq i (1+ i))
-  )
-  out
-)
-
-(defun PdfLayout_LbdSheetMatch (text names / key k b2 bk best)
-  ;; names 里哪个分表名出现在 text 里；取最长的那个匹配
-  (setq key (PdfLayout_LbdSheetKey text) best nil bk "")
-  (foreach k names
-    (setq b2 (PdfLayout_LbdSheetKey k))
-    (if (and (> (strlen b2) 0)
-             (vl-string-search b2 key)
-             (> (strlen b2) (strlen bk)))
-      (progn (setq best k bk b2))
-    )
-  )
-  best
-)
-
-
-(defun PdfLayout_LbdAuto (pdf xlsx pgStart pgEnd txtH labelWhere bgColor bgGap txtColor layNames / ok autoTxt maxDim uu bbu doc actLay blk vp ptUse runOk wait nSeen hgtR txtHi pgIt pit sheetKeys statByLay)
+(defun PdfLayout_LbdAuto (pdf xlsx pgStart pgEnd txtH labelWhere bgColor bgGap txtColor / ok autoTxt maxDim uu bbu doc actLay blk vp ptUse runOk wait nSeen hgtR txtHi pgIt pit)
   (setq autoTxt (or (not txtH) (<= txtH 0.0)))
   (setq outPath (if *PdfLayout_LbdPre* *PdfLayout_LbdOut* (strcat (getvar "TEMPPREFIX") "pdflbd_extract.txt")))
   (setq progPath (strcat (getvar "TEMPPREFIX") "pdflbd_progress.txt"))
@@ -561,9 +527,6 @@
       )
       (setq sheetMap nil)
       (if (and xlsx (/= xlsx "")) (setq sheetMap (PdfLayout_ReadAllLbdLabels xlsx)))
-      ;; 标签表里真实存在的分表名（拿它们去文字里匹配）
-      (setq sheetKeys (mapcar 'car sheetMap))
-      (setq statByLay 0)
       (setq *PdfLayout_ObsAll* (PdfLayout_ObsRead outPath))
       (setq *PdfLayout_RngAll* (PdfLayout_RngRead outPath))
       (setq *PdfLayout_ObsRects* nil)
@@ -644,22 +607,10 @@
                     (progn
                       (setq mx (+ (car pmin) (* fx bw)))
                       (setq my (+ (cadr pmin) (* fy bh)))
-                      ;; 分表名：先拿标签表里的分表名去文字里匹配（"1.01-LBD-17"、
-                      ;; "INV11A101_LBD_07" 都认），认不出再用「第几页 = 第几个分表」
-                      ;; 的布局名兜底，最后才用老的 INV 规则。
-                      (setq shN (PdfLayout_LbdSheetMatch stext sheetKeys))
-                      (if (not shN)
-                        (progn
-                          (setq shN (nth (1- pgnum) layNames))
-                          (if shN (setq statByLay (1+ statByLay)))
-                        )
-                      )
-                      (if (and shN (not (assoc shN sheetMap))) (setq shN nil))
-                      (if (not shN) (setq shN (PdfLayout_LbdSheetFromText stext)))
+                      (setq shN (PdfLayout_LbdSheetFromText stext))
                       (if (not shN) (setq statNoSheet (1+ statNoSheet)))
                       (setq sheetLabels (if shN (cdr (assoc shN sheetMap)) nil))
                       (setq labels (if sheetLabels (cdr (assoc num sheetLabels)) nil))
-                      (if (not labels) (setq statNoLabel (1+ statNoLabel)))
                       ;; LBD 标签只认 Excel 映射: 查不到就不画, 不用 PDF 原文兜底, 也不编造 "LBD-xx"
                       (if labels
                         (progn
@@ -730,7 +681,7 @@
                                 " ms=" (itoa (max 0 (- (PdfLayout_NowMs) (if tPg0 tPg0 0))))))
       )
       (PdfLayout_Prog (strcat "LBD_DONE " (itoa nDone)))
-      (PdfLayout_Prog (strcat "LBD_STAT 匹配到页=" (itoa nSeen) " 分表名没认出=" (itoa statNoSheet) " 编号表里没有=" (itoa statNoLabel) " 用布局名兜底=" (itoa statByLay) " 分表数=" (itoa (length sheetMap))))
+      (PdfLayout_Prog (strcat "LBD_STAT 匹配到页=" (itoa nSeen) " 分表名没认出=" (itoa statNoSheet) " 编号表里没有=" (itoa statNoLabel) " 分表数=" (itoa (length sheetMap))))
       (princ (strcat "\n[PDFAUTO] LBD 已填写 " (itoa nDone) " 个标签。"))
       T
     )
@@ -909,7 +860,7 @@
   (setq gapc (atof (PdfLayout_ACfg cfg "labelBgGap" "1.0")))
   (setq pdf (PdfLayout_ACfg cfg "pdf" ""))
   (if (and pdf (/= pdf ""))
-    (PdfLayout_LbdAuto pdf (PdfLayout_ACfg cfg "xlsx" "") (PdfLayout_ACfg cfg "pageStart" "1") (if (> (atoi (PdfLayout_ACfg cfg "importPages" "0")) 0) (PdfLayout_ACfg cfg "importPages" "0") (PdfLayout_ACfg cfg "pageEnd" "0")) (atof (PdfLayout_ACfg cfg "textHeight" "0")) (PdfLayout_ACfg cfg "labelWhere" "M") (atoi (PdfLayout_ACfg cfg "labelBgColor" "1")) (atof (PdfLayout_ACfg cfg "labelBgGap" "1.0")) (atoi (PdfLayout_ACfg cfg "labelTextColor" "7")) names2)
+    (PdfLayout_LbdAuto pdf (PdfLayout_ACfg cfg "xlsx" "") (PdfLayout_ACfg cfg "pageStart" "1") (if (> (atoi (PdfLayout_ACfg cfg "importPages" "0")) 0) (PdfLayout_ACfg cfg "importPages" "0") (PdfLayout_ACfg cfg "pageEnd" "0")) (atof (PdfLayout_ACfg cfg "textHeight" "0")) (PdfLayout_ACfg cfg "labelWhere" "M") (atoi (PdfLayout_ACfg cfg "labelBgColor" "1")) (atof (PdfLayout_ACfg cfg "labelBgGap" "1.0")) (atoi (PdfLayout_ACfg cfg "labelTextColor" "7")))
   )
   (setq outdir (PdfLayout_ACfg cfg "outputDir" ""))
   ;; Auto save off by default: the orchestrator saves from the UI after the run.
