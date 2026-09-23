@@ -11,6 +11,8 @@
 ;; LBD 标签字高：0 = 不用 LBD 区域宽算（回到老逻辑：填固定字高 / 自动按底图尺寸）
 ;; 想重新启用"LBD 区域宽 x 倍数"就把它改成 >0（例如 1.4）
 (setq *PdfLayout_LbdRegionScale* 0.0)
+;; 画完之后要不要跑「LBD 标签避让 STR 号」这步（程序里可以设成 nil 关掉）
+(setq *PdfLayout_LbdAvoidOn* T)
 
 ;;; 进度写入(覆盖写，供外部轮询)
 (defun PdfLayout_Prog (msg / _ar)
@@ -84,66 +86,10 @@
   )
 )
 
-(defun PdfLayout_LbdAvoidStr (/ doc ms obj labs lab bb h selfE step n0 key best bestKey
-                              cand dx i0 nTot nMoved strLay)
-  (vl-load-com)
-  (setq strLay (if (and *PdfLayout_AiLayer* (/= *PdfLayout_AiLayer* "")) *PdfLayout_AiLayer* "PDF-AUTO-NUM"))
-  (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
-  (setq ms (vla-get-ModelSpace doc))
-  (setq labs nil)
-  (vlax-for obj ms
-    (if (= (strcase (vl-catch-all-apply 'vla-get-Layer (list obj))) "LBD标签")
-      (setq labs (cons obj labs))
-    )
-  )
-  (if (not labs)
-    (progn (princ "\n[LBD避让STR] 模型空间里没有 LBD 标签，跳过。") (princ))
-    (progn
-      ;; 窗口选择要在模型空间里做（当前在布局标签页时先切过去，完事再切回）
-      (setq i0 (getvar "CTAB"))
-      (if (/= (strcase i0) "MODEL") (setvar "CTAB" "Model"))
-      (setq nTot 0 nMoved 0)
-      (foreach lab labs
-        (setq bb (PdfLayout_ObjBox lab))
-        (if bb
-          (progn
-            (setq nTot (1+ nTot))
-            (setq selfE (vlax-vla-object->ename lab))
-            (setq n0 (PdfLayout_HitCount bb strLay selfE))
-            (if (> n0 0)
-              (progn
-                (setq h (vl-catch-all-apply 'vla-get-Height (list lab)))
-                (setq h (if (and (numberp h) (> h 0.0)) h 0.05))
-                (setq step (* 1.5 h))
-                (setq best nil bestKey nil)
-                (foreach dx (list 0.0 step (- 0.0 step) (* 2.0 step) (* -2.0 step))
-                  (setq cand (PdfLayout_BoxShift bb 0.0 dx))
-                  (setq key (list (PdfLayout_HitCount cand strLay selfE)
-                                  (PdfLayout_HitCount cand "LBD标签" selfE)
-                                  (abs dx)))
-                  (if (or (null bestKey) (PdfLayout_KeyLess key bestKey))
-                    (setq best dx bestKey key)
-                  )
-                )
-                (if (and best (/= best 0.0))
-                  (progn
-                    (vl-catch-all-apply 'vla-Move
-                      (list lab (vlax-3d-point 0.0 0.0 0.0) (vlax-3d-point 0.0 best 0.0)))
-                    (setq nMoved (1+ nMoved))
-                  )
-                )
-              )
-            )
-          )
-        )
-      )
-      (if (/= (strcase i0) "MODEL") (vl-catch-all-apply 'setvar (list "CTAB" i0)))
-      (princ (strcat "\n[LBD避让STR] 检查 LBD 标签 " (itoa nTot)
-                     " 个，压住 STR 号并挪开的 " (itoa nMoved) " 个。"))
-    )
-  )
-  (princ)
-)
+;;; 旧实现（ssget 交叉选择 + 切标签页）在自动跑的时候会把 CAD 卡住，
+;;; 现在直接转发到新的安全实现。
+(defun PdfLayout_LbdAvoidStr () (PdfLayout_LbdPlaceRaw))
+
 ;;; =============================================================
 ;;; LBD label final placement   (ASCII only: this file is GBK)
 ;;;  - STR numbers are the fixed part: they never move here.
@@ -182,6 +128,44 @@
 (defun PdfLayout_RectHits (r lst / n)
   (setq n 0)
   (foreach x lst (if (PdfLayout_RectOver r x) (setq n (1+ n))))
+  n
+)
+
+;;; 某图层上的文字框，一次性收下来：((ename x1 y1 x2 y2) ...)
+;;; 不用 ssget —— 那玩意在脚本 / COM 上下文里会让 CAD 卡住或等输入，
+;;; 而且每个候选位置都要选一次，几十个标签就是几百次选择。
+(defun PdfLayout_TextRects (layer / doc ms obj lay bb out on)  
+  (setq out nil)
+  (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
+  (setq ms (vla-get-ModelSpace doc))
+  (vlax-for obj ms
+    (setq on (vl-catch-all-apply 'vla-get-ObjectName (list obj)))
+    (if (and (not (vl-catch-all-error-p on))
+             (member (strcase on) '("ACDBTEXT" "ACDBMTEXT")))
+      (progn
+        (setq lay (vl-catch-all-apply 'vla-get-Layer (list obj)))
+        (if (and (not (vl-catch-all-error-p lay))
+                 (= (strcase lay) (strcase layer)))
+          (progn
+            (setq bb (PdfLayout_ObjBox obj))
+            (if bb
+              (setq out (cons (cons (vlax-vla-object->ename obj)
+                                    (PdfLayout_RectMake bb)) out))
+            )
+          )
+        )
+      )
+    )
+  )
+  out
+)
+
+(defun PdfLayout_RectHitsEx (r lst en / n)
+  ;; 和 PdfLayout_RectHits 一样，但列表是 (ename x1 y1 x2 y2)，且排除自己
+  (setq n 0)
+  (foreach x lst
+    (if (and (/= (car x) en) (PdfLayout_RectOver r (cdr x)))
+      (setq n (1+ n))))
   n
 )
 
@@ -273,8 +257,25 @@
 
 ;;; place every LBD label: only up/down, inside its region, no overlap with
 ;;; STR numbers / printed boxes / other labels, closest to the region centre
-(defun PdfLayout_LbdPlace (/ doc ms labLay strLay labs obj bb r en h step k s off rng lo hi
-                             ctr ctr0 cand oc hc obc lbc key best bestKey nTot nMoved)
+(defun PdfLayout_LbdPlace (/ _t0 _r)
+  ;; 总开关：程序里把 *PdfLayout_LbdAvoidOn* 设成 nil 就整段跳过
+  (if (eq *PdfLayout_LbdAvoidOn* nil)
+    (progn (princ "\n[LBD-PLACE] 已关闭，跳过。") (princ))
+    (progn
+      (setq _t0 (PdfLayout_NowMs))
+      (setq _r (vl-catch-all-apply 'PdfLayout_LbdPlaceRaw nil))
+      (if (vl-catch-all-error-p _r)
+        (princ (strcat "\n[LBD-PLACE] 出错：" (vl-catch-all-error-message _r)))
+        (princ (strcat "\n[LBD-PLACE] 用时 " (itoa (fix (- (PdfLayout_NowMs) _t0))) " ms"))
+      )
+    )
+  )
+  (princ)
+)
+
+(defun PdfLayout_LbdPlaceRaw (/ doc ms labLay strLay labs obj bb r en h step k s off rng lo hi
+                             ctr ctr0 cand oc hc obc lbc key best bestKey nTot nMoved
+                             strRects)
   (vl-load-com)
   (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
   (setq ms (vla-get-ModelSpace doc))
@@ -294,6 +295,7 @@
       )
     )
   )
+  (setq strRects (PdfLayout_TextRects strLay))   ;; 一次收好，后面纯数学判交
   (setq nTot (length labs) nMoved 0)
   (foreach it labs
     (setq en (car it) obj (cadr it) r (caddr it))
@@ -322,7 +324,7 @@
         (setq oc (* 0.5 (+ (cadr cand) (nth 3 cand))))
         (if (or (null lo) (and (>= oc (- lo 1e-9)) (<= oc (+ hi 1e-9))))
           (progn
-            (setq hc (PdfLayout_HitCount (PdfLayout_RectBox cand) strLay en))
+            (setq hc (PdfLayout_RectHitsEx cand strRects en))
             (setq obc (PdfLayout_RectHits cand *PdfLayout_ObsRects*))
             (setq lbc (PdfLayout_RectHits cand (PdfLayout_OtherRects labs en)))
             (setq key (list hc obc lbc (abs (- oc ctr0)) (abs off)))

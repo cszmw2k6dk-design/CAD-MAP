@@ -68,6 +68,7 @@ FIELDS = [
     ("strQuadIV", "象限 IV 右下 的 STR 顺序"),
     ("rackAlign", "STR 号自动对齐"),
     ("rackAvoid", "避开 LBD 标签(底图+CAD)"),
+    ("lbdAvoidStr", "画完让 LBD 标签避让 STR 号"),
     ("rackTypes", "支架类型"), ("rackSplit", "拆不拆"), ("rackStringLen", "单串长度(FT)"),
     ("strBgOn", "STR背景填充"), ("strBgColor", "STR背景色"), ("strBgGap", "STR遮挡间隙"),
     ("strTextColor", "STR 标签字色"),
@@ -98,6 +99,7 @@ DEFAULTS = {
     "strQuadIV": (_LR_QUAD_DEFAULTS or {}).get("IV", "1"),
     "rackAlign": "1",
     "rackAvoid": "1",
+    "lbdAvoidStr": "1",
     "rackTypes": "", "rackSplit": "不拆", "rackStringLen": "",
     "rackAuto": True, "rackSplitByType": "",
     "strBgOn": "1", "strBgColor": "2", "strTextColor": "7", "strBgGap": "1.0",
@@ -177,6 +179,7 @@ SECTIONS = [
             ("strOrder", "STR 编号顺序(8 种)"),
             ("rackAlign", "STR 号自动对齐"),
             ("rackAvoid", "避开底图 LBD 标号"),
+            ("lbdAvoidStr", "画完让 LBD 标签避让 STR 号"),
             ("strBgOn", "STR背景填充"),
             ("strBgColor", "STR背景色"),
             ("strTextColor", "STR 标签字色"),
@@ -1305,6 +1308,8 @@ def auto_worker(cfg, ini, prog, bus):
         if ai:
             # STR 号背景填充：UI 设置 -> LISP 全局变量(*PdfLayout_AiStrBgOn/Color/Gap)
             _sbg_on = "nil" if str(cfg.get("strBgOn", "1")).strip() in ("0", "", "关", "否", "off", "false", "False") else "T"
+            # 画完之后那步「LBD 标签避让 STR 号」要不要跑（卡死时可以关掉）
+            _lav_on = "nil" if str(cfg.get("lbdAvoidStr", "1")).strip() in ("0", "", "关", "否", "off", "false", "False") else "T"
             try:
                 _sbg_c = int(float(str(cfg.get("strBgColor", "1")).strip() or 1))
             except Exception:
@@ -1344,7 +1349,9 @@ def auto_worker(cfg, ini, prog, bus):
                       "(setq *PdfLayout_AiTextH* %s)\n"
                       "(setq *PdfLayout_AiStrColor* %s)\n"
                       "(setq *PdfLayout_AiLabelColor* %s)\n"
-                      % (_sbg_on, _sbg_c, _sbg_g, _rp, _scale, _auto_h, _txt_h, _stc, _ltc))
+                      "(setq *PdfLayout_LbdAvoidOn* %s)\n"
+                      % (_sbg_on, _sbg_c, _sbg_g, _rp, _scale, _auto_h, _txt_h, _stc, _ltc,
+                         _lav_on))
             cmd = ("(load %s)\n(load %s)\n(load %s)\n"
                    "%s"
                    "(setq *PdfLayout_GridAutoFile* %s)\n(setq *PdfLayout_AiPage* %s)\n"
@@ -2778,7 +2785,7 @@ class MainWindow(QMainWindow):
                     cb.currentIndexChanged.connect(lambda *_: self.on_refresh_quad_preview())
                     form.addWidget(cb, r, 1)
 
-                elif key in ("strBgOn", "rackAlign", "rackAvoid"):
+                elif key in ("strBgOn", "rackAlign", "rackAvoid", "lbdAvoidStr"):
                     cb = NoWheelCombo()
                     cb.setObjectName("Field")
                     cb.setMinimumWidth(320)
