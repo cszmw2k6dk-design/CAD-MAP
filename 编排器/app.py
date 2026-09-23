@@ -44,7 +44,7 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_lbd_boxes = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.51"
+APP_VERSION = "2.52"
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
