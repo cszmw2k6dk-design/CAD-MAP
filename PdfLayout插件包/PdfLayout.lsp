@@ -3946,7 +3946,34 @@
   )
   l
 )
-(defun PdfLayout_ReadAllLbdLabels (path / xl wbs wb shs out i sh sheet ur vals arr shCount rng hadExcel curLbd
+;;; ── 标签表行判定（给 PdfLayout_ReadAllLbdLabels 用）─────────────────
+(defun PdfLayout_HasDig (s / i n c hit)
+  (setq i 1 n (strlen s) hit nil)
+  (while (and (<= i n) (not hit))
+    (setq c (substr s i 1))
+    (if (and (>= c "0") (<= c "9")) (setq hit T))
+    (setq i (1+ i))
+  )
+  hit
+)
+
+(defun PdfLayout_LbdRowStartP (a / up)
+  ;; 这一格是不是"新的一行 LBD"：表头 "LBD NO."、标题 "Lynx\nINV31B102" 都不算。
+  ;; 认的两种：A 列写 "LBD-15"（South Platte 那种）；写 "1.C.1"（Yellow Viking 那种，
+  ;; 里面没有纯编号，所以编号改按"这个分表里的第几行"算，好让图上的号和标签表对上）。
+  (setq up (strcase (if a a "")))
+  (and (> (strlen up) 0)
+       (not (vl-string-search "\n" up))
+       (not (vl-string-search "\r" up))
+       (not (vl-string-search "NO." up))
+       (PdfLayout_HasDig up)
+       (or (vl-string-search "LBD" up)
+           (not (vl-string-search "INV" up)))
+  )
+)
+
+
+(defun PdfLayout_ReadAllLbdLabels (path / xl wbs wb shs out i sh sheet ur vals arr shCount rng hadExcel curLbd rowCnt useNum
                                    rows map lbd lab cur labels kv)
   ;; 一次读取 Excel 所有分表：返回 ((分表名 . ((LBD编号 . "标签A/标签B") ...)) ...)
   (setq out nil)
@@ -3980,21 +4007,46 @@
                     (setq vals (if (and ur (not (vl-catch-all-error-p ur)))
                                  (vl-catch-all-apply 'vlax-get-property (list ur 'Value))
                                  nil))
-                    (setq map nil curLbd nil)
+                            (setq map nil curLbd nil rowCnt 0 useNum nil)
                     (if (and vals (not (vl-catch-all-error-p vals)))
                           (progn
                             (setq arr (vlax-variant-value vals))
                             (setq rows (vlax-safearray->list arr))
                             (setq rows (mapcar '(lambda (r) (mapcar 'PdfLayout_CellStr r)) rows))
+                            ;; 先看这个分表的 A 列有没有 "LBD-15" 这种真编号：
+                            ;; 有一行是 -> 全按真编号取；一个都没有（"1.C.1" 那种）
+                            ;; -> 按"这个分表里的第几个 LBD 行"编号 1,2,3…
+                            ;; （跟标注工具的补编号用同一套键，两边才对得上）
+                            (foreach r rows
+                              (if (PdfLayout_LbdRowStartP (nth 0 r))
+                                (progn
+                                  (setq rowCnt (1+ rowCnt))
+                                  (if (PdfLayout_LbdNumFromText (nth 0 r)) (setq useNum T))
+                                )
+                              )
+                            )
+                            (setq rowCnt 0)
                             (foreach r rows
                               ;; 标签取 C 列(Item Code)；A 列为空的续行(负极)归入上一个 LBD
                               (setq lbd (nth 0 r) lab (nth 2 r))
                               (if (and lab (/= lab ""))
                                 (progn
-                                  (if (and lbd (/= lbd "") (PdfLayout_LbdNumFromText lbd))
-                                    (setq n0 (PdfLayout_LbdNumFromText lbd) curLbd n0)
-                                    (setq n0 curLbd)
-                                  )
+                                          (if (PdfLayout_LbdRowStartP lbd)
+                                            (progn
+                                              (setq rowCnt (1+ rowCnt))
+                                              (if useNum
+                                                (progn
+                                                  (if (PdfLayout_LbdNumFromText lbd)
+                                                    (setq n0 (PdfLayout_LbdNumFromText lbd))
+                                                    (setq n0 curLbd)
+                                                  )
+                                                )
+                                                (setq n0 rowCnt)
+                                              )
+                                              (setq curLbd n0)
+                                            )
+                                            (setq n0 curLbd)
+                                          )
                                   (if n0
                                     (progn
                                       (setq cur (assoc n0 map))

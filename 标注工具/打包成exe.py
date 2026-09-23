@@ -17,8 +17,12 @@ DIST = os.path.join(HERE, "dist")
 WORK = os.path.join(HERE, "build_exe")
 NAME = "LBD标注工具"
 CONSOLE = "--console" in sys.argv          # 调试用：带控制台，错误能直接看到
+ONEDIR = "--onedir" in sys.argv            # 打成文件夹（onedir）而不是单文件
 NAME = NAME + ("_debug" if CONSOLE else "")
 EXE = os.path.join(DIST, NAME + ".exe")
+APPDIR = os.path.join(DIST, NAME)
+if ONEDIR:
+    EXE = os.path.join(APPDIR, NAME + ".exe")
 SEP = os.pathsep
 PY = sys.executable
 
@@ -54,7 +58,16 @@ def build_env():
 def main():
     if not os.path.exists(APP):
         raise SystemExit("找不到 %s" % APP)
-    if os.path.exists(EXE):
+    if ONEDIR:
+        if os.path.isdir(APPDIR):
+            try:
+                if os.path.isdir(APPDIR + ".old"):
+                    shutil.rmtree(APPDIR + ".old")
+                os.replace(APPDIR, APPDIR + ".old")
+            except Exception as e:
+                log("[失败] 旧文件夹挪不动（%s）：多半是标注工具还在运行，先关掉。" % e)
+                return 1
+    elif os.path.exists(EXE):
         try:
             os.replace(EXE, EXE + ".old")
         except Exception as e:
@@ -69,11 +82,15 @@ def main():
         if os.path.exists(cand):
             icon = cand
             break
-    args = [PY, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile",
+    args = [PY, "-m", "PyInstaller", "--noconfirm", "--clean",
+            "--onedir" if ONEDIR else "--onefile",
             "--console" if CONSOLE else "--windowed",
             "--name", NAME,
             "--distpath", DIST, "--workpath", WORK, "--specpath", WORK,
             "--collect-binaries", "PySide6", "--collect-binaries", "shiboken6",
+            # 按框内文字补编号要读 PDF 文字层（pypdf 是在函数里 import 的，
+            # 显式写上，免得 PyInstaller 漏掉）
+            "--hidden-import", "pypdf",
             "--add-data", os.path.join(pl, "platforms") + SEP + "PySide6/plugins/platforms",
             "--add-data", os.path.join(pl, "styles") + SEP + "PySide6/plugins/styles",
             "--exclude-module", "PIL", "--exclude-module", "numpy",
@@ -88,14 +105,23 @@ def main():
     if p.returncode != 0 or not os.path.exists(EXE):
         log("[失败] 打包没成功（退出码 %s）" % p.returncode)
         return 1
-    old = EXE + ".old"
+    old = (APPDIR + ".old") if ONEDIR else (EXE + ".old")
     if os.path.exists(old):
         try:
-            os.remove(old)
+            if os.path.isdir(old):
+                shutil.rmtree(old)
+            else:
+                os.remove(old)
         except Exception:
             pass
-    log("打包完成：%s（%.1f MB，用时 %.0fs）"
-        % (EXE, os.path.getsize(EXE) / 1048576.0, time.time() - t0))
+    if ONEDIR:
+        total = sum(os.path.getsize(os.path.join(base, f))
+                    for base, _d, fs in os.walk(APPDIR) for f in fs)
+        log("打包完成（文件夹版）：%s（整个文件夹 %.1f MB，用时 %.0fs）"
+            % (APPDIR, total / 1048576.0, time.time() - t0))
+    else:
+        log("打包完成：%s（%.1f MB，用时 %.0fs）"
+            % (EXE, os.path.getsize(EXE) / 1048576.0, time.time() - t0))
     return 0
 
 

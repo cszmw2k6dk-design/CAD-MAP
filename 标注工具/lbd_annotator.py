@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LBD 标注工具 v0.1（内嵌标注页原型）
+"""LBD 标注工具 v0.2（内嵌标注页原型）
 
 直接读写 agent3-debug 识别结果 JSON：改框、改 LBD 名字，另存出一份完整 JSON 给下游程序用。
 
@@ -311,15 +311,48 @@ class Renderer:
 
 
 def settings_path():
-    return os.path.join(app_dir(), "annotator_settings.json")
+    """设置文件放 %LOCALAPPDATA%，不放在程序旁边。
+
+    打包成文件夹版放到桌面后，程序旁边就是桌面 —— 设置和渲染缓存写在程序目录，
+    桌面上就会冒出一堆文件和文件夹。老位置里的设置会自动搬过来。
+    """
+    return os.path.join(work_dir(), "annotator_settings.json")
+
+
+def work_dir():
+    """放设置 / 渲染缓存的地方（不动程序目录）。"""
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if base:
+        d = os.path.join(base, "LBD标注工具")
+        try:
+            os.makedirs(d, exist_ok=True)
+            return d
+        except Exception:
+            pass
+    return app_dir()
+
+
+def cache_dir():
+    return os.path.join(work_dir(), "render_cache")
 
 
 def load_settings():
+    old = os.path.join(app_dir(), "annotator_settings.json")
     try:
         with open(settings_path(), "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {}
+        pass
+    # 老版本把设置放在程序旁边：读得到就搬过来（PDF/标签表路径不用重选）
+    try:
+        if os.path.exists(old):
+            with open(old, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            save_settings(d)
+            return d
+    except Exception:
+        pass
+    return {}
 
 
 def save_settings(d):
@@ -328,6 +361,698 @@ def save_settings(d):
             json.dump(d, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+# ------------------------------------------------------- PDF 文字层：框内找 LBD 标签
+# 这一套和主程序 app.py 里的 _pdf_text_items 等价，搬到标注工具里是为了
+# "从已经框好的 LBD 区域里取标签文字"，不依赖任何识别模型。
+def _pdf_rotate(page):
+    try:
+        return int(page.get("/Rotate") or 0) % 360
+    except Exception:
+        return 0
+
+
+def _pdf_norm_pt(page, x, y):
+    """PDF 用户坐标 -> 底图（渲染图）归一化坐标 (fx, fy)，fy 从下往上。
+
+    PDF 带 /Rotate 时文字层坐标是没转过的，而底图是按转过的样子渲染的，
+    不换算整片文字会跑到错位置。
+    """
+    try:
+        cb = page.cropbox
+        x0, y0 = float(cb.left), float(cb.bottom)
+        pw = float(cb.right) - x0
+        ph = float(cb.top) - y0
+    except Exception:
+        x0, y0, pw, ph = 0.0, 0.0, 1.0, 1.0
+    pw = pw or 1.0
+    ph = ph or 1.0
+    x = float(x) - x0
+    y = float(y) - y0
+    rot = _pdf_rotate(page)
+    if rot == 90:
+        return (y / ph, (pw - x) / pw)
+    if rot == 180:
+        return ((pw - x) / pw, (ph - y) / ph)
+    if rot == 270:
+        return ((ph - y) / ph, x / pw)
+    return (x / pw, y / ph)
+
+
+def _pdf_text_items(page):
+    """一页 -> [(文字, fx中心, fy中心, fx1, fy1, fx2, fy2)]（底图归一化坐标）。"""
+    items = []
+
+    def visit_text(text, cm, tm, font, size):
+        if not text or not text.strip():
+            return
+        try:
+            m0 = cm[0] * tm[0] + cm[2] * tm[1]
+            m1 = cm[1] * tm[0] + cm[3] * tm[1]
+            m2 = cm[0] * tm[2] + cm[2] * tm[3]
+            m3 = cm[1] * tm[2] + cm[3] * tm[3]
+            m4 = cm[0] * tm[4] + cm[2] * tm[5] + cm[4]
+            m5 = cm[1] * tm[4] + cm[3] * tm[5] + cm[5]
+        except Exception:
+            m0, m1, m2, m3, m4, m5 = 1.0, 0.0, 0.0, 1.0, 0.0, 0.0
+        try:
+            cs = float(size)
+        except Exception:
+            cs = 0.0
+        w = cs * 0.5 * len(text)
+        h = cs
+        xs, ys = [], []
+        for tx, ty in ((0.0, 0.0), (w, 0.0), (0.0, h), (w, h)):
+            xs.append(m0 * tx + m2 * ty + m4)
+            ys.append(m1 * tx + m3 * ty + m5)
+        pts = [_pdf_norm_pt(page, px, py)
+               for px, py in ((min(xs), min(ys)), (max(xs), min(ys)),
+                              (min(xs), max(ys)), (max(xs), max(ys)))]
+        fx1, fx2 = min(p[0] for p in pts), max(p[0] for p in pts)
+        fy1, fy2 = min(p[1] for p in pts), max(p[1] for p in pts)
+        items.append((text.strip(), (fx1 + fx2) * 0.5, (fy1 + fy2) * 0.5,
+                      fx1, fy1, fx2, fy2))
+
+    page.extract_text(visitor_text=visit_text)
+    return items
+
+
+class PdfText:
+    """按页取 PDF 文字块（复用同一个 reader + 缓存：整册跑才不至于太慢）。"""
+
+    def __init__(self, pdf):
+        from pypdf import PdfReader
+        self.pdf = pdf
+        self.reader = PdfReader(pdf)
+        self._cache = {}
+
+    def count(self):
+        return len(self.reader.pages)
+
+    def items(self, page_number):
+        if page_number not in self._cache:
+            try:
+                self._cache[page_number] = _pdf_text_items(
+                    self.reader.pages[int(page_number) - 1])
+            except Exception:
+                self._cache[page_number] = []
+        return self._cache[page_number]
+
+
+# ------------------------------------------------------- LBD 标签表（xlsx）
+_XL_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_XL_RN = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+
+def _xlsx_sheets(path, want_cols=("A", "C")):
+    """xlsx -> 有序的 [(分表名, {行号: {列: 文字}})]。不用 Excel，直接解 zip。"""
+    import zipfile
+    import xml.etree.ElementTree as ET
+    out = []
+    with zipfile.ZipFile(path) as z:
+        have = set(z.namelist())
+
+        def _read(name):
+            return z.read(name) if name in have else None
+
+        wb = ET.fromstring(_read("xl/workbook.xml"))
+        rels = ET.fromstring(_read("xl/_rels/workbook.xml.rels"))
+        rid2t = {r.get("Id"): r.get("Target") for r in rels}
+        shared = []
+        sst = _read("xl/sharedStrings.xml")
+        if sst is not None:
+            for si in ET.fromstring(sst):
+                shared.append("".join(t.text or "" for t in si.iter(_XL_NS + "t")))
+        for el in wb.iter():
+            if not el.tag.endswith("}sheet"):
+                continue
+            sheet = (el.get("name") or "").strip()
+            tgt = (rid2t.get(el.get(_XL_RN + "id")) or "").lstrip("/")
+            if not sheet or not tgt:
+                continue
+            if not tgt.startswith("xl/"):
+                tgt = "xl/" + tgt
+            data = _read(tgt)
+            if data is None:
+                continue
+            cells = {}
+            for row in ET.fromstring(data).iter(_XL_NS + "row"):
+                rn = int(row.get("r") or 0)
+                for c in row:
+                    if c.tag != _XL_NS + "c":
+                        continue
+                    ref = c.get("r") or ""
+                    m = re.match(r"[A-Z]+", ref)
+                    col = m.group(0) if m else ""
+                    if col not in want_cols:
+                        continue
+                    typ = c.get("t")
+                    v = c.find(_XL_NS + "v")
+                    val = ""
+                    if typ == "s" and v is not None:
+                        try:
+                            val = shared[int(v.text)]
+                        except Exception:
+                            val = ""
+                    elif typ == "inlineStr":
+                        ins = c.find(_XL_NS + "is")
+                        val = ("".join(x.text or "" for x in ins.iter(_XL_NS + "t"))
+                               if ins is not None else "")
+                    else:
+                        val = v.text if v is not None else ""
+                    cells.setdefault(rn, {})[col] = (val or "").strip()
+            out.append((sheet, cells))
+    return out
+
+
+def xlsx_sheet_names(path):
+    """标签表的分表名（按表顺序）。"""
+    try:
+        return [nm for nm, _c in _xlsx_sheets(path)]
+    except Exception:
+        return []
+
+
+def xlsx_lbd_rows(path, sheet_name):
+    """一个分表的 LBD 行（按表里的行顺序）-> [(编号, 名称串)]。
+
+    编号规则和 CAD 插件对齐：A 列写了 "LBD-15" 就用 15；A 列没有纯编号
+    （比如 Yellow Viking 的 "1.C.1"）就按"这个分表里第几个 LBD 行"算 1,2,3…
+    —— 两边同一套键，标签才对得上。
+    """
+    cells_all = None
+    for name, cells in _xlsx_sheets(path):
+        if name.strip().upper() == str(sheet_name).strip().upper():
+            cells_all = cells
+            break
+    if not cells_all:
+        return []
+    order = sorted(cells_all)
+    # 表头（C 列 "Item Code" / A 列 "LBD NO."）之后才开始算 LBD 行，
+    # 不然 "Lynx Plus 1.01" 这种标题行会被当成第一行
+    start = 0
+    for k, rn in enumerate(order):
+        a = cells_all[rn].get("A", "")
+        c = cells_all[rn].get("C", "")
+        if re.search(r"item\s*code", c, re.I) or re.match(r"^LBD\s*NO", a, re.I):
+            start = k + 1
+            break
+    rows = []
+    for rn in order[start:]:
+        a = cells_all[rn].get("A", "")
+        c = cells_all[rn].get("C", "")
+        if a:
+            rows.append([a, []])
+        if c and rows:
+            rows[-1][1].append(c)
+    numbered = [_lbd_num_in(a) for a, _l in rows]
+    # 只要有一行 A 列写了 "LBD-15" 这种真编号，就按真编号走（South Platte）；
+    # 否则按"这个分表里的第几行"编号（Yellow Viking 的 "1.C.1" 这种）
+    use_num = any(n is not None for n in numbered)
+    out = []
+    k = 0
+    for (a, labels), n in zip(rows, numbered):
+        if not labels:
+            continue
+        k += 1
+        num = n if (use_num and n is not None) else k
+        out.append((num, "/".join(labels)))
+    return out
+
+
+# ------------------------------------------------------- 框内取标签 / 编号
+LBD_NUM_RE = re.compile(r"LBD\s*[_\-–—]?\s*0*(\d+)", re.I)
+# 有些图里框内只印一个裸编号（"07" / "#7"），文字层里并没有 "LBD" 三个字母。
+# 只认"整条就是数字"的，别把 3.5、1:100 这种尺寸/比例当编号。
+BARE_NUM_RE = re.compile(r"^#?\s*0*(\d{1,3})\.?$")
+# 兜底：框里任何文字里的第一个数字（"1.C.1"、"LBD-07"、"07" 都行）
+ANY_NUM_RE = re.compile(r"(\d{1,3})")
+INV_RE = re.compile(r"INV\s*0*(\d+)\s*([A-Za-z])\s*0*(\d+)", re.I)
+SHEET_CLEAN_RE = re.compile(r"[^0-9A-Za-z.]")
+
+
+def _clean_key(s):
+    return SHEET_CLEAN_RE.sub("", str(s or "")).upper()
+
+
+def _lbd_num_in(text):
+    m = LBD_NUM_RE.search(str(text or ""))
+    return int(m.group(1)) if m else None
+
+
+def _inv_in(text):
+    """文字里自带的 INV 分表名（如 INV31B102_LBD_07 -> INV31B102），没有返回 None。"""
+    m = INV_RE.search(str(text or ""))
+    if not m:
+        return None
+    return ("INV%s%s%s" % (m.group(1), m.group(2).upper(), m.group(3))).upper()
+
+
+def norm_sheet(s):
+    """分表名归一化：INV31B102 / inv31b102 / INV31B102_LBD_07 都能对上。"""
+    return _clean_key(s)
+
+
+def sheet_in_text(text, sheet_names):
+    """文字里命中的分表名（取最长的那个，避免 "1.0" 抢 "1.01"）。"""
+    key = _clean_key(text)
+    if not key:
+        return None
+    best = None
+    for nm in sheet_names:
+        k = _clean_key(nm)
+        if k and k in key and (best is None or len(k) > len(_clean_key(best))):
+            best = nm
+    return best
+
+
+def page_sheet_by_text(text_items, sheet_names):
+    """页面文字里出现次数最多的分表名 + 次数（用来校验"按顺序"推断的对不对）。"""
+    counts = {}
+    for it in text_items:
+        nm = sheet_in_text(it[0], sheet_names)
+        if nm:
+            counts[nm] = counts.get(nm, 0) + 1
+    if not counts:
+        return None, 0
+    nm = max(counts, key=lambda k: counts[k])
+    return nm, counts[nm]
+
+
+def _box_dist(b, x, y):
+    dx = max(b[0] - x, 0.0, x - b[2])
+    dy = max(b[1] - y, 0.0, y - b[3])
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _box_center(b):
+    return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+
+
+def _flag_suspicious(shapes):
+    """同一行里相邻两个框的号不连续（比如 3、7）-> 标 _check，返回清单。
+
+    自动补号最常见的错法就是"这一排的号跳了"，拿它当"位置可能错"的提示。
+    返回 [(名字, x, y), ...]，坐标是底图像素（人照着这个去图上找）。
+    """
+    nodes = []
+    for s in shapes:
+        if s.get("label") != "Node":
+            continue
+        n = _lbd_num_in(s.get("name") or "")
+        if n is None:
+            continue
+        cx, cy = _box_center(s["bbox"])
+        nodes.append((cy, cx, n, s))
+    if len(nodes) < 2:
+        return []
+    rows = _rows_of(nodes, _row_tol(shapes))
+    out = []
+    for row in rows:
+        for k in range(len(row) - 1):
+            if abs(row[k][2] - row[k + 1][2]) != 1:
+                for it in (row[k], row[k + 1]):
+                    if not it[3].get("_check"):
+                        it[3]["_check"] = True
+                        out.append((it[3].get("name"), round(it[1]), round(it[0])))
+    return out
+
+
+def _row_tol(shapes):
+    """分行容差：按 Node 框高度的中位数取 60%（条带框长、中心点浮动大，容差得放宽）。"""
+    hs = sorted(abs(s["bbox"][3] - s["bbox"][1])
+                for s in shapes if s.get("label") == "Node")
+    med = hs[len(hs) // 2] if hs else 1.0
+    return max(2.0, med * 0.6)
+
+
+def _rows_of(items, tol):
+    """[(y中点, x中点, ...)] -> 按 y 分成一排排（行内从左到右排好）。
+
+    注意不能直接按 (y, x) 排序：同一条带排里的框高度不一样，y 中点能差好几百像素，
+    直接排会把同一排的号打乱（补号顺序就错了）。
+    """
+    ps = sorted(items, key=lambda t: t[0])
+    rows, cur = [], []
+    for it in ps:
+        if not cur or abs(it[0] - cur[-1][0]) <= tol:
+            cur.append(it)
+        else:
+            rows.append(cur)
+            cur = [it]
+    if cur:
+        rows.append(cur)
+    for r in rows:
+        r.sort(key=lambda t: t[1])
+    return rows
+
+
+def drawing_pages(dbg):
+    """「有框的页」按页码升序 —— 和主程序 debug_page_map 同一套规则。
+
+    分表顺序按这个列表排（不是 PDF 页码）：第 1 张图纸对标签表第 1 个分表。
+    封面/说明页、以及"整本都写了空记录"的空页都不算，否则一律错位一格。
+    """
+    got = set()
+    for key in SECTION_ORDER:
+        for el in dbg._elements(key):
+            try:
+                data = dbg.page_data(key, el["page"])
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                if data.get("detections"):
+                    got.add(el["page"])
+            elif isinstance(data, list) and data:
+                got.add(el["page"])
+    return sorted(got)
+
+
+def _page_candidates(text_items, sheet, num_set, width, height):
+    """这一页可用的编号文字 -> (强候选, 裸数字候选, 分表名对不上的条数)。
+
+    强候选：文字里有 LBD+数字（如 INV31B102_LBD_07），且号码在本分表号码表里，
+            再把"图例/引线名单"（同列密排）滤掉。
+    裸数字候选：整条文字就是个号（"07"），有些图框里只印这个，没有 "LBD" 字样 —
+            这条通道以前没有，所以"每个框里都有号、有的却取不到"。
+    """
+    raw, bare, wrong = [], [], 0
+    for it in text_items:
+        num = _lbd_num_in(it[0])
+        inv = _inv_in(it[0])
+        if inv and _clean_key(sheet) and _clean_key(inv) != _clean_key(sheet):
+            wrong += 1
+            continue
+        px = it[1] * width
+        py = (1.0 - it[2]) * height
+        if num is not None:
+            if sheet and num_set and num not in num_set:
+                continue
+            raw.append((px, py, num, it[0]))
+        else:
+            m = BARE_NUM_RE.match(it[0].strip())
+            if m:
+                bare.append((px, py, int(m.group(1)), it[0]))
+    return _drop_legend(raw, height), bare, wrong
+
+
+def _box_texts(shapes, text_items, width, height, tol_ratio=0.006):
+    """框里 / 框边上找到的**所有文字**（先全拿出来，谁是什么号后面再判断）。
+
+    返回 {框下标: [(距离, 文字)]}；每条文字只归给离它最近的那个框。
+    """
+    nodes = [(i, s) for i, s in enumerate(shapes) if s.get("label") == "Node"]
+    tol = max(6.0, float(tol_ratio) * max(width, height))
+    out = {}
+    for it in text_items:
+        txt = (it[0] or "").strip()
+        if not txt:
+            continue
+        px, py = it[1] * width, (1.0 - it[2]) * height
+        best, bd = None, None
+        for i, s in nodes:
+            d = _box_dist(s["bbox"], px, py)
+            if bd is None or d < bd:
+                best, bd = i, d
+        if best is not None and bd is not None and bd <= tol:
+            out.setdefault(best, []).append((round(bd), txt))
+    for k in out:
+        out[k].sort()
+    return out
+
+
+def _drop_legend(cands, page_h):
+    """滤掉"引线名单/图例"：同一列上密集挤着 ≥3 条编号的那种。
+
+    图纸上每个区域自己的号是孤零零一条；名单是十几条一列排下来 —— 靠这个区分。
+    """
+    if len(cands) < 4:
+        return list(cands)
+    gx = max(4.0, page_h * 0.004)
+    gy = max(8.0, page_h * 0.02)
+    out = []
+    for i, (px, py, num, txt) in enumerate(cands):
+        n = 0
+        for j, (qx, qy, _n, _t) in enumerate(cands):
+            if i != j and abs(qx - px) <= gx and abs(qy - py) <= gy:
+                n += 1
+        if n < 3:
+            out.append((px, py, num, txt))
+    return out
+
+
+def check_rows(shapes, text_items, sheet, num_set, width, height):
+    """核对表：每个 Node 框一行 —— 现有名字 + 框内找到的候选 + 按现在规则重算的建议。
+
+    返回 (rows, dry_stat)。rows 里每个 dict：
+      ix 框序号 / cx,cy 框中心（底图像素）/ now 现有名字 / sug 建议名字
+      cand 框内候选（"号@距离"）/ src 建议来源（框内 / 推 / 缺）
+    """
+    cands, bare, _wrong = _page_candidates(text_items, sheet, num_set, width, height)
+    alltext = _box_texts(shapes, text_items, width, height)
+    tol = max(6.0, 0.006 * max(width, height))
+    nodes = [(i, s) for i, s in enumerate(shapes) if s.get("label") == "Node"]
+    got = {}
+    for px, py, num, txt in cands:
+        best, bd = None, None
+        for i, s in nodes:
+            d = _box_dist(s["bbox"], px, py)
+            if bd is None or d < bd:
+                best, bd = i, d
+        if best is not None and bd is not None and bd <= tol:
+            got.setdefault(best, []).append((bd, num, txt))
+    # 只印裸编号的（文字层里没有 "LBD" 字样）也一起列出来，标个 (裸)
+    for px, py, val, txt in bare:
+        best, bd = None, None
+        for i, s in nodes:
+            d = _box_dist(s["bbox"], px, py)
+            if bd is None or d < bd:
+                best, bd = i, d
+        if best is not None and bd is not None and bd <= tol:
+            got.setdefault(best, []).append((bd, val, txt + "(裸)"))
+    tmp = [dict(s) for s in shapes]
+    for s in tmp:
+        s.pop("_auto", None)
+        s.pop("_miss", None)
+        s.pop("_check", None)
+        if s.get("label") == "Node":
+            s["name"] = ""
+    dry = autofill_shapes(tmp, text_items, sheet, num_set, width, height)
+    rows = []
+    for i, s in nodes:
+        cx, cy = _box_center(s["bbox"])
+        cand = sorted(got.get(i) or [])[:3]
+        raw = []
+        for d, txt in (alltext.get(i) or [])[:6]:
+            mark = ""
+            # 标 × 的：这条文字被过滤掉了（号不在本分表号码表里 / 结尾像是被截断）
+            mm = ANY_NUM_RE.search(re.sub(r"INV\s*\d+\s*[A-Za-z]\s*\d+", " ", txt, flags=re.I))
+            if (txt.rstrip().endswith(("-", "_", ".", "(", "#"))
+                    or (mm and sheet and num_set and int(mm.group(1)) not in num_set)):
+                mark = "×"
+            raw.append((d, txt + mark))
+        t = tmp[i]
+        src = ("框内" if raw else ("推" if t.get("_auto") else
+                                    ("缺" if t.get("_miss") else "已有")))
+        rows.append({"ix": i, "cx": round(cx), "cy": round(cy),
+                     "now": s.get("name") or "", "sug": t.get("name") or "",
+                     "src": src,
+                     "cand": " | ".join("%s@%d" % (txt, d) for d, txt in raw)
+                             or " / ".join("%02d@%d" % (n, round(d)) for d, n, _t in cand)})
+    return rows, dry
+
+
+def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
+                    tol_ratio=0.006):
+    """给一页的 Node 框补 LBD 名字。返回统计 dict。
+
+    shapes: 这一页的框（就地改 name / _auto / _miss 标记，只动 label == "Node"）
+    text_items: [(文字, fx中心, fy中心, fx1, fy1, fx2, fy2)]（底图归一化坐标）
+    sheet: 本页分表名（来自标签表）
+    num_set: 这个分表可用的 LBD 编号集合（用来滤掉框里的干扰文字）
+    规则：
+      1) 每条文字只归给离它最近的那个框（不是一个框把周围文字全拿走）
+      2) 文字里的编号必须在这个分表的号码表里
+      3) 文字自带 INV 分表名、且和本页分表不一致 -> 当干扰丢掉
+      4) 框里没有可用文字的，按标签表的号（还没被用掉的）按位置顺序补，标黄
+      5) 连标签表的号都没有了 -> 标红，等人手填
+    """
+    nodes = [(i, s) for i, s in enumerate(shapes) if s.get("label") == "Node"]
+    tol = max(6.0, float(tol_ratio) * max(width, height))
+    stat = {"total": len(nodes), "filled": 0, "auto": 0, "missed": 0,
+            "wrong_sheet": 0, "kept": 0}
+    if not nodes:
+        return stat
+
+    # 已经有人写过的名字：不动（免得把手工改的冲掉）
+    todo = []
+    for i, s in nodes:
+        if (s.get("name") or "").strip() and not s.get("_auto"):
+            stat["kept"] += 1
+            s["_miss"] = False
+        else:
+            s["name"] = ""
+            s["_miss"] = False
+            s["_check"] = False
+            todo.append((i, s))
+    if not todo:
+        return stat
+
+    # 1) 候选文字：编号 + 分表名过滤 + 去掉图例/引线名单
+    cands, bare, n_wrong = _page_candidates(text_items, sheet, num_set, width, height)
+    stat["wrong_sheet"] = n_wrong
+
+    # 2) 归属：① 文字中心落在哪个框里，就归那个框（谁的框谁拿字）
+    #          ② 落在框外的，才按"最近 + 那个框还没拿到字"分给别人
+    #    （老写法是"每条文字只给最近的框"，两个框抢同一条字时多的那条直接被丢掉，
+    #      结果本该拿到它的框就空了 —— 表现就是"4 个框只读到 2 个"。）
+    got = {}
+    left_c = []
+    for px, py, num, _txt in cands:
+        inside = None
+        for i, s in todo:
+            b = s["bbox"]
+            if b[0] <= px <= b[2] and b[1] <= py <= b[3]:
+                inside = i
+                break
+        if inside is None:
+            left_c.append((px, py, num))
+            continue
+        old = got.get(inside)
+        if old is None or 0.0 < old[0]:
+            got[inside] = (0.0, num)
+    for px, py, num in left_c:
+        best, bd = None, None
+        for i, s in todo:
+            if i in got:                 # 已经有字了，别再抢
+                continue
+            d = _box_dist(s["bbox"], px, py)
+            if bd is None or d < bd:
+                best, bd = i, d
+        if best is None or bd is None or bd > tol:
+            continue
+        got[best] = (bd, num)
+
+    # 3) 抢号：同一个号只留最近的那个框
+    keep = {}
+    for i, (d, num) in sorted(got.items(), key=lambda kv: kv[1][0]):
+        if num in keep:
+            continue
+        keep[i] = num
+
+    used = set(keep.values())
+    for i, s in todo:
+        if i in keep:
+            s["name"] = "%s-LBD-%02d" % (sheet, keep[i]) if sheet else "LBD-%02d" % keep[i]
+            s["_auto"] = False
+            stat["filled"] += 1
+
+    # 3b) 框里只印裸编号的（文字层里没有 "LBD" 字样）：按"离框最近 + 号在号码表里优先"补。
+    #     这正是"每个框里都有号、有的却取不到"那批 —— 以前只认带 LBD 字样的文字。
+    if bare and len(keep) < len(todo):
+        left = [t for t in todo if t[0] not in keep]
+        bare_got = {}
+        for px, py, val, txt in bare:
+            best, bd = None, None
+            for i, s in left:
+                d = _box_dist(s["bbox"], px, py)
+                if bd is None or d < bd:
+                    best, bd = i, d
+            if best is None or bd is None or bd > tol or best in bare_got:
+                continue
+            if val in used and any(v == val for _d, v, _t in [bare_got.get(best) or (0, -1, "")]):
+                continue
+            bare_got[best] = (bd, val, txt)
+        # 同一号码只留一个框
+        seen_num = set()
+        for i in sorted(bare_got, key=lambda k: bare_got[k][0]):
+            _d, val, _t = bare_got[i]
+            if val in seen_num or val in used:
+                continue
+            # 号码不在这个分表号码表里 -> 当"文字不全/被截断"过滤掉，不填
+            if sheet and num_set and val not in num_set:
+                stat["dropped"] = stat.get("dropped", 0) + 1
+                continue
+            seen_num.add(val)
+            s = dict(todo)[i]
+            s["name"] = "%s-LBD-%02d" % (sheet, val) if sheet else "LBD-%02d" % val
+            s["_auto"] = False
+            s["_check"] = False
+            keep[i] = val
+            used.add(val)
+            stat["bare"] = stat.get("bare", 0) + 1
+            stat["filled"] += 1
+
+    # 3c) 最后兜底：框里的文字先全拿出来，只要里面带数字就试一把
+    #     （"1.C.1"、"LBD-07"、"07" 都行；号码不在本分表表里的标紫，让人核）
+    if len(keep) < len(todo):
+        bt = _box_texts(shapes, text_items, width, height, tol_ratio)
+        left = [t for t in todo if t[0] not in keep]
+        picks = {}
+        for i, _s in left:
+            for d, txt in (bt.get(i) or []):
+                # ★ 先把分表名（INV31B101 这种）从文字里剔掉再找数字，
+                #   不然"任意数字"会抓到分表名里的 31，填出 INV31B101-LBD-31 这种鬼东西
+                if txt.rstrip().endswith(("-", "_", ".", "(", "#", "|")):
+                    continue           # 结尾是分隔符 -> 文字被截断了，不拿它猜号
+                t2 = re.sub(r"INV\s*\d+\s*[A-Za-z]\s*\d+", " ", txt, flags=re.I)
+                m = ANY_NUM_RE.search(t2)
+                if not m:
+                    continue
+                val = int(m.group(1))
+                in_set = (not sheet or not num_set or val in num_set)
+                picks.setdefault(i, []).append((0 if in_set else 1, d, val, txt))
+        for i, lst in picks.items():
+            if i in keep:
+                continue
+            lst.sort()
+            pref = [t for t in lst if t[0] == 0]
+            if not pref:
+                # 框里那些字里的数字都不在本分表号码表里（多半是被拆开/截断的文字）
+                # -> 过滤掉，不猜号
+                stat["dropped"] = stat.get("dropped", 0) + 1
+                continue
+            flag, _d, val, _txt = pref[0]
+            if val in used:
+                continue
+            s = dict(todo)[i]
+            s["name"] = "%s-LBD-%02d" % (sheet, val) if sheet else "LBD-%02d" % val
+            s["_auto"] = False
+            s["_check"] = False
+            keep[i] = val
+            used.add(val)
+            stat["any"] = stat.get("any", 0) + 1
+            stat["filled"] += 1
+
+    # 4) 框里没取到号的：按标签表的号顺序补（标黄，提示人工核）
+    rest = [t for t in todo if t[0] not in keep]
+    if rest and sheet and num_set:
+        free = [n for n in sorted(num_set) if n not in used]
+        # 位置顺序 = 一排排（先分行，行内从左到右）——和图纸上读的顺序一致
+        pairs = [(round(_box_center(s["bbox"])[1], 3), round(_box_center(s["bbox"])[0], 3), i, s)
+                 for i, s in rest]
+        k = 0
+        for row in _rows_of(pairs, _row_tol(shapes)):
+            for _cy, _cx, i, s in row:
+                if k >= len(free):
+                    break
+                s["name"] = "%s-LBD-%02d" % (sheet, free[k])
+                s["_auto"] = True
+                stat["auto"] += 1
+                k += 1
+    for i, s in rest:
+        if not (s.get("name") or "").strip():
+            s["_miss"] = True
+            stat["missed"] += 1
+    # 5) 位置可疑：同一行里号码跳号 -> 标紫（紫 = 从框内取到号了，但和同排的号对不上，
+    #    也可能是框画错/取到了隔壁）；黄 = 按标签表顺序推的，同样要人核一眼。
+    stat["sus"] = _flag_suspicious(shapes)
+    stat["auto_list"] = [(s.get("name") or "") for _i, s in todo if s.get("_auto")]
+    stat["sus_list"] = [(s.get("name") or "", round(_box_center(s["bbox"])[0]),
+                         round(_box_center(s["bbox"])[1]))
+                        for _i, s in todo if s.get("_check")]
+    return stat
 
 
 # ------------------------------------------------------- 字节级 JSON 定位
@@ -826,6 +1551,15 @@ def make_gui_classes():
                       Qt.CursorShape.SizeFDiagCursor]
 
     class BoxItem(QGraphicsRectItem):
+        # 名字字号（屏幕像素）：工具栏可调，默认小号不挡图
+        name_px = 11.0
+        # True = 只给"选中的那个框"画名字（默认，图上不会一堆名字压在一起）
+        name_sel_only = True
+        # 自动补的号（标黄）/ 没取到号（标红）用的颜色
+        AUTO_COLOR = QColor(230, 150, 0)
+        MISS_COLOR = QColor(255, 40, 40)
+        CHECK_COLOR = QColor(150, 60, 220)
+
         def __init__(self, shape):
             super().__init__(0, 0, shape["bbox"][2] - shape["bbox"][0],
                              shape["bbox"][3] - shape["bbox"][1])
@@ -837,7 +1571,14 @@ def make_gui_classes():
             self.apply_pen()
 
         def apply_pen(self):
-            c = COLORS.get(self.shape_data["label"], QColor(255, 0, 255))
+            if self.shape_data.get("_miss"):
+                c = self.MISS_COLOR
+            elif self.shape_data.get("_check"):
+                c = self.CHECK_COLOR
+            elif self.shape_data.get("_auto"):
+                c = self.AUTO_COLOR
+            else:
+                c = COLORS.get(self.shape_data["label"], QColor(255, 0, 255))
             pen = QPen(c)
             pen.setCosmetic(True)
             pen.setWidthF(2.0)
@@ -864,13 +1605,8 @@ def make_gui_classes():
             super().paint(painter, option, widget)
             sc = self.view_scale()
             name = self.shape_data.get("name") or ""
-            if name and sc > 0.06:
-                f = QFont()
-                f.setPixelSize(46)
-                f.setBold(True)
-                painter.setFont(f)
-                painter.setPen(QPen(QColor(0, 150, 0)))
-                painter.drawText(QPointF(4, -8), name)
+            if name and sc > 0.02 and (not BoxItem.name_sel_only or self.isSelected()):
+                self._paint_name(painter, name, sc)
             if self.isSelected():
                 h = 9.0 / max(sc, 1e-6)
                 r = self.rect()
@@ -884,6 +1620,51 @@ def make_gui_classes():
                 painter.setPen(pen)
                 for x, y in pts:
                     painter.drawRect(QRectF(x - h / 2, y - h / 2, h, h))
+
+        def _paint_name(self, painter, name, sc):
+            """把 LBD 名字画在框里：屏幕上恒定小字号、永远不出自己的框，所以不会互相压。
+
+            横放和竖放哪个能排得下就选哪个（图上那种细长条带框会走竖排）。
+            """
+            if BoxItem.name_px <= 0:
+                return
+            r = self.rect()
+            w, h = max(r.width(), 1.0), max(r.height(), 1.0)
+            need = max(1, len(name)) * 0.58
+            # 字号上限：屏幕上恒定 name_px；再夹住"文字厚度"，保证永远不出自己的框
+            base = min(BoxItem.name_px / sc, max(0.0, (min(w, h) - 2.0) / 1.4))
+            if base <= 0:
+                return
+            horiz = min(base, (w - 2.0) / need)
+            vert = min(base, (h - 2.0) / need)
+            size = max(horiz, vert)
+            if size * sc < 4.0:            # 屏幕上太小了，干脆不画
+                return
+            f = QFont()
+            f.setBold(True)
+            f.setPixelSize(max(1, int(size)))
+            col = (self.MISS_COLOR if self.shape_data.get("_miss")
+                   else (self.CHECK_COLOR if self.shape_data.get("_check")
+                         else (self.AUTO_COLOR if self.shape_data.get("_auto")
+                               else QColor(0, 140, 0))))
+            painter.save()
+            painter.setFont(f)
+            if horiz >= vert:
+                box = QRectF(r.left() + 1.0, r.top() + 1.0, w - 2.0, size * 1.35)
+                painter.fillRect(box, QColor(255, 255, 255, 200))
+                painter.setPen(QPen(col))
+                painter.drawText(box, Qt.AlignmentFlag.AlignLeft
+                                 | Qt.AlignmentFlag.AlignTop, name)
+            else:
+                # 竖排：从框的左下角往上排（和图纸上那些转 90° 的标注一样）
+                box = QRectF(0.0, 0.0, h - 2.0, size * 1.4)
+                painter.translate(r.left() + 1.0, r.bottom() - 1.0)
+                painter.rotate(-90.0)
+                painter.fillRect(box, QColor(255, 255, 255, 200))
+                painter.setPen(QPen(col))
+                painter.drawText(box, Qt.AlignmentFlag.AlignLeft
+                                 | Qt.AlignmentFlag.AlignTop, name)
+            painter.restore()
 
     class Canvas(QGraphicsView):
         def __init__(self, win):
@@ -993,6 +1774,9 @@ def make_gui_classes():
                     self.viewport().setCursor(HANDLE_CURSORS[i] if i is not None
                                               else Qt.CursorShape.ArrowCursor)
             super().mouseMoveEvent(ev)
+            # 拖动框的时候实时同步坐标（Qt 不会给 itemChange 派发"位置变了"）
+            if self.mode == "select" and not self._pan and self._resize is None:
+                self.win.sync_shapes()
 
         def mouseReleaseEvent(self, ev):
             if ev.button() == Qt.MouseButton.MiddleButton:
@@ -1016,6 +1800,10 @@ def make_gui_classes():
                 self.win.on_selection()
                 return
             super().mouseReleaseEvent(ev)
+            # ★ 必须自己同步：这个 PySide6 版本的 QGraphicsItem::itemChange 收不到
+            #   ItemPositionHasChanged，靠它同步的话"拖动框"永远不会写回数据，
+            #   保存出来还是老坐标（用户反馈的"移动支架位置保存不生效"就是这个）。
+            self.win.sync_shapes()
             self.win.end_change()
 
         @staticmethod
@@ -1068,7 +1856,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
     class Win(QMainWindow):
         def __init__(self, src=None):
             super().__init__()
-            self.setWindowTitle("LBD 标注工具 v0.1")
+            self.setWindowTitle("LBD 标注工具 v0.2")
             self.resize(1500, 950)
             self.dbg = None
             self.page = None
@@ -1084,10 +1872,21 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.settings = load_settings()
             self.pdf = self.settings.get("pdf") or ""
             self.dpi = int(self.settings.get("dpi") or 0)
+            self.xlsx = self.settings.get("xlsx") or ""
+            self._sheet_cache = None
             self.poppler = find_pdftoppm()
             self.renderer = Renderer(self.poppler,
-                                     os.path.join(app_dir(), "render_cache"))
+                                     cache_dir())
             self._img_note = ""
+            # 窗口：给个合理的最小尺寸（不然侧栏会被挤没），大小记住上次的
+            self.setMinimumSize(1180, 740)
+            try:
+                w = int(self.settings.get("win_w") or 0)
+                h = int(self.settings.get("win_h") or 0)
+                if w > 600 and h > 400:
+                    self.resize(w, h)
+            except Exception:
+                pass
 
             self.scene = self._make_scene()
             self.canvas = Canvas(self)
@@ -1149,6 +1948,49 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             tb.addAction(a)
 
             tb.addSeparator()
+            a = QAction("选标签表…", self)
+            a.setToolTip("选 LBD 标签表(xlsx)：分表名、LBD 编号、要填的名字都从这张表来")
+            a.triggered.connect(self.on_pick_xlsx)
+            tb.addAction(a)
+            a = QAction("补全编号(本页)", self)
+            a.setToolTip("从框内文字取 LBD 编号补名字（只跑当前页）")
+            a.triggered.connect(lambda: self.on_autofill(False))
+            tb.addAction(a)
+            a = QAction("补全编号(整册)", self)
+            a.setToolTip("整册逐页补：框内文字取号；取不到的按标签表顺序补（标黄）；"
+                         "再取不到标红等人手填")
+            a.triggered.connect(lambda: self.on_autofill(True))
+            tb.addAction(a)
+            from PySide6.QtWidgets import QCheckBox
+            self.chk_force = QCheckBox("重算(覆盖已有名字)")
+            self.chk_force.setToolTip(
+                "勾上：已经有名字的框也重算一遍（识别给的名字不对时用这个）")
+            self.chk_force.setChecked(bool(self.settings.get("force")))
+            tb.addWidget(self.chk_force)
+            a = QAction("导出核对表…", self)
+            a.setToolTip("每个框一行：现有名字 / 框内找到的候选 / 建议名字 —— 导出 CSV 在 Excel 里核")
+            a.triggered.connect(self.on_export_check)
+            tb.addAction(a)
+            tb.addWidget(QLabel("  名字 "))
+            self.cmb_name = QComboBox()
+            # (显示方式, 字号, 只画选中的那个)
+            for text, px, selonly in (("不显示", 0, True),
+                                      ("只看选中的", 11, True),
+                                      ("全部·小", 9, False),
+                                      ("全部·中", 11, False),
+                                      ("全部·大", 14, False)):
+                self.cmb_name.addItem(text, (px, selonly))
+            i = int(self.settings.get("name_mode") or 1)
+            self.cmb_name.setCurrentIndex(i if 0 <= i < self.cmb_name.count() else 1)
+            self.cmb_name.currentIndexChanged.connect(self.on_name_px)
+            tb.addWidget(self.cmb_name)
+            self.act_lock = QAction("锁定窗口大小", self)
+            self.act_lock.setCheckable(True)
+            self.act_lock.setToolTip("勾上以后窗口就不能再拉大拉小了（再点一下解锁）")
+            self.act_lock.triggered.connect(self.on_lock_window)
+            tb.addAction(self.act_lock)
+
+            tb.addSeparator()
             tb.addWidget(QLabel("  底图 "))
             self.cmb_dpi = QComboBox()
             for text, val in (("内嵌图（快）", 0), ("250 DPI", 250),
@@ -1207,6 +2049,10 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.setStatusBar(QStatusBar())
             self.scene.selectionChanged.connect(self.on_selection)
             self.set_mode("select")
+            self.on_name_px()
+            if self.settings.get("win_locked"):
+                self.act_lock.setChecked(True)
+                self.on_lock_window(True)
             self.refresh_info()
             if src:
                 self.load_file(src)
@@ -1255,7 +2101,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             for n in doc.page_numbers():
                 self.cmb_page.addItem(str(n), n)
             self.cmb_page.blockSignals(False)
-            self.setWindowTitle("LBD 标注工具 v0.1 — %s（直接标注，无识别结果）"
+            self.setWindowTitle("LBD 标注工具 v0.2 — %s（直接标注，无识别结果）"
                                 % os.path.basename(p))
             self.statusBar().showMessage("空白文档：%d 页，框从零开始画；保存会生成识别结果 JSON"
                                          % len(doc.page_numbers()), 8000)
@@ -1315,8 +2161,11 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             for n in self.dbg.page_numbers():
                 self.cmb_page.addItem(str(n), n)
             self.cmb_page.blockSignals(False)
-            self.setWindowTitle("LBD 标注工具 v0.1 — %s" % os.path.basename(path))
-            self.goto_page(pgs[0])
+            self.setWindowTitle("LBD 标注工具 v0.2 — %s" % os.path.basename(path))
+            # 有框的页优先：整册 JSON（每页都写了空记录的那份）本来会停在第 1 页，
+            # 明明有图纸却是一片空白，得自己翻半天。
+            drw = drawing_pages(self.dbg)
+            self.goto_page(drw[0] if drw else pgs[0])
 
         def goto_page(self, number):
             if not self.dbg or number not in self.dbg.pages:
@@ -1601,13 +2450,14 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 return
             c = self.pm.counts()
             src = ("底图 %d DPI" % self.dpi) if self.dpi > 0 else "底图 内嵌图"
-            self.setWindowTitle("LBD 标注工具 v0.1 — %s ｜ %s"
+            self.setWindowTitle("LBD 标注工具 v0.2 — %s ｜ %s"
                                 % (os.path.basename(self.dbg.path), src))
             self.lbl_info.setText(
                 "第 %d 页 / 共 %d 页\n坐标尺寸 %d × %d\n底图：%s\n"
-                "Node %d　Tracker %d　Box %d%s"
+                "标签表：%s\nNode %d　Tracker %d　Box %d%s"
                 % (self.page, len(self.dbg.page_numbers()), self.pm.width,
                    self.pm.height, self._img_note or "（载入中）",
+                   (os.path.basename(self.xlsx) if self.xlsx else "（没选，补编号要用）"),
                    c["Node"], c["Tracker"], c.get("Box", 0),
                    "\n\n● 已修改，记得保存" if self.pm.dirty else ""))
             self.statusBar().showMessage(
@@ -1772,6 +2622,334 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.refresh_info()
             self.on_selection()
 
+        # ---------------- 标签表 / 自动补编号
+        def sync_shapes(self):
+            """把界面上框的位置写回数据。
+
+            拖动框之后必须调一次 —— 这个 PySide6 版本的 QGraphicsItem::itemChange
+            收不到 "位置变了" 事件，靠它同步的话拖动永远不会写回 bbox，
+            保存出来还是老坐标（就是"移动支架位置保存不生效"那个 bug）。
+            """
+            if not self.pm:
+                return
+            for it in self.items:
+                it.sync_shape()
+            it = self.current_item()
+            if it is not None:
+                b = it.scene_box()
+                self.lbl_bbox.setText("%.0f, %.0f → %.0f, %.0f"
+                                      % (b[0], b[1], b[2], b[3]))
+
+        def on_name_px(self, _i=None):
+            px, selonly = self.cmb_name.currentData() or (11, True)
+            BoxItem.name_px = float(px)
+            BoxItem.name_sel_only = bool(selonly)
+            for it in self.items:
+                it.update()
+            s = load_settings()
+            s["name_mode"] = self.cmb_name.currentIndex()
+            save_settings(s)
+
+        def on_lock_window(self, on):
+            try:
+                if on:
+                    self.setFixedSize(self.size())
+                else:
+                    self.setMaximumSize(16777215, 16777215)
+                    self.setMinimumSize(1180, 740)
+            except Exception:
+                pass
+            s = load_settings()
+            s["win_locked"] = bool(on)
+            save_settings(s)
+            self.statusBar().showMessage(
+                "窗口大小已锁定（再点一下「锁定窗口大小」解锁）" if on
+                else "窗口大小已解锁（现在可以自由拉动）", 4000)
+
+        def closeEvent(self, ev):
+            try:
+                s = load_settings()
+                s["win_w"], s["win_h"] = int(self.width()), int(self.height())
+                s["name_mode"] = self.cmb_name.currentIndex()
+                save_settings(s)
+            except Exception:
+                pass
+            super().closeEvent(ev)
+
+        def on_pick_xlsx(self):
+            base = (self.xlsx if (self.xlsx and os.path.exists(self.xlsx))
+                    else os.path.expanduser("~"))
+            p, _ = QFileDialog.getOpenFileName(self, "选择 LBD 标签表", base,
+                                               "Excel (*.xlsx)")
+            if not p:
+                return
+            self.xlsx = p
+            self._sheet_cache = None
+            s = load_settings()
+            s["xlsx"] = p
+            save_settings(s)
+            self.refresh_info()
+            self.statusBar().showMessage("标签表：%s" % p, 6000)
+
+        def _sheet_rows(self):
+            """(分表名列表, 取某分表 LBD 行的函数)；读不到返回 (None, None)。"""
+            return self._sheets_and_rows()
+
+        def _page_order(self):
+            """要处理的页顺序（升序）：识别结果 JSON = 有识别记录的图纸页；
+            直接标 PDF（BlankDoc）= 本会话里已经画了框的页。"""
+            pages = []
+            if hasattr(self.dbg, "_elements"):
+                try:
+                    pages = list(drawing_pages(self.dbg))
+                except Exception:
+                    pages = []
+            for pg in self.dbg.page_numbers():
+                pm = self.pm if pg == self.page else self.edited.get(pg)
+                if pm is not None and any(s.get("label") == "Node" for s in pm.shapes):
+                    pages.append(pg)
+            return sorted(set(pages))
+
+        def _sheets_and_rows(self):
+            if not self.xlsx or not os.path.exists(self.xlsx):
+                return None, None
+            if self._sheet_cache is None or self._sheet_cache[0] != self.xlsx:
+                self._sheet_cache = (self.xlsx, xlsx_sheet_names(self.xlsx), {})
+            _p, sheets, cache = self._sheet_cache
+
+            def rows_of(name):
+                if name not in cache:
+                    try:
+                        cache[name] = xlsx_lbd_rows(self.xlsx, name)
+                    except Exception:
+                        cache[name] = []
+                return cache[name]
+
+            return sheets, rows_of
+
+        def on_autofill(self, whole=True):
+            """按「已框好的 LBD 区域 + 框内文字」补 LBD 名字，整册跑时逐页报进度。"""
+            try:
+                self._autofill_impl(whole)
+            except Exception:
+                import traceback
+                QMessageBox.critical(self, "补编号出错（把这段发我）",
+                                     traceback.format_exc())
+
+        def _autofill_impl(self, whole=True):
+            from PySide6.QtWidgets import QProgressDialog
+            if not self.pm or not self.dbg:
+                self.statusBar().showMessage("先打开一份 JSON（或 PDF）再补编号", 5000)
+                return
+            # 本页先看一眼有没有可补的框：没有就直说，别让人以为"点了没反应"
+            if not whole:
+                n_node = sum(1 for s in self.pm.shapes if s.get("label") == "Node")
+                if n_node == 0:
+                    QMessageBox.information(
+                        self, "本页没有 Node 框",
+                        "第 %d 页上 Node 框 0 个（这页不是图纸页，或者框还没画）。\n\n"
+                        "补编号只对有 Node 框（LBD 区域）的图纸页有用；"
+                        "也可以直接用「补全编号(整册)」。" % self.page)
+                    return
+                self.statusBar().showMessage("正在补第 %d 页（Node %d 个）…" % (self.page, n_node))
+                QApplication.processEvents()
+            sheets, rows_of = self._sheet_rows()
+            if not sheets:
+                QMessageBox.information(self, "缺标签表",
+                                        "先点工具栏「选标签表…」选上 LBD 标签表(xlsx)。")
+                return
+            if not self.pdf or not os.path.exists(self.pdf):
+                QMessageBox.information(
+                    self, "缺 PDF",
+                    "框内取文字要读 PDF 文字层，请先「选 PDF…」指定这份 JSON 对应的 PDF。")
+                return
+            # 直接标 PDF（没 JSON）时 dbg 是 BlankDoc：它没有"识别记录"，
+            # 只能按"本会话里有框的页"来排；识别结果 JSON 就按 debug_page_map 那套。
+            blank = not hasattr(self.dbg, "_elements")
+            order = self._page_order()
+            if self.page not in order:
+                order = sorted(set(order) | {self.page})
+            todo = order if whole else [self.page]
+            force = False
+            try:
+                force = bool(self.chk_force.isChecked())
+                s = load_settings()
+                s["force"] = force
+                save_settings(s)
+            except Exception:
+                force = False
+            try:
+                ptext = PdfText(self.pdf)
+            except Exception as e:
+                QMessageBox.warning(self, "读不了 PDF", "打开 PDF 失败：%s" % e)
+                return
+            prog = QProgressDialog("正在按框内文字补编号…", "取消", 0, len(todo), self)
+            prog.setWindowTitle("补全 LBD 编号")
+            prog.setMinimumDuration(0)
+            prog.setWindowModality(Qt.WindowModality.WindowModal)
+            lines, n_ok, n_auto, n_miss, n_skip = [], 0, 0, 0, 0
+            check = []          # 要人核的：位置可能错的（紫）+ 按顺序推的（黄）
+            try:
+                for k, pg in enumerate(todo):
+                    prog.setValue(k)
+                    prog.setLabelText("第 %d 页（%d/%d）…" % (pg, k + 1, len(todo)))
+                    QApplication.processEvents()
+                    if prog.wasCanceled():
+                        break
+                    pm = self.pm if pg == self.page else (self.edited.get(pg)
+                                                          or PageModel(self.dbg, pg))
+                    if force:
+                        # 重算：把 Node 上已有的名字清掉（识别给的号不对时用这个）
+                        for sh in pm.shapes:
+                            if sh.get("label") == "Node":
+                                sh["name"] = ""
+                                sh["_auto"] = False
+                                sh["_miss"] = False
+                                sh["_check"] = False
+                    items = ptext.items(pg)
+                    hit, _cnt = page_sheet_by_text(items, sheets)
+                    idx = order.index(pg) if pg in order else -1
+                    by_order = sheets[idx] if 0 <= idx < len(sheets) else ""
+                    # 直接标 PDF 时没有"图纸顺序"可依，就用页面上印的分表名；
+                    # 识别结果 JSON 还是按"第几页 = 第几个分表"（和主程序一致）。
+                    sheet = (hit or by_order) if blank else by_order
+                    num_set = {n for n, _l in (rows_of(sheet) if sheet else [])}
+                    st = autofill_shapes(pm.shapes, items, sheet, num_set,
+                                         pm.width, pm.height)
+                    pm.dirty = True
+                    self.edited[pg] = pm
+                    if pg == self.page:
+                        self._rebuild_items()
+                    n_ok += st["filled"]
+                    n_auto += st["auto"]
+                    n_miss += st["missed"]
+                    n_skip += st["kept"]
+                    note = ""
+                    if hit and sheet and _clean_key(hit) != _clean_key(sheet):
+                        note = "；⚠页面文字里印的是 %s（按顺序推的是 %s）" % (hit, sheet)
+                    details = ""
+                    if st["auto"]:
+                        details += "，其中按标签表顺序推 %d（黄色）" % st["auto"]
+                    if st["missed"]:
+                        details += "，没取到 %d（红色）" % st["missed"]
+                    lines.append("第 %s 页 %s：补上 %d 个%s%s"
+                                 % (pg, sheet or "（推不出分表）", st["filled"],
+                                    details, note))
+                    for nm, x, y in (st.get("sus_list") or []):
+                        check.append("第 %s 页 %s —— 同一排的号不连续，位置可能错"
+                                     "（图上大约 x=%d y=%d）" % (pg, nm or "（空）", x, y))
+                    for nm in (st.get("auto_list") or []):
+                        check.append("第 %s 页 %s —— 图上没找到编号，按标签表顺序推的"
+                                     % (pg, nm or "（空）"))
+            finally:
+                prog.close()
+                self.refresh_info()
+                self.on_selection()
+            head = ("框内文字取到 %d 个；按标签表顺序补 %d 个（黄色，请核一下）；"
+                    "没取到 %d 个（红色，手填）；已有名字跳过 %d 个。\n"
+                    "要你核的一共 %d 个（下面列出来；紫=号跳号、黄=按顺序推的）\n\n"
+                    % (n_ok, n_auto, n_miss, n_skip, len(check)))
+            if not whole:
+                n_node = sum(1 for s in self.pm.shapes if s.get("label") == "Node")
+                head = ("第 %d 页（Node 框 %d 个）\n" % (self.page, n_node)) + head
+                if n_node and not (n_ok or n_auto or n_miss) and n_skip == n_node:
+                    head = ("第 %d 页：%d 个框全都有名字了，我默认不动它们。\n"
+                            "如果这些名字是错的，勾上工具栏的「重算(覆盖已有名字)」再点一次。\n\n"
+                            % (self.page, n_node)) + head
+            body = "\n".join(lines[:60])
+            if len(lines) > 60:
+                body += "\n…（共 %d 页，完整清单见状态栏）" % len(lines)
+            if check:
+                body += "\n\n【需要核对的】\n" + "\n".join(check[:60])
+                if len(check) > 60:
+                    body += "\n…（还有 %d 个，见 --autofill 的日志）" % (len(check) - 60)
+            try:
+                self.statusBar().showMessage(
+                    "补编号完成：框内 %d / 推 %d / 缺 %d" % (n_ok, n_auto, n_miss), 0)
+            except Exception:
+                pass
+            QMessageBox.information(self, "补全 LBD 编号", head + body)
+
+        def on_export_check(self):
+            """导出核对表 CSV：每页每个 Node 框一行（现有名字 / 框内候选 / 建议）。"""
+            import csv
+            from PySide6.QtWidgets import QProgressDialog
+            if not self.pm or not self.dbg:
+                self.statusBar().showMessage("先打开一份 JSON 再导出核对表", 5000)
+                return
+            sheets, rows_of = self._sheet_rows()
+            if not sheets:
+                QMessageBox.information(self, "缺标签表",
+                                        "先点工具栏「选标签表…」选上 LBD 标签表(xlsx)。")
+                return
+            if not self.pdf or not os.path.exists(self.pdf):
+                QMessageBox.information(self, "缺 PDF",
+                                        "读框内文字要 PDF，请先「选 PDF…」指定这份 JSON 的 PDF。")
+                return
+            base = os.path.splitext(os.path.basename(self.dbg.path))[0] + "_核对表.csv"
+            path, _ = QFileDialog.getSaveFileName(self, "导出核对表", base, "CSV (*.csv)")
+            if not path:
+                return
+            blank = not hasattr(self.dbg, "_elements")
+            order = self._page_order()
+            if self.page not in order:
+                order = sorted(set(order) | {self.page})
+            try:
+                ptext = PdfText(self.pdf)
+            except Exception as e:
+                QMessageBox.warning(self, "读不了 PDF", "打开 PDF 失败：%s" % e)
+                return
+            prog = QProgressDialog("正在生成核对表…", "取消", 0, len(order), self)
+            prog.setWindowTitle("导出核对表")
+            prog.setMinimumDuration(0)
+            prog.setWindowModality(Qt.WindowModality.WindowModal)
+            rows = []
+            try:
+                for k, pg in enumerate(order):
+                    prog.setValue(k)
+                    prog.setLabelText("第 %d 页（%d/%d）…" % (pg, k + 1, len(order)))
+                    QApplication.processEvents()
+                    if prog.wasCanceled():
+                        break
+                    pm = self.pm if pg == self.page else (self.edited.get(pg)
+                                                          or PageModel(self.dbg, pg))
+                    items = ptext.items(pg)
+                    hit, _cnt = page_sheet_by_text(items, sheets)
+                    idx = order.index(pg)
+                    by_order = sheets[idx] if idx < len(sheets) else ""
+                    sheet = (hit or by_order) if blank else by_order
+                    num_set = {n for n, _l in (rows_of(sheet) if sheet else [])}
+                    rr, _dry = check_rows(pm.shapes, items, sheet, num_set,
+                                          pm.width, pm.height)
+                    for r in rr:
+                        r["page"] = pg
+                        r["sheet"] = sheet
+                        rows.append(r)
+            finally:
+                prog.close()
+            cols = ["page", "sheet", "ix", "cx", "cy", "now", "cand", "sug", "src"]
+            head = {"page": "页号", "sheet": "分表", "ix": "框序号", "cx": "中心X",
+                    "cy": "中心Y", "now": "现有名字", "cand": "框内候选(号@距离px)",
+                    "sug": "建议名字", "src": "建议来源"}
+            try:
+                with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=cols)
+                    w.writerow(head)
+                    for r in rows:
+                        w.writerow({c: r.get(c, "") for c in cols})
+            except Exception as e:
+                QMessageBox.warning(self, "写不了文件", "%s" % e)
+                return
+            n_diff = sum(1 for r in rows if (r.get("now") or "") != (r.get("sug") or ""))
+            n_cand = sum(1 for r in rows if r.get("cand"))
+            QMessageBox.information(
+                self, "核对表已导出",
+                "写好了：\n%s\n\n共 %d 行（%d 个框）；框内找到候选的 %d 个；"
+                "现有名字和建议不一致的 %d 个。\n\n"
+                "在 Excel 里看：cand 列是这个框里找到的文字（号@距离），"
+                "sug 是按现在规则算的建议名，src=框内 就是真从框里取到的。"
+                % (path, len(rows), len(rows), n_cand, n_diff))
+
         # ---------------- 保存
         def do_save(self, dest, quiet=False):
             if not self.dbg:
@@ -1792,7 +2970,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             for n in self.dbg.page_numbers():
                 self.cmb_page.addItem(str(n), n)
             self.cmb_page.blockSignals(False)
-            self.setWindowTitle("LBD 标注工具 v0.1 — %s" % os.path.basename(dest))
+            self.setWindowTitle("LBD 标注工具 v0.2 — %s" % os.path.basename(dest))
             keep = self.page if self.page in self.dbg.pages else self.dbg.page_numbers()[0]
             self.pm = None
             self.goto_page(keep)
@@ -2058,9 +3236,110 @@ def last_json():
     return p if p and os.path.exists(p) else ""
 
 
+def autofill_run(json_path, pdf_path, xlsx_path, out_path=None, only_page=None,
+                 force=False, csv_path=None):
+    """无界面跑一遍「框内取文字补 LBD 编号」，逐页打印结果；给了 out 就另存一份。
+
+    跟界面上「补全编号」用的是同一套函数，方便先拿真实文件核对。
+    """
+    dbg = DebugJson(json_path)
+    sheets = xlsx_sheet_names(xlsx_path)
+    if not sheets:
+        print("标签表里读不到分表名：%s" % xlsx_path)
+        return 2
+    cache = {}
+
+    def rows_of(nm):
+        if nm not in cache:
+            try:
+                cache[nm] = xlsx_lbd_rows(xlsx_path, nm)
+            except Exception as e:
+                print("  读分表 %s 失败：%s" % (nm, e))
+                cache[nm] = []
+        return cache[nm]
+
+    try:
+        ptext = PdfText(pdf_path)
+    except Exception as e:
+        print("打不开 PDF：%s" % e)
+        return 2
+    order = drawing_pages(dbg)
+    pages = [only_page] if only_page else order
+    print("JSON %s：%d 页；标签表分表 %d 个；PDF %d 页"
+          % (os.path.basename(json_path), len(order), len(sheets), ptext.count()))
+    mod = {}
+    tot = {"filled": 0, "auto": 0, "missed": 0, "kept": 0}
+    check_all = []
+    for k, pg in enumerate(pages):
+        idx = order.index(pg) if pg in order else -1
+        sheet = sheets[idx] if 0 <= idx < len(sheets) else ""
+        num_set = {n for n, _l in (rows_of(sheet) if sheet else [])}
+        pm = PageModel(dbg, pg)
+        now_map = {i: (s.get("name") or "")
+                   for i, s in enumerate(pm.shapes) if s.get("label") == "Node"}
+        if force:
+            for s in pm.shapes:
+                if s.get("label") == "Node":
+                    s["name"] = ""
+                    s["_auto"] = False
+                    s["_miss"] = False
+                    s["_check"] = False
+        items = ptext.items(pg)
+        hit, _cnt = page_sheet_by_text(items, sheets)
+        st = autofill_shapes(pm.shapes, items, sheet, num_set, pm.width, pm.height)
+        if csv_path:
+            rr, _dry = check_rows(pm.shapes, items, sheet, num_set, pm.width, pm.height)
+            for r in rr:
+                r["page"] = pg
+                r["sheet"] = sheet
+                r["now"] = now_map.get(r["ix"], "")
+                check_all.append(r)
+        for key in tot:
+            tot[key] += st.get(key, 0)
+        note = ""
+        if hit and sheet and _clean_key(hit) != _clean_key(sheet):
+            note = "  [警告] 页面文字印的是 %s" % hit
+        print("[%2d/%2d] 第 %s 页 分表=%-10s 号码表=%-3d 出名字 %d 个"
+              "（框内 %d / 推 %d / 缺 %d）%s"
+              % (k + 1, len(pages), pg, sheet or "?", len(num_set),
+                 st["filled"] + st["auto"], st["filled"], st["auto"],
+                 st["missed"], note))
+        for s in pm.shapes:
+            if s.get("label") == "Node":
+                flag = "红" if s.get("_miss") else ("紫" if s.get("_check")
+                                                   else ("黄" if s.get("_auto") else "绿"))
+                print("        %s %s" % (flag, (s.get("name") or "（空）")))
+        for nm, x, y in (st.get("sus_list") or []):
+            print("        [要核] %s 同一排号不连续（x=%d y=%d）" % (nm or "（空）", x, y))
+        for nm in (st.get("auto_list") or []):
+            print("        [要核] %s 图上没编号，按标签表顺序推的" % (nm or "（空）"))
+        mod[pg] = pm.result()
+    print("合计：框内取到 %d，按标签表推 %d，没取到 %d，已有名字跳过 %d"
+          % (tot["filled"], tot["auto"], tot["missed"], tot["kept"]))
+    if out_path:
+        dbg.save(out_path, mod)
+        print("已另存：%s" % out_path)
+    if csv_path:
+        import csv
+        cols = ["page", "sheet", "ix", "cx", "cy", "now", "cand", "sug", "src"]
+        head = {"page": "页号", "sheet": "分表", "ix": "框序号", "cx": "中心X",
+                "cy": "中心Y", "now": "现有名字", "cand": "框内候选(号@距离px)",
+                "sug": "建议名字", "src": "建议来源"}
+        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writerow(head)
+            for r in check_all:
+                w.writerow({c: r.get(c, "") for c in cols})
+        n_cand = sum(1 for r in check_all if r.get("cand"))
+        n_diff = sum(1 for r in check_all if (r.get("now") or "") != (r.get("sug") or ""))
+        print("核对表已写：%s（%d 行；框内有候选 %d；现有≠建议 %d）"
+              % (csv_path, len(check_all), n_cand, n_diff))
+    return 0
+
+
 def main():
     fix_std_streams()
-    ap = argparse.ArgumentParser(description="LBD 标注工具 v0.1")
+    ap = argparse.ArgumentParser(description="LBD 标注工具 v0.2")
     ap.add_argument("json", nargs="?", default=None,
                     help="识别结果 debug JSON（不填就打开对话框）")
     ap.add_argument("--selftest", action="store_true", help="无界面自检")
@@ -2069,9 +3348,27 @@ def main():
                     help="只载入并显示第一页，然后挂着（外部采样内存用）")
     ap.add_argument("--roundtrip", action="store_true",
                     help="复现「画完翻页再翻回来」，检查框和底图有没有乱")
+    ap.add_argument("--autofill", action="store_true",
+                    help="无界面按框内文字补 LBD 编号（配 --pdf/--xlsx/--out 用）")
+    ap.add_argument("--pdf", default=None, help="配套 PDF（框内取文字用）")
+    ap.add_argument("--xlsx", default=None, help="LBD 标签表(xlsx)")
+    ap.add_argument("--page", type=int, default=None, help="--autofill 时只跑这一页")
+    ap.add_argument("--force", action="store_true",
+                    help="--autofill 时把已有的 Node 名字也重算一遍")
+    ap.add_argument("--csv", default=None,
+                    help="--autofill 时同时导出核对表 CSV（现有/框内候选/建议）")
     ap.add_argument("--hold", type=float, default=20.0, help="--memtest 挂多久（秒）")
     ap.add_argument("--out", default=None, help="自检时的输出文件")
     a = ap.parse_args()
+    if a.autofill:
+        src = a.json or DEFAULT_JSON
+        pdf = a.pdf or str(load_settings().get("pdf") or "")
+        xl = a.xlsx or str(load_settings().get("xlsx") or "")
+        if not (src and os.path.exists(src) and pdf and os.path.exists(pdf)
+                and xl and os.path.exists(xl)):
+            print("--autofill 需要：JSON 路径 + --pdf + --xlsx（都要存在）")
+            return 2
+        return autofill_run(src, pdf, xl, a.out, a.page, a.force, a.csv)
     if a.selftest:
         src = a.json or DEFAULT_JSON
         if not os.path.exists(src):

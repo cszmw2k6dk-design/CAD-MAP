@@ -15,6 +15,10 @@ PY = sys.executable
 PYDIR = os.path.dirname(PY)
 DIST = os.path.join(HERE, "dist")
 EXE = os.path.join(DIST, "Voltage-CAD MAP.exe")
+ONEDIR = "--onedir" in sys.argv          # 打成文件夹（onedir）而不是单文件
+APPDIR = os.path.join(DIST, "Voltage-CAD MAP")
+if ONEDIR:
+    EXE = os.path.join(APPDIR, "Voltage-CAD MAP.exe")
 SEP = os.pathsep
 
 
@@ -110,13 +114,29 @@ def main():
     # 旧 exe 先挪走：这样后面只要 exe 存在，就保证是这次新产出的。
     # 注意：正在运行的那份 exe 会被 Windows 锁住（重命名/删除都失败），
     # 这时直接提示"先关掉程序"，别打到一半再报权限错误。
-    old = EXE + ".old"
-    if os.path.exists(old):
+    target_old = (APPDIR + ".old") if ONEDIR else (EXE + ".old")
+    old = target_old
+    if ONEDIR and os.path.isdir(target_old):
+        try:
+            shutil.rmtree(target_old)
+        except Exception:
+            log("  提示：删不掉旧的文件夹 %s（多半是程序还在跑），留着不影响本次打包。"
+                % os.path.basename(target_old))
+    if not ONEDIR and os.path.exists(old):
         try:
             os.remove(old)
         except Exception:
             log("  提示：删不掉旧的 %s（多半是它还在运行），先留着，不影响本次打包。" % os.path.basename(old))
-    if os.path.exists(EXE):
+    if ONEDIR:
+        if os.path.isdir(APPDIR):
+            try:
+                os.replace(APPDIR, target_old)
+            except Exception as e:
+                log("[失败] 旧文件夹挪不动（%s）：多半是 Voltage-CAD MAP 正在运行。" % e)
+                log("       请先关掉正在运行的程序（任务管理器里结束 Voltage-CAD MAP），再重新打包。")
+                return 1
+        old = target_old if os.path.isdir(target_old) else None
+    elif os.path.exists(EXE):
         try:
             os.replace(EXE, old)
         except Exception as e:
@@ -125,7 +145,7 @@ def main():
             return 1
 
     log("[2/3] PyInstaller 打包中（约 1 分钟）...")
-    args = [PY, "-m", "PyInstaller", "--onefile", "--windowed",
+    args = [PY, "-m", "PyInstaller", "--onedir" if ONEDIR else "--onefile", "--windowed",
             "--icon", os.path.join(HERE, "app.ico"),
             "--name", "Voltage-CAD MAP",
             "--add-data", data(os.path.join(HERE, "app_icon.png")),
@@ -168,13 +188,24 @@ def main():
                         os.path.join(DIST, "PdfLayout_ai.lsp"))
     except Exception as e:
         log("  复制附属 lsp 失败（不影响 exe）：%s" % e)
-    if os.path.exists(old):
+    if old and ONEDIR and os.path.isdir(old):
+        try:
+            shutil.rmtree(old)
+        except Exception:
+            log("  提示：旧的文件夹 %s 删不掉（程序还在运行会锁住它），下次打包会再清一次。"
+                % os.path.basename(old))
+    elif os.path.exists(old):
         try:
             os.remove(old)
         except Exception:
             log("  提示：旧的 %s 删不掉（程序还在运行会锁住它），下次打包会再清一次。"
                 % os.path.basename(old))
-    log("打包完成：%s（%.1f MB）" % (EXE, os.path.getsize(EXE) / 1048576.0))
+    if ONEDIR:
+        total = sum(os.path.getsize(os.path.join(base, f))
+                    for base, _d, fs in os.walk(APPDIR) for f in fs)
+        log("打包完成（文件夹版）：%s（整个文件夹 %.1f MB）" % (APPDIR, total / 1048576.0))
+    else:
+        log("打包完成：%s（%.1f MB）" % (EXE, os.path.getsize(EXE) / 1048576.0))
     return 0
 
 
