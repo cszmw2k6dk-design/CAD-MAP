@@ -24,14 +24,9 @@
       nil))
   (if (= (strcase msg) "RUN_DONE")
     (progn
-      ;; ① STR 号已经画完：让 LBD 标签反过来避让一下（用 CAD 里的真实包围盒）
-      (setq _ar (vl-catch-all-apply 'PdfLayout_LbdPlace nil))
-      (if (vl-catch-all-error-p _ar)
-        (setq _ar (vl-catch-all-apply 'PdfLayout_LbdAvoidStr nil))
-      )
-      (if (vl-catch-all-error-p _ar)
-        (princ (strcat "\n[LBD避让STR] 出错：" (vl-catch-all-error-message _ar)))
-      )
+      ;; LBD 标签避让 STR 号这步**不再自动执行**（一跑完就卡死 CAD，先去掉）。
+      ;; 需要时手动执行命令 LBDAVOIDSTR —— 它现在走的是不用 ssget 的安全实现。
+      (princ "\n[LBD] 画完（自动避让已关闭；需要时手动执行 LBDAVOIDSTR）")
     )
   )
 )
