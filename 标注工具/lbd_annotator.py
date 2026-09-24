@@ -42,6 +42,40 @@ SECTION_ORDER = (TRACKER_SECTION, BOX_SECTION, OCR_SECTION)
 DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 DEFAULT_JSON = r"C:\Users\ZhaokeShi\OneDrive - Voltage, LLC\桌面\little-debug.json"
+ANNOTATOR_VERSION = "0.3"                       # 标注工具自己的版本号
+RACK_LEN_TOL = 0.10                             # 支架长度差 ≤10% 算同一类
+UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"      # 在线更新读这个仓库的 Release
+
+
+def find_pythons():
+    """机器上可能能用的 Python 解释器（训练/推理要用）。
+
+    注意：Python 3.14 现在装不上 torch，所以优先列 3.12 / 3.11。
+    """
+    out = []
+    try:
+        w = shutil.which("python")
+        if w:
+            out.append(w)
+    except Exception:
+        pass
+    bases = ["C:\\", os.environ.get("LOCALAPPDATA") or "",
+             os.path.join(os.environ.get("USERPROFILE") or "", "anaconda3"),
+             os.path.join(os.environ.get("USERPROFILE") or "", "miniconda3")]
+    for base in bases:
+        if not base:
+            continue
+        for ver in ("312", "311", "313", "310", "39"):
+            for p in (os.path.join(base, "Python%s" % ver, "python.exe"),
+                      os.path.join(base, "Programs", "Python", "Python%s" % ver, "python.exe"),
+                      os.path.join(base, "python%s" % ver, "python.exe"),
+                      os.path.join(base, "envs", "py%s" % ver, "python.exe")):
+                if os.path.exists(p) and p not in out:
+                    out.append(p)
+        p = os.path.join(base, "python.exe")
+        if os.path.exists(p) and p not in out:
+            out.append(p)
+    return out
 
 # ------------------------------------------------------- 高分辨率底图（重新渲染 PDF）
 POPPLER_HINTS = (
@@ -997,10 +1031,19 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
                 if txt.rstrip().endswith(("-", "_", ".", "(", "#", "|")):
                     continue           # 结尾是分隔符 -> 文字被截断了，不拿它猜号
                 t2 = re.sub(r"INV\s*\d+\s*[A-Za-z]\s*\d+", " ", txt, flags=re.I)
-                m = ANY_NUM_RE.search(t2)
-                if not m:
+                # "1.01.1.C.5" 这种：把所有数字段都拆出来，从**最后往前**找，
+                # 只要有一个能在本分表号码表里对上就用它（不再要求带 "LBD" 字样）
+                segs = [int(g) for g in re.findall(r"\d{1,3}", t2)]
+                if not segs:
                     continue
-                val = int(m.group(1))
+                val = None
+                for v in reversed(segs):
+                    if not sheet or not num_set or v in num_set:
+                        val = v
+                        break
+                if val is None:
+                    stat["dropped"] = stat.get("dropped", 0) + 1
+                    continue
                 in_set = (not sheet or not num_set or val in num_set)
                 picks.setdefault(i, []).append((0 if in_set else 1, d, val, txt))
         for i, lst in picks.items():
@@ -1706,6 +1749,9 @@ def make_gui_classes():
             self.win.keyPressEvent(ev)
 
         def wheelEvent(self, ev):
+            # 每次滚轮都重设锚点：fitInView / 100% 会把锚点变回视口中心，
+            # 不重设的话缩放就不是跟着十字光标走的
+            self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
             f = 1.18 if ev.angleDelta().y() > 0 else 1 / 1.18
             cur = self.transform().m11()
             if 0.01 < cur * f < 40:
@@ -1729,6 +1775,16 @@ def make_gui_classes():
                         return
             if ev.button() == Qt.MouseButton.LeftButton and self.mode != "select":
                 sp = self.mapToScene(ev.position().toPoint())
+                # 两点画法：已经点过第一角了，这次点击就是对角点，直接成框
+                if self._rubber is not None:
+                    r = self._rubber.rect()
+                    self.scene().removeItem(self._rubber)
+                    self._rubber = None
+                    self._origin = None
+                    if r.width() >= 3 and r.height() >= 3:
+                        self.win.add_shape(self.mode,
+                                           [r.left(), r.top(), r.right(), r.bottom()])
+                    return
                 self._origin = sp
                 c = COLORS.get(self.mode, QColor(255, 0, 255))
                 pen = QPen(c)
@@ -1787,6 +1843,10 @@ def make_gui_classes():
                 return
             if self._rubber is not None and ev.button() == Qt.MouseButton.LeftButton:
                 r = self._rubber.rect()
+                # 只是点了一下（面积≈0）→ 留在"两点画法"里等第二次点击；
+                # 拖着画出来的（有点面积）→ 按老习惯直接成框
+                if r.width() < 3 or r.height() < 3:
+                    return
                 self.scene().removeItem(self._rubber)
                 self._rubber = None
                 self._origin = None
@@ -1895,6 +1955,14 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             tb = QToolBar("工具栏")
             tb.setMovable(False)
             self.addToolBar(tb)
+            # 画图相关的工具栏放左边（竖排），保存/输出相关的留在上面
+            tb2 = QToolBar("画图")
+            tb2.setMovable(False)
+            try:
+                tb2.setOrientation(Qt.Orientation.Vertical)
+                self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, tb2)
+            except Exception:
+                self.addToolBar(tb2)
 
             act = QAction("打开 JSON", self)
             act.triggered.connect(self.on_open)
@@ -1902,23 +1970,28 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             act = QAction("打开 PDF（无 JSON，直接标注）", self)
             act.triggered.connect(self.on_open_pdf)
             tb.addAction(act)
-            tb.addSeparator()
+            tb2.addSeparator()
             for m in ("select",) + CLASSES:
                 a = QAction(MODE_TEXT[m], self)
                 a.setCheckable(True)
                 a.triggered.connect(lambda _c=False, mm=m: self.set_mode(mm))
-                tb.addAction(a)
+                tb2.addAction(a)
                 setattr(self, "act_" + m, a)
-            tb.addSeparator()
+            tb2.addSeparator()
             a = QAction("撤销", self)
             a.setShortcut(QKeySequence("Ctrl+Z"))
             a.triggered.connect(self.on_undo)
-            tb.addAction(a)
+            tb2.addAction(a)
             a = QAction("重做", self)
             a.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
             a.setToolTip("重做刚撤销的操作（Ctrl+Y 或 Ctrl+Shift+Z）")
             a.triggered.connect(self.on_redo)
-            tb.addAction(a)
+            tb2.addAction(a)
+            a = QAction("支架按长度分档", self)
+            a.setToolTip("Tracker（支架）框按长边长度分档：短的算 2 串、长的算 3 串（可改），"
+                         "结果写进 JSON 的 raw.strings")
+            a.triggered.connect(self.on_rack_grade)
+            tb2.addAction(a)
             a = QAction("重载本页", self)
             a.setToolTip("把当前页恢复成上次打开/保存时的样子（画乱了的出口；可用 Ctrl+Z 撤销）")
             a.triggered.connect(self.on_reload_page)
@@ -1970,6 +2043,18 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             a = QAction("导出核对表…", self)
             a.setToolTip("每个框一行：现有名字 / 框内找到的候选 / 建议名字 —— 导出 CSV 在 Excel 里核")
             a.triggered.connect(self.on_export_check)
+            tb.addAction(a)
+            a = QAction("导出 YOLO 数据集…", self)
+            a.setToolTip("导出成 YOLO 训练集（images/ + labels/ + data.yaml），可以丢给 yolo26 训练")
+            a.triggered.connect(self.on_export_dataset)
+            tb.addAction(a)
+            a = QAction("检查更新", self)
+            a.setToolTip("看 Release 里有没有新的标注工具包（名字里带 LBD 的那个）")
+            a.triggered.connect(self.on_check_update)
+            tb.addAction(a)
+            a = QAction("训练环境…", self)
+            a.setToolTip("检测 Python / 一键装 ultralytics（CPU 版），下一步接一键训练")
+            a.triggered.connect(self.on_train_panel)
             tb.addAction(a)
             tb.addWidget(QLabel("  名字 "))
             self.cmb_name = QComboBox()
@@ -2562,8 +2647,10 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             gx2 = max(s["bbox"][2] for s in clip)
             gy2 = max(s["bbox"][3] for s in clip)
             gap = 12.0
-            dx = ((gx2 - gx1) + gap) * self._paste_n
-            dy = ((gy2 - gy1) + gap) * self._paste_n
+            # 错开量按"这一组较短边的 15%（不小于 24px）"算，再乘粘贴次数。
+            # 以前按整组包围盒错开，细长的一组会被甩到很远的地方。
+            dx = max(24.0, 0.15 * (gx2 - gx1)) * self._paste_n
+            dy = max(24.0, 0.15 * (gy2 - gy1)) * self._paste_n
             W, H = float(self.pm.width), float(self.pm.height)
             # 整组不越界：越界就把整组挪回来，组内相对位置不变（不会挤在页面边上）
             if gx2 + dx > W:
@@ -2653,8 +2740,11 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         def on_lock_window(self, on):
             try:
                 if on:
-                    self.setFixedSize(self.size())
+                    # 锁的是"画布区"：画布固定住，整个窗口仍然可以拉大拉小
+                    self.canvas.setFixedSize(self.canvas.size())
                 else:
+                    self.canvas.setMinimumSize(320, 240)
+                    self.canvas.setMaximumSize(16777215, 16777215)
                     self.setMaximumSize(16777215, 16777215)
                     self.setMinimumSize(1180, 740)
             except Exception:
@@ -2869,6 +2959,295 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             except Exception:
                 pass
             QMessageBox.information(self, "补全 LBD 编号", head + body)
+
+        def on_export_dataset(self):
+            """导出 YOLO 训练集：images/ + labels/ + classes.txt + data.yaml。"""
+            from PySide6.QtWidgets import QProgressDialog
+            if not (self.dbg and self.pdf and os.path.exists(self.pdf)):
+                QMessageBox.information(self, "缺 PDF",
+                                        "导出数据集要用 PDF 渲染图片，请先「选 PDF…」。")
+                return
+            base = os.path.join(os.path.dirname(self.dbg.path), "yolo_dataset")
+            out = QFileDialog.getExistingDirectory(self, "选数据集输出目录", base)
+            if not out:
+                return
+            img_dir = os.path.join(out, "images")
+            lab_dir = os.path.join(out, "labels")
+            os.makedirs(img_dir, exist_ok=True)
+            os.makedirs(lab_dir, exist_ok=True)
+            names = list(CLASSES)
+            with open(os.path.join(out, "classes.txt"), "w", encoding="utf-8") as f:
+                f.write("\n".join(names) + "\n")
+            with open(os.path.join(out, "data.yaml"), "w", encoding="utf-8") as f:
+                f.write("path: %s\ntrain: images\nval: images\nnames:\n"
+                        % out.replace("\\", "/"))
+                for i, n in enumerate(names):
+                    f.write("  %d: %s\n" % (i, n))
+            pages = drawing_pages(self.dbg) or [self.page]
+            dpi = self.dpi if self.dpi > 0 else 250
+            prog = QProgressDialog("正在导出 YOLO 数据集…", "取消", 0, len(pages), self)
+            prog.setWindowModality(Qt.WindowModality.WindowModal)
+            prog.setMinimumDuration(0)
+            n_img = n_box = 0
+            try:
+                for k, pg in enumerate(pages):
+                    prog.setValue(k)
+                    prog.setLabelText("第 %d 页（%d/%d）…" % (pg, k + 1, len(pages)))
+                    QApplication.processEvents()
+                    if prog.wasCanceled():
+                        break
+                    src = self.renderer.render(self.pdf, pg, dpi)
+                    dst = os.path.join(img_dir, "p%04d.png" % pg)
+                    shutil.copyfile(src, dst)
+                    pm = self.pm if pg == self.page else (self.edited.get(pg)
+                                                          or PageModel(self.dbg, pg))
+                    W = float(pm.width) or 1.0
+                    H = float(pm.height) or 1.0
+                    lines = []
+                    for s in pm.shapes:
+                        b = s["bbox"]
+                        cls = names.index(s["label"]) if s["label"] in names else 0
+                        lines.append("%d %.6f %.6f %.6f %.6f"
+                                     % (cls, (b[0] + b[2]) / 2 / W, (b[1] + b[3]) / 2 / H,
+                                        (b[2] - b[0]) / W, (b[3] - b[1]) / H))
+                        n_box += 1
+                    with open(os.path.join(lab_dir, "p%04d.txt" % pg), "w",
+                              encoding="utf-8") as f:
+                        f.write("\n".join(lines) + "\n")
+                    n_img += 1
+            finally:
+                prog.close()
+            QMessageBox.information(
+                self, "数据集导出完成",
+                "目录：%s\n\n图片 %d 张、标注框 %d 个，类别顺序：%s\n\n"
+                "训练（在装了 ultralytics 的 Python 环境里）：\n"
+                "yolo train data=%s/data.yaml model=yolov8n.pt imgsz=2560\n"
+                % (out, n_img, n_box, " / ".join(names),
+                   out.replace("\\", "/")))
+
+        def on_train_panel(self):
+            """训练环境面板：探测 Python / 检测 ultralytics / 一键装（日志实时显示）。"""
+            from PySide6.QtWidgets import (QDialog, QPlainTextEdit, QVBoxLayout, QHBoxLayout,
+                                           QPushButton, QLabel, QComboBox)
+            import subprocess
+            import threading
+            dlg = QDialog(self)
+            dlg.setWindowTitle("训练环境（先装环境，下一步接一键训练）")
+            dlg.resize(780, 500)
+            v = QVBoxLayout(dlg)
+            h = QHBoxLayout()
+            h.addWidget(QLabel("Python 解释器："))
+            cmb = QComboBox()
+            for p in find_pythons():
+                cmb.addItem(p)
+            if cmb.count() == 0:
+                cmb.addItem("（没找到 Python，点右边「浏览…」）")
+            if self.settings.get("python"):
+                cmb.addItem(str(self.settings["python"]))
+                cmb.setCurrentText(str(self.settings["python"]))
+            h.addWidget(cmb, 1)
+            b_br = QPushButton("浏览…")
+            h.addWidget(b_br)
+            v.addLayout(h)
+            lbl = QLabel("Python 3.14 装不上 torch —— 请选 3.11 / 3.12。"
+                         "这台机器是 GT 1030(2GB)+老驱动，只能跑 CPU 版。")
+            lbl.setWordWrap(True)
+            v.addWidget(lbl)
+            log = QPlainTextEdit()
+            log.setReadOnly(True)
+            v.addWidget(log, 1)
+            hb = QHBoxLayout()
+            b1 = QPushButton("检测环境")
+            b2 = QPushButton("一键装环境(CPU)")
+            b3 = QPushButton("关闭")
+            hb.addWidget(b1)
+            hb.addWidget(b2)
+            hb.addStretch(1)
+            hb.addWidget(b3)
+            v.addLayout(hb)
+
+            def cur_py():
+                t = cmb.currentText().strip()
+                return t if (t and os.path.exists(t)) else None
+
+            def run(args, tag):
+                log.appendPlainText("$ " + " ".join(args))
+
+                def work():
+                    try:
+                        pr = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                              stderr=subprocess.STDOUT, text=True,
+                                              encoding="utf-8", errors="replace",
+                                              creationflags=_NO_WINDOW)
+                        for line in pr.stdout:
+                            log.appendPlainText(line.rstrip())
+                        pr.wait()
+                        log.appendPlainText("[%s] 结束，退出码 %s" % (tag, pr.returncode))
+                    except Exception as e:
+                        log.appendPlainText("[%s] 出错：%s" % (tag, e))
+                threading.Thread(target=work, daemon=True).start()
+
+            def do_check():
+                p = cur_py()
+                if not p:
+                    lbl.setText("先选一个有效的 python.exe（「浏览…」）")
+                    return
+                self.settings["python"] = p
+                save_settings(self.settings)
+                lbl.setText("检测中…（看下面日志）")
+                run([p, "-c", "import sys;print('PY',sys.version.split()[0]);"
+                              "import ultralytics;print('UL',ultralytics.__version__)"], "检测")
+
+            def do_install():
+                p = cur_py()
+                if not p:
+                    lbl.setText("先选一个有效的 python.exe（「浏览…」）")
+                    return
+                self.settings["python"] = p
+                save_settings(self.settings)
+                lbl.setText("正在装 ultralytics（CPU 版 torch，几分钟）")
+                run([p, "-m", "pip", "install", "-U", "ultralytics"], "安装")
+
+            def do_browse():
+                p, _f = QFileDialog.getOpenFileName(dlg, "选 python.exe", "C:\\",
+                                                    "python.exe (python.exe)")
+                if p:
+                    cmb.addItem(p)
+                    cmb.setCurrentText(p)
+
+            b1.clicked.connect(do_check)
+            b2.clicked.connect(do_install)
+            b3.clicked.connect(dlg.accept)
+            b_br.clicked.connect(do_browse)
+            dlg.exec()
+
+        def on_check_update(self):
+            """检查标注工具自己的更新（读 Release 里的附件，不自动替换）。"""
+            # 联网行为会被杀软当木马（未签名 + 打包 + 联网是最敏感的三种特征），
+            # 所以这里只给手动下载的提示，不再自己去连 GitHub。
+            QMessageBox.information(
+                self, "在线更新",
+                "内置的联网检查更新已关闭（避免被杀软误报）。\n\n"
+                "更新方式：打开仓库的 Release 页面，下载名字里带 LBD 的那个包，"
+                "覆盖旧的 exe 即可。")
+            return
+            import json as _json
+            import urllib.request
+            repo = str(self.settings.get("update_repo") or UPDATE_REPO)
+            tok = str(self.settings.get("update_token") or "").strip()
+            req = urllib.request.Request(
+                "https://api.github.com/repos/%s/releases/latest" % repo,
+                headers={"User-Agent": "LBD-Annotator/%s" % ANNOTATOR_VERSION})
+            if tok:
+                req.add_header("Authorization", "token %s" % tok)
+            try:
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    info = _json.loads(r.read().decode("utf-8"))
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "检查更新失败",
+                    "拉不到 Release：%s\n\n如果仓库是私有的，要么把它设成公开，"
+                    "要么在 annotator_settings.json 里加 update_token（只读 token）。" % e)
+                return
+            assets = info.get("assets") or []
+            mine = [a for a in assets if "LBD" in (a.get("name") or "").upper()]
+            txt = ["当前版本：%s   远端最新：%s（%s）"
+                   % (ANNOTATOR_VERSION, info.get("tag_name") or "?",
+                      info.get("published_at") or "")]
+            for a in assets:
+                txt.append("· %s  %.1f MB" % (a.get("name"), (a.get("size") or 0) / 1048576.0))
+            if mine:
+                txt.append("\n标注工具的包：%s\n下载地址：%s"
+                           % (mine[0].get("name"), mine[0].get("browser_download_url")))
+                txt.append("（自动替换要另配一个替换用的启动器，先给你下载地址）")
+            else:
+                txt.append("\n远端没有名字带 LBD 的附件 —— 把 LBD标注工具.exe 传到 Release 才能在线更新。")
+            QMessageBox.information(self, "检查更新", "\n".join(txt))
+
+        def on_rack_grade(self):
+            """Tracker（支架）按长边长度分档：短的 2 串、长的 3 串（可改）→ 写进 raw.strings。
+
+            分档用的是**整册所有页画过的支架**（不是只看当前页），
+            这样每一页的"长/短"用的是同一套门槛，跨页也不会忽长忽短。
+            """
+            from PySide6.QtWidgets import QInputDialog
+            if not self.dbg:
+                return
+            pages = self._page_order() or [self.page]
+            pms = {}
+            for pg in pages:
+                pms[pg] = (self.pm if pg == self.page
+                           else (self.edited.get(pg) or PageModel(self.dbg, pg)))
+            racks = [s for pm in pms.values() for s in pm.shapes
+                     if s.get("label") == "Tracker"]
+            if not racks:
+                QMessageBox.information(self, "没有支架框", "整册里都没有 Tracker（支架）框。")
+                return
+            longs = sorted(max(s["bbox"][2] - s["bbox"][0], s["bbox"][3] - s["bbox"][1])
+                           for s in racks)
+            # 按"长度差 ≤10%"聚类：差在 10% 以内的算同一类（不再等分位硬切）
+            groups = []
+            for L in longs:
+                if groups:
+                    m = sum(groups[-1]) / len(groups[-1])
+                    if abs(L - m) <= RACK_LEN_TOL * m:
+                        groups[-1].append(L)
+                        continue
+                groups.append([L])
+            k0 = len(groups)
+            txt, ok = QInputDialog.getText(
+                self, "支架串数分档",
+                "整册 %d 个支架框，按「长度差 ≤%d%% 算同一类」分成 %d 类。\n"
+                "按「短 → 长」填每类的串数（逗号分开）："
+                % (len(racks), int(RACK_LEN_TOL * 100), k0),
+                text=",".join(str(2 + i) for i in range(k0)))
+            if not ok or not txt.strip():
+                return
+            levels = sorted(int(x) for x in re.split(r"[^0-9]+", txt) if x.strip())
+            if not levels:
+                QMessageBox.warning(self, "填错了", "按 2,3 这种写法填。")
+                return
+            k = len(levels)
+            if k == k0:
+                means = [sum(g) / len(g) for g in groups]
+                cuts = [(means[i] + means[i + 1]) / 2.0 for i in range(k - 1)]
+            else:
+                # 你填的档数和自动分出来的类数不一致 -> 退回等分位切
+                cuts = [longs[min(len(longs) - 1, int(len(longs) * i / k))]
+                        for i in range(1, k)]
+            counts = {lv: 0 for lv in levels}
+            self.begin_change()
+            for pg, pm in pms.items():
+                hit = False
+                for s in pm.shapes:
+                    if s.get("label") != "Tracker":
+                        continue
+                    L = max(s["bbox"][2] - s["bbox"][0], s["bbox"][3] - s["bbox"][1])
+                    gi = 0
+                    for c in cuts:
+                        if L > c:
+                            gi += 1
+                    lv = levels[min(gi, k - 1)]
+                    raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
+                    raw["strings"] = lv
+                    s["raw"] = raw
+                    s["name"] = "%d串" % lv
+                    counts[lv] = counts.get(lv, 0) + 1
+                    hit = True
+                if hit:
+                    pm.dirty = True
+                    self.edited[pg] = pm
+            self.end_change()
+            self.mark_dirty()
+            for it in self.items:
+                it.update()
+            QMessageBox.information(
+                self, "支架分档完成",
+                "整册 %d 个支架框（%d 页），按长度分成 %d 档：\n%s\n\n"
+                "已写进 JSON（raw.strings），框上也标了串数。\n"
+                "（主程序要拿这个值来定类型，还需要我加 3 行读取代码）"
+                % (len(racks), len(pages), k,
+                   "\n".join("%d串：%d 个" % (lv, counts[lv]) for lv in levels)))
 
         def on_export_check(self):
             """导出核对表 CSV：每页每个 Node 框一行（现有名字 / 框内候选 / 建议）。"""

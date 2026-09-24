@@ -1862,11 +1862,337 @@ def plot_one_to_file(plot, device, out_file):
             raise first
 
 
-def plot_worker(layouts, device, media_canon, out_path, bus):
-    """把勾选的布局逐张打印成 PDF，再合并成一个多页 PDF；中间文件用完就删。"""
+# ---------------- 导出 PDF：质量 ----------------
+# ZWCAD / AutoCAD 的 PDF 打印驱动把「清晰度」写在绘图仪配置（.pc5）里：
+#   resolution_x / resolution_y                 = 矢量质量（dpi）
+#   raster_resolution_x / raster_resolution_y   = 图片（光栅）质量（dpi）
+# 这些键是打印时现读的，所以「调质量」的做法是：打印前把用户选的那份 .pc5 就地改一下，
+# 打完（不管成没成）按原样写回去。
+# ★ 为什么不另存一份新名字的绘图仪配置给 CAD 用：ZWCAD 在本会话里第一次问设备清单时
+#   就把清单缓存住了，之后新写进去的 .pc5 它认不到，ConfigName 设过去会被打回「无」
+#   （2025 实测）；而改了已有设备的 .pc5，下一次打印立刻生效（layerinclude 实测过）。
+PDF_QUALITY_DEFAULT = 0            # 默认「跟随设备」，不改用户原来的打印配置
+PDF_QUALITY_CHOICES = [("跟随设备（不改质量）", 0), ("标准 300 dpi", 300), ("清晰 600 dpi", 600),
+                       ("高 1200 dpi", 1200), ("超清 2400 dpi（文件较大）", 2400),
+                       ("极致 4800 dpi（文件很大）", 4800)]
+PDF_RASTER_CHOICES = [("跟矢量质量", -1), ("跟随设备（不改）", 0), ("图片 300 dpi", 300),
+                      ("图片 600 dpi", 600), ("图片 1200 dpi", 1200), ("图片 2400 dpi", 2400)]
+
+
+def plotter_dirs():
+    """CAD 的「绘图仪配置」目录（.pc5 放这些地方）；用户目录排在前面。"""
+    env = os.environ.get
+    pats = []
+    if env("APPDATA"):
+        pats += [os.path.join(env("APPDATA"), r"ZWSOFT\ZWCAD\*\*\Plotters"),
+                 os.path.join(env("APPDATA"), r"ZWSoft\ZWCAD\*\*\Plotters"),
+                 os.path.join(env("APPDATA"), r"Autodesk\AutoCAD *\R*\*\Plotters")]
+    if env("LOCALAPPDATA"):
+        pats += [os.path.join(env("LOCALAPPDATA"), r"Autodesk\AutoCAD *\R*\*\Plotters")]
+    for k in ("ProgramFiles", "ProgramFiles(x86)"):
+        if env(k):
+            pats += [os.path.join(env(k), r"ZWSOFT\ZWCAD *\UserDataCache\*\Plotters"),
+                     os.path.join(env(k), r"ZWSOFT\ZWCAD *\Plotters"),
+                     os.path.join(env(k), r"Autodesk\AutoCAD *\Plotters")]
+    out, seen = [], set()
+    for p in pats:
+        for d in glob.glob(p):
+            if os.path.isdir(d) and os.path.normcase(d) not in seen:
+                seen.add(os.path.normcase(d))
+                out.append(d)
+    return out
+
+
+def device_pc5(device):
+    """设备名（ZWCAD 报出来的名字带 .pc5 后缀）-> 它的绘图仪配置文件路径。"""
+    name = str(device or "").strip()
+    if not name:
+        return ""
+    cands = [name, name + ".pc5"]
+    if name.lower().endswith(".pc5"):
+        cands.append(name[:-4])
+    for d in plotter_dirs():
+        for c in cands:
+            p = os.path.join(d, c)
+            if os.path.isfile(p):
+                return p
+    return ""
+
+
+def _pc5_set(data, key, val):
+    """把 .pc5（bytes，别管它是什么编码）里 key=... 这行换成新值；没有就加到 [res_color_mem] 里。"""
+    k = str(key).encode("ascii")
+    pat = re.compile(rb"(?mi)^" + re.escape(k) + rb"=[^\r\n]*")
+    line = k + b"=" + str(val).encode("ascii")
+    if pat.search(data):
+        return pat.sub(line, data, count=1)
+    sec = re.compile(rb"(?mi)^\[res_color_mem\][^\r\n]*\r?\n")
+    m = sec.search(data)
+    if not m:
+        return data + b"\r\n" + line + b"\r\n"
+    return data[:m.end()] + line + b"\r\n" + data[m.end():]
+
+
+def pc5_set_quality(data, quality, raster=-1, auto_open=0):
+    """按界面选的「质量」改 .pc5：矢量 dpi / 图片 dpi / 打完要不要驱动自己打开文件。"""
+    out = data
+    q = int(quality or 0)
+    if q > 0:
+        out = _pc5_set(out, "resolution_x", q)
+        out = _pc5_set(out, "resolution_y", q)
+    ras = q if int(raster) < 0 else int(raster or 0)      # -1 = 跟矢量质量
+    if ras > 0:
+        out = _pc5_set(out, "raster_resolution_x", ras)
+        out = _pc5_set(out, "raster_resolution_y", ras)
+    # 驱动自己开文件会打开我们中途用的临时文件，一律关掉；要打开由我们合成完再开
+    return _pc5_set(out, "autoopenfile", 1 if auto_open else 0)
+
+
+class Pc5Quality(object):
+    """打印期间把绘图仪配置里的质量改掉，打完自动改回来。"""
+
+    def __init__(self, device, quality, raster=-1):
+        self.device = str(device or "")
+        self.path = device_pc5(device)
+        self.quality = int(quality or 0)
+        self.raster = int(raster if raster is not None else -1)
+        self.orig = None
+        self.done = False
+        self.backup = ""
+
+    def wanted(self):
+        return self.quality > 0 or self.raster > 0
+
+    def apply(self):
+        """改配置。返回 (改没改成, 说明)，说明是要写进结果提示里的那一句。
+
+        就算质量选的是「跟随设备」也要碰一下这份配置：顺手把「打完自动打开文件」关掉
+        —— 不然 CAD 每打一页就弹一个 PDF 阅读器（打的是我们中途那些临时页）。
+        """
+        if not self.path:
+            if not self.wanted():
+                return False, ""
+            return False, ("没找到设备「%s」的绘图仪配置（.pc5），质量这次按设备自带设置打印"
+                           % self.device)
+        try:
+            with open(self.path, "rb") as f:
+                self.orig = f.read()
+        except Exception as e:
+            if not self.wanted():
+                return False, ""
+            return False, "读不了绘图仪配置 %s：%s" % (self.path, e)
+        if not re.search(rb"(?mi)^\[res_color_mem\]", self.orig):
+            if not self.wanted():
+                return False, ""
+            return False, ("%s 不是能改质量的绘图仪配置，质量这次按设备自带设置打印"
+                           % os.path.basename(self.path))
+        data = pc5_set_quality(self.orig, self.quality, self.raster, auto_open=0)
+        if data == self.orig:                     # 本来就一样，不用改
+            return False, ""
+        try:
+            with open(self.path, "wb") as f:
+                f.write(data)
+        except Exception as e:
+            if not self.wanted():
+                return False, ""
+            return False, ("改不了绘图仪配置 %s（%s），质量这次没生效" % (self.path, e))
+        self.backup = _pc5_backup(self.orig, self.path)
+        if not self.wanted():
+            return True, ""
+        return True, ("质量 %s（打印期间临时改 %s，打完已改回）"
+                      % (quality_text(self.quality, self.raster), os.path.basename(self.path)))
+
+    def restore(self):
+        """把配置改回打印前那样；改不回去返回 False（原文在 %TEMP% 里有一份）。"""
+        if self.orig is None or self.done:
+            return True
+        self.done = True
+        try:
+            with open(self.path, "rb") as f:
+                if f.read() == self.orig:
+                    return True
+            with open(self.path, "wb") as f:
+                f.write(self.orig)
+            return True
+        except Exception:
+            return False
+
+
+def _pc5_backup(data, path):
+    """改之前先把原文另存一份到 %TEMP%，万一半路崩了还能自己找回来。"""
+    try:
+        d = os.path.join(tempfile.gettempdir(), "MAP-CAD-绘图仪配置备份")
+        if not os.path.isdir(d):
+            os.makedirs(d)
+        dst = os.path.join(d, os.path.basename(path))
+        with open(dst, "wb") as f:
+            f.write(data)
+        return dst
+    except Exception:
+        return ""
+
+
+def quality_text(quality, raster=-1):
+    """界面上选的质量 -> 一句话（写进提示和日志）。"""
+    q = int(quality or 0)
+    r = int(raster if raster is not None else -1)
+    if q <= 0 and r <= 0:
+        return "矢量/图片都跟随设备"
+    if r < 0:
+        r = q
+    return "、".join(["矢量 %d dpi" % q if q > 0 else "矢量跟设备",
+                      "图片 %d dpi" % r if r > 0 else "图片跟设备"])
+
+
+def device_pc5_quality(device):
+    """这个设备配置里现在的质量（直接读 .pc5）：返回 (矢量 dpi, 图片 dpi)，读不出给 0。"""
+    path = device_pc5(device)
+    if not path:
+        return 0, 0
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except Exception:
+        return 0, 0
+
+    def num(key):
+        m = re.search(rb"(?mi)^" + re.escape(key.encode("ascii")) + rb"=(\d+)", data)
+        return int(m.group(1)) if m else 0
+
+    v = num("resolution_x")
+    return v, (num("raster_resolution_x") or v)
+
+
+# ---------------- 导出 PDF：一次打一批 ----------------
+def set_plot_layouts(plot, names):
+    """告诉 CAD「这次要打这几个布局」（AcadPlot.SetLayoutsToPlot）。
+    接口不存在 / 传参不认就返回 False，调用方自己决定怎么办。
+
+    实测 ZWCAD 2025：直接传 Python 列表会抛「类型不对」，一定要包成 BSTR 数组；
+    所以先试 BSTR 数组，不认再退回普通列表。"""
+    want = [str(x) for x in (names or []) if str(x)]
+    if not want:
+        return False
+    try:
+        import pythoncom
+        from win32com.client import VARIANT
+        plot.SetLayoutsToPlot(VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_BSTR, want))
+        return True
+    except Exception:
+        pass
+    try:
+        plot.SetLayoutsToPlot(want)
+        return True
+    except Exception:
+        return False
+
+
+def set_layout_device(lay, device, raise_=True):
+    """给布局换打印设备（设备名照 CAD 清单报的原样传就行，ZWCAD 报的名字带 .pc5）。
+
+    ★ 别拿「加/去 .pc5」当兜底：实测 ZWCAD 里给它一个不认的名字，它会把布局的打印设备
+      直接清成「无」，比失败还糟；所以只按给的名字设一次，不行就如实报错。
+    """
+    try:
+        lay.ConfigName = str(device)
+        return True
+    except Exception as e:
+        if raise_:
+            raise RuntimeError("切换到打印设备「%s」失败：%s" % (device, e))
+        return False
+
+
+def pdf_page_count(path):
+    """PDF 页数；读不出来返回 -1。"""
+    try:
+        return len(PdfReader(path).pages)
+    except Exception:
+        return -1
+
+
+def pdf_page_count_wait(path, tries=8, gap=0.4):
+    """等 PDF 落盘再读页数（驱动写文件到能读之间偶尔差一点时间）；还是没有就是 0。"""
+    for i in range(max(1, tries)):
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            n = pdf_page_count(path)
+            if n > 0:
+                return n
+        if i < tries - 1:
+            time.sleep(gap)
+    return 0
+
+
+def new_tmpdir(prefix, prefer=""):
+    """建个临时目录，并确认它真的写得进去（个别环境 mkdtemp 出来的目录写不了）。"""
+    cands = []
+    try:
+        cands.append(tempfile.mkdtemp(prefix=prefix))
+    except Exception:
+        pass
+    for base in (tempfile.gettempdir(), prefer):
+        if base:
+            cands.append(os.path.join(base, "%s%d" % (prefix, int(time.time() * 1000))))
+    for d in cands:
+        try:
+            if not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".w_probe")
+            with open(probe, "wb") as f:
+                f.write(b"x")
+            os.remove(probe)
+            return d
+        except Exception:
+            shutil.rmtree(d, ignore_errors=True)
+            continue
+    raise RuntimeError("建不了临时目录（%s）" % "；".join(cands[:3]))
+
+
+def pdf_files_for(folder, layouts, dwg_stem=""):
+    """CAD 一次打多个布局时，是按「图纸名_布局名.pdf」一个布局存一个文件。
+    按布局顺序把它们挑出来（先按图纸名精确找，再按后缀找，一个文件只配一个布局）；
+    有一个对不上就返回 None（调用方会退回逐张打印）。"""
+    try:
+        files = [f for f in os.listdir(folder) if f.lower().endswith(".pdf")]
+    except Exception:
+        return None
+    used = set()
+
+    def pick(nm):
+        nm = str(nm)
+        if dwg_stem:                     # 图纸名_布局名.pdf（ZWCAD 的命名）
+            exact = ("%s_%s.pdf" % (dwg_stem, nm)).lower()
+            for f in files:
+                if f.lower() == exact and f not in used:
+                    return f
+        cands = [f for f in files if f not in used and f[:-4].endswith("_" + nm)]
+        if not cands:
+            return None
+        return sorted(cands, key=len)[0]      # 前缀最短的最像（避开 1 和 x1 这种）
+
+    out = []
+    for nm in layouts:
+        f = pick(nm)
+        if not f:
+            return None
+        used.add(f)
+        out.append(os.path.join(folder, f))
+    return out
+
+
+def plot_worker(layouts, device, media_canon, out_path, bus,
+                quality=0, raster=-1, open_after=False):
+    """把勾选的布局一次交给 CAD 打印，再合成一份多页 PDF。
+
+    打印是一次打完所有页面：SetLayoutsToPlot(整份布局清单) + 一次 PlotToFile，
+    不再一页一次地切换布局反复调打印。
+    （ZWCAD 的 PDF 驱动对多布局是「一个布局存一个文件、按 图纸名_布局名.pdf 存」，
+    这跟它自己的批量打印工具一样 —— 工具里也是打完再合并成一份多页 PDF。）
+    只有这个 CAD 版本不认批量接口时，才退回逐张打印（结果里会写明）。
+    """
     pythoncom = None
     tmpdir = None
     notes = []
+    qual = Pc5Quality(device, quality, raster)
     try:
         import pythoncom
         import win32com.client as win32
@@ -1886,27 +2212,52 @@ def plot_worker(layouts, device, media_canon, out_path, bus):
         except Exception:
             pass
         try:
+            plot.BackgroundPlot = False         # 批量打印要等它打完，别让它后台跑
+        except Exception:
+            pass
+        try:
             old_tab = doc.GetVariable("CTAB")
         except Exception:
             old_tab = None
-        # 该设备的纸型清单（"随布局页面设置" 时用来找同规格纸型）
-        dev_media = [canon for _lab, canon in cad_plot_media(doc, device)]
+        try:
+            dwg_stem = os.path.splitext(os.path.basename(str(doc.Name or "")))[0]
+        except Exception:
+            dwg_stem = ""
 
-        tmpdir = tempfile.mkdtemp(prefix="vcad_pdf_")
+        # 质量：打印期间把这份绘图仪配置里的 dpi 改掉，打完就改回来
+        _ok_q, why = qual.apply()
+        if why:
+            notes.append(why)
+
+        media_of = {}
+
+        def dev_medias(d):
+            """某设备的纸型清单（"随布局页面设置" 时用来找同规格纸型）。"""
+            if d not in media_of:
+                try:
+                    media_of[d] = [canon for _lab, canon in cad_plot_media(doc, d)]
+                except Exception:
+                    media_of[d] = []
+            return media_of[d]
+
         total = len(layouts)
-        outs = []
-        for i, name in enumerate(layouts, 1):
-            bus.plot_prog.emit(i - 1, total)
+
+        # 先把要打的布局逐个设好设备 / 纸型（都不打印），再一次性提交给 CAD
+        old_setup = []
+        for name in layouts:
             doc.SetVariable("CTAB", name)
             lay = doc.ActiveLayout
+            try:
+                old_dev = str(lay.ConfigName or "")
+            except Exception:
+                old_dev = ""
             try:
                 old_media = str(lay.CanonicalMediaName or "")
             except Exception:
                 old_media = ""
-            try:
-                lay.ConfigName = device
-            except Exception as e:
-                raise RuntimeError("切换到打印设备「%s」失败：%s" % (device, e))
+            old_setup.append((name, old_dev, old_media))
+            set_layout_device(lay, device)           # 失败就抛出来（带设备名）
+            dev_media = dev_medias(device)
             want = media_canon or ""
             if not want and old_media:
                 if old_media in dev_media:
@@ -1920,20 +2271,90 @@ def plot_worker(layouts, device, media_canon, out_path, bus):
                     lay.CanonicalMediaName = want
                 except Exception as e:
                     raise RuntimeError("布局「%s」设置纸型失败（%s）：%s" % (name, want, e))
-            out_i = os.path.join(tmpdir, "%04d.pdf" % i)
-            plot_one_to_file(plot, device, out_i)
-            if not os.path.exists(out_i) or os.path.getsize(out_i) <= 0:
-                raise RuntimeError("布局「%s」没有生成 PDF（设备 %s）。" % (name, device))
-            outs.append(out_i)
-            bus.plot_prog.emit(i, total)
+
+        tmpdir = new_tmpdir("vcad_pdf_", prefer=os.path.dirname(os.path.abspath(out_path)))
+        out_pdf = os.path.join(tmpdir, "out.pdf")
+        bus.plot_prog.emit(0, total)
+
+        # ① 一次把这一批全打了（CAD 的批量打印）
+        parts = None
+        if total > 1 and set_plot_layouts(plot, layouts):
+            try:
+                plot_one_to_file(plot, device, out_pdf)
+                if os.path.exists(out_pdf) and os.path.getsize(out_pdf) > 0:
+                    # 这个 CAD 一次就给了一份多页 PDF，直接用
+                    pages = pdf_page_count(out_pdf)
+                    if pages == total:
+                        parts = [out_pdf]
+                    else:
+                        notes.append("一次打一批出来 %d 页（要 %d 页），这次改用逐张打印后合并"
+                                     % (pages, total))
+                else:
+                    # ZWCAD 的 PDF 驱动是「一个布局存一个」：图纸名_布局名.pdf
+                    got = pdf_files_for(tmpdir, layouts, dwg_stem)
+                    if not got:
+                        notes.append("一次打一批没看到打出来的 PDF，这次改用逐张打印后合并")
+                    else:
+                        pages = sum(max(0, pdf_page_count_wait(f)) for f in got)
+                        if pages == total:
+                            parts = got
+                        else:
+                            notes.append("一次打一批出来 %d 页（要 %d 页），这次改用逐张打印后合并"
+                                         % (pages, total))
+            except Exception as e:
+                notes.append("一次打一批失败（%s），这次改用逐张打印后合并" % e)
+        elif total > 1:
+            notes.append("这张 CAD 不支持「一次打多个布局」（AcadPlot.SetLayoutsToPlot），"
+                         "这次退回逐张打印后合并")
+
+        if parts:
+            bus.plot_prog.emit(total, total)
+        else:
+            # ② 退回逐张打（每次只让它打当前这一个布局），再合并 —— 保证功能可用
+            parts = []
+            for i, name in enumerate(layouts, 1):
+                bus.plot_prog.emit(i - 1, total)
+                doc.SetVariable("CTAB", name)
+                try:
+                    set_plot_layouts(plot, [name])
+                except Exception:
+                    pass
+                out_i = os.path.join(tmpdir, "%04d.pdf" % i)
+                plot_one_to_file(plot, device, out_i)
+                if not os.path.exists(out_i) or os.path.getsize(out_i) <= 0:
+                    raise RuntimeError("布局「%s」没有生成 PDF（设备 %s）。" % (name, device))
+                n_i = pdf_page_count_wait(out_i, tries=4, gap=0.3)
+                if n_i != 1:      # 逐张打就该是一页；不是一页说明「只打当前布局」没生效
+                    raise RuntimeError("布局「%s」一次打出来 %d 页（应该 1 页），先停在这里。"
+                                       % (name, n_i))
+                parts.append(out_i)
+                bus.plot_prog.emit(i, total)
 
         writer = PdfWriter()
-        for p in outs:
+        for p in parts:
             writer.append(p)
-        part = out_path + ".part"
-        with open(part, "wb") as f:
+        out_merge = os.path.join(tmpdir, "merge.pdf")
+        with open(out_merge, "wb") as f:
             writer.write(f)
-        os.replace(part, out_path)
+
+        if not os.path.exists(out_merge) or os.path.getsize(out_merge) <= 0:
+            raise RuntimeError("没有生成 PDF（设备 %s）。" % device)
+        try:
+            os.replace(out_merge, out_path)
+        except OSError:
+            shutil.move(out_merge, out_path)
+
+        # 布局的打印设备 / 纸型改回原来的（导入时改的东西不留在图上）
+        for name, old_dev, old_media in old_setup:
+            try:
+                doc.SetVariable("CTAB", name)
+                lay = doc.ActiveLayout
+                if old_dev:
+                    set_layout_device(lay, old_dev, raise_=False)
+                if old_media:
+                    lay.CanonicalMediaName = old_media
+            except Exception:
+                pass
         if old_tab:
             try:
                 doc.SetVariable("CTAB", old_tab)
@@ -1944,9 +2365,13 @@ def plot_worker(layouts, device, media_canon, out_path, bus):
         if "pythoncom" in msg or "win32com" in msg or "pywintypes" in msg:
             msg = ("连接 CAD 需要 pywin32（pythoncom）：%s\n"
                    "打包版要用装了 pywin32 的 Python 重新打包。" % msg)
+        if not qual.restore():
+            msg += "\n（绘图仪配置没改回去，原文在 %s）" % (qual.backup or "（没存成）")
         bus.plot_result.emit(False, msg)
         return
     finally:
+        if not qual.restore():
+            notes.append("绘图仪配置没改回去，原文在 %s" % (qual.backup or "（没存成）"))
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
         if pythoncom is not None:
@@ -1954,6 +2379,11 @@ def plot_worker(layouts, device, media_canon, out_path, bus):
                 pythoncom.CoUninitialize()
             except Exception:
                 pass
+    if open_after:
+        try:
+            os.startfile(out_path)
+        except Exception:
+            notes.append("（自动打开 PDF 失败，文件已经导出）")
     if notes:
         bus.plot_result.emit(True, "%s\n（%s）" % (out_path, "；".join(notes)))
     else:
@@ -2356,15 +2786,18 @@ class QuadPreview(QWidget):
 
 
 class PrintDialog(QDialog):
-    """导出 PDF：勾选要打印的布局 + 选打印设备 / 纸型 + 选输出位置。"""
+    """导出 PDF：勾选要打印的布局 + 选打印设备 / 纸型 / 质量 + 选输出位置。"""
 
     def __init__(self, parent, layouts, prechecked, devices, default_device,
-                 media_provider, out_dir, file_name):
+                 media_provider, out_dir, file_name, prefs=None):
         super().__init__(parent)
         self.setWindowTitle("导出 PDF")
         self.setMinimumWidth(580)
         self._media_provider = media_provider
         self._media_cache = {}
+        self._media_note = ""
+        self._dpi_cache = {}
+        prefs = prefs or {}
         self.data = {}
 
         v = QVBoxLayout(self)
@@ -2374,7 +2807,7 @@ class PrintDialog(QDialog):
         title = QLabel("导出 PDF")
         title.setObjectName("PageTitle")
         v.addWidget(title)
-        sub = QLabel("勾选要打印的布局；会按列表顺序逐张打印，最后合成一个多页 PDF。")
+        sub = QLabel("勾选要打印的布局；一次把选中的布局打成一份多页 PDF（质量可调）。")
         sub.setObjectName("Hint")
         sub.setWordWrap(True)
         v.addWidget(sub)
@@ -2429,6 +2862,23 @@ class PrintDialog(QDialog):
         g.addWidget(QLabel("文件名"), 3, 0)
         self.name = QLineEdit(file_name or "")
         g.addWidget(self.name, 3, 1)
+
+        # ---- 质量（PDF 清晰度）：打印期间临时改打印设备配置的 dpi，打完自动改回 ----
+        g.addWidget(QLabel("质量(线条)"), 4, 0)
+        self.qual = NoWheelCombo()
+        for lab, val in PDF_QUALITY_CHOICES:
+            self.qual.addItem(lab, val)
+        self._select_data(self.qual, prefs.get("quality", PDF_QUALITY_DEFAULT))
+        g.addWidget(self.qual, 4, 1)
+        g.addWidget(QLabel("质量(图片)"), 5, 0)
+        self.raster = NoWheelCombo()
+        for lab, val in PDF_RASTER_CHOICES:
+            self.raster.addItem(lab, val)
+        self._select_data(self.raster, prefs.get("raster", -1))
+        g.addWidget(self.raster, 5, 1)
+        self.open_after = QCheckBox("打完后打开 PDF")
+        self.open_after.setChecked(bool(prefs.get("open_after")))
+        g.addWidget(self.open_after, 6, 1)
         v.addLayout(g)
 
         self.hint = QLabel("")
@@ -2453,10 +2903,18 @@ class PrintDialog(QDialog):
         self.dir.textChanged.connect(self._sync_hint)
         self.name.textChanged.connect(self._sync_hint)
         self.dev.currentIndexChanged.connect(self._reload_media)
+        self.qual.currentIndexChanged.connect(self._sync_hint)
+        self.raster.currentIndexChanged.connect(self._sync_hint)
         self._reload_media()
         self._sync_hint()
 
     # ---- 内部 ----
+    def _select_data(self, combo, val):
+        """按值选一项（存的是数字，界面上显示的是文字），没有就保持第一项。"""
+        idx = combo.findData(val)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+
     def _check_all(self, state):
         for i in range(self.list.count()):
             self.list.item(i).setCheckState(Qt.Checked if state else Qt.Unchecked)
@@ -2480,7 +2938,26 @@ class PrintDialog(QDialog):
         self.count_hint.setText("已勾选 %d 个布局" % n)
         d = (self.dir.text() or "").strip()
         where = os.path.join(d, self.out_name()) if d else self.out_name()
-        self.hint.setText("输出：%s（先逐张打印到临时文件，合并成功后临时文件自动删掉）" % where)
+        q = int(self.qual.currentData() or 0)
+        rr = self.raster.currentData()
+        r = int(rr if rr is not None else -1)
+        txt = ("输出：%s（一次把这 %d 个布局交给 CAD 打完，再合成一份多页 PDF）"
+               % (where, n))
+        if q > 0 or r > 0:
+            txt += "\n质量：%s（打印期间临时改打印设备的配置，打完自动改回）" % quality_text(q, r)
+        else:
+            dev = self.dev.currentText()
+            if dev not in self._dpi_cache:
+                self._dpi_cache[dev] = device_pc5_quality(dev)
+            vdpi, rdpi = self._dpi_cache[dev]
+            if vdpi:
+                txt += ("\n质量：跟随设备（%s 现在矢量 %d dpi、图片 %d dpi）—— 想改就在上面选"
+                        % (dev, vdpi, rdpi))
+            else:
+                txt += "\n质量：跟随设备（这台设备不是 CAD 的绘图仪配置，质量改不了）"
+        if self._media_note:
+            txt += "\n" + self._media_note
+        self.hint.setText(txt)
         self.ok.setEnabled(n > 0)
 
     def _pick_dir(self):
@@ -2510,9 +2987,9 @@ class PrintDialog(QDialog):
             idx = self.media.findData(keep)
             if idx >= 0:
                 self.media.setCurrentIndex(idx)
-        if self.media.count() <= 1:
-            self.hint.setText(self.hint.text() +
-                              "\n（没读到这个设备的纸型清单，将按图纸原来的纸型打印）")
+        self._media_note = ("（没读到这个设备的纸型清单，将按图纸原来的纸型打印）"
+                            if self.media.count() <= 1 else "")
+        self._sync_hint()
 
     def _accept(self):
         if not self.checked_layouts():
@@ -2533,6 +3010,9 @@ class PrintDialog(QDialog):
         self.data = {"layouts": self.checked_layouts(),
                      "device": self.dev.currentText(),
                      "media": self.media.currentData() or "",
+                     "quality": int(self.qual.currentData() or 0),
+                     "raster": int(self.raster.currentData() if self.raster.currentData() is not None else -1),
+                     "open_after": bool(self.open_after.isChecked()),
                      "out_path": os.path.join(d, self.out_name())}
         self.accept()
 
@@ -3506,7 +3986,7 @@ class MainWindow(QMainWindow):
 
     # ---------------- 导出 PDF ----------------
     def on_export_pdf(self):
-        """点「导出 PDF」：列出当前图纸的布局，勾选后逐张打印并合并成一个 PDF。"""
+        """点「导出 PDF」：列出当前图纸的布局，勾选后一次打成一份多页 PDF。"""
         cfg = self.cfg()
         acad, msg = cad_connect()
         if not acad:
@@ -3552,31 +4032,46 @@ class MainWindow(QMainWindow):
             return cad_plot_media(doc, dev)
 
         dlg = PrintDialog(self, layouts, self._generated_layouts, devices, default_dev,
-                          media_provider, out_dir, fname)
+                          media_provider, out_dir, fname, self._print_prefs)
         if dlg.exec() != QDialog.Accepted:
             return
         data = dlg.data
         self._print_prefs["device"] = data["device"]
         self._print_prefs["dir"] = os.path.dirname(data["out_path"])
+        self._print_prefs["quality"] = data["quality"]
+        self._print_prefs["raster"] = data["raster"]
+        self._print_prefs["open_after"] = data["open_after"]
         self.pdf_btn.setEnabled(False)
         self.pdf_btn.setText("正在导出…")
         self.content_stack.setCurrentIndex(1)
         self.status_label.setText("正在导出 PDF…")
-        self.page_label.setText("逐张打印布局，全部打完再合并成一个 PDF")
+        self.page_label.setText("一次打印全部 %d 个布局（质量 %s）"
+                                % (len(data["layouts"]),
+                                   quality_text(data["quality"], data["raster"])))
         self.pbar.setValue(0)
-        self.log_msg("导出 PDF：设备 %s；布局 %d 个 → %s"
-                     % (data["device"], len(data["layouts"]), data["out_path"]))
+        self.log_msg("导出 PDF：设备 %s；质量 %s；布局 %d 个一次打 → %s"
+                     % (data["device"], quality_text(data["quality"], data["raster"]),
+                        len(data["layouts"]), data["out_path"]))
         threading.Thread(target=plot_worker,
                          args=(data["layouts"], data["device"], data["media"],
-                               data["out_path"], self.bus), daemon=True).start()
+                               data["out_path"], self.bus),
+                         kwargs={"quality": data["quality"], "raster": data["raster"],
+                                 "open_after": data["open_after"]},
+                         daemon=True).start()
 
     def on_plot_prog(self, done_n, total):
         self.status_label.setText("正在导出 PDF %d / %d" % (done_n, total))
-        self.page_label.setText("正在打印布局 %d / %d（打完再合并）" % (done_n, total))
-        if total:
-            self.pbar.setValue(int(round(min(1.0, done_n / float(total)) * 100)))
+        if not total:
+            return
+        if done_n <= 0 and total > 1:
+            self.pbar.setRange(0, 0)              # 一次打一批：先转圈，等 CAD 出结果
+            return
+        if self.pbar.maximum() == 0:
+            self.pbar.setRange(0, 100)
+        self.pbar.setValue(int(round(min(1.0, done_n / float(total)) * 100)))
 
     def on_plot_result(self, ok, msg):
+        self.pbar.setRange(0, 100)
         self.pdf_btn.setEnabled(True)
         self.pdf_btn.setText("再次导出…" if ok else "导出 PDF")
         if ok:
@@ -3912,7 +4407,7 @@ class MainWindow(QMainWindow):
                 self.finish_title.setText("执行完成，共 %d 个布局 —— 请选择保存位置"
                                           % (self.total or self.done_n or 0))
                 self.finish_hint.setText("「下载」= 连到 CAD 用 SAVEAS 存 DWG；"
-                                         "「导出 PDF」= 勾选布局打印成 PDF 并合并成一个文件"
+                                         "「导出 PDF」= 勾选布局，一次打成一份多页 PDF（质量可调）"
                                          "（此时 STR 号也已画好，会一起进去）")
         elif hard_err:
             self.run_status = "出错：" + (txt.strip()[-200:])
