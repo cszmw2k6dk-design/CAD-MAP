@@ -30,7 +30,8 @@ try:
                              order_demo_cells as _lr_demo_cells,
                              quad_note as _lr_quad_note,
                              rack_types_text as _lr_rack_text,
-                             set_rack_len_hints as _lr_set_hints)
+                             set_rack_len_hints as _lr_set_hints,
+                             lbd_mark_boxes as _lr_mark_boxes)
 except Exception:                    # 模块缺失时不阻塞主程序
     _lr_candidates = _lr_json_kind = _lr_extract_debug = None
     _lr_write_regions = _lr_write_regions_sheets = None
@@ -40,9 +41,10 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _LR_ORDER_TEXT = _lr_demo_cells = None
     _lr_rack_lines = _lr_page_map = None
     _lr_rack_types = _lr_rack_text = _lr_set_hints = None
+    _lr_mark_boxes = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.54"
+APP_VERSION = "2.55"
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
@@ -65,6 +67,7 @@ FIELDS = [
     ("strQuadIII", "象限 III 左下 的 STR 顺序"),
     ("strQuadIV", "象限 IV 右下 的 STR 顺序"),
     ("rackAlign", "STR 号自动对齐"),
+    ("rackAvoid", "避开 LBD 标号(按识别结果)"),
     ("rackTypes", "支架类型"), ("rackSplit", "拆不拆"), ("rackStringLen", "单串长度(FT)"),
     ("strBgOn", "STR背景填充"), ("strBgColor", "STR背景色"), ("strBgGap", "STR遮挡间隙"),
     ("strTextColor", "STR 标签字色"),
@@ -94,6 +97,7 @@ DEFAULTS = {
     "strQuadIII": (_LR_QUAD_DEFAULTS or {}).get("III", "3"),
     "strQuadIV": (_LR_QUAD_DEFAULTS or {}).get("IV", "1"),
     "rackAlign": "1",
+    "rackAvoid": "1",
     "rackTypes": "", "rackSplit": "不拆", "rackStringLen": "",
     "rackAuto": True, "rackSplitByType": "",
     "strBgOn": "1", "strBgColor": "2", "strTextColor": "7", "strBgGap": "1.0",
@@ -172,6 +176,7 @@ SECTIONS = [
             ("strHeight", "STR 字高(typical宽倍数)"),
             ("strOrder", "STR 编号顺序(8 种)"),
             ("rackAlign", "STR 号自动对齐"),
+            ("rackAvoid", "避开底图 LBD 标号"),
             ("strBgOn", "STR背景填充"),
             ("strBgColor", "STR背景色"),
             ("strTextColor", "STR 标签字色"),
@@ -433,6 +438,14 @@ def write_auto_ini(cfg, ini_path):
             f.write("%s=%s\n" % (k, 1 if v is True else (0 if v is False else v)))
 
 
+def avoid_note(detail):
+    """日志里那句"避开了多少处 LBD 标号"（位置来自识别结果 JSON 里的 label_pos）。"""
+    if not detail:
+        return ""
+    n = int(detail.get("avoid") or 0)
+    return ("；已按识别结果避开底图 LBD 标号 %d 处" % n) if n else ""
+
+
 def build_extract_file(cfg, out_path, prog_path=None):
     """生成 CAD 读的标签提取文件（P/L 行）。返回 (ok, 说明, 明细)。
 
@@ -478,12 +491,31 @@ def build_extract_file(cfg, out_path, prog_path=None):
             pgmap = None
     detail["pages"] = len(pgmap) if pgmap else 0
 
-    # 原先这里会给 STR 号算「避开底图 LBD 标号」的障碍框（读 PDF 文字层），
-    # 那套代码已随文字层识别一起删掉。CAD 里画的标签仍然由标签自己上下让位
-    # （真实包围盒判定，见 PdfLayout_auto.lsp 的 PdfLayout_LbdPlace）。
-    # 传给 lbd_regions 的 avoid / avoid_pad 用默认值（None / 0.0），即不额外避让。
+    # STR 号要避开的障碍（带背景填充的号压上去会把编号盖掉）：底图上印着的 LBD 标号。
+    # 位置来自识别结果 JSON 里每根 Node 的 raw.label_pos（标注工具从文字层/OCR 抓的，
+    # 实测就是标号框中心，见 lbd_regions.lbd_mark_boxes），不再翻 PDF 文字层。
+    # CAD 里画的 LBD 标签仍然由标签自己上下让位（PdfLayout_auto.lsp 的 PdfLayout_LbdPlace）。
     avoid = None
-    _avoid_pad = 0.0
+    _avoid_pad = 0.0        # 关掉避让时也要有值：下面几条输出路径都会用到它
+    detail["avoid"] = 0
+    if (kind == "debug" and _lr_mark_boxes is not None
+            and str(cfg.get("rackAvoid", "1")).strip() not in ("0", "", "关", "否", "off", "false", "False")):
+        try:
+            avoid = _lr_mark_boxes(jp, page_map=pgmap) or None
+        except Exception:
+            avoid = None
+        detail["avoid"] = sum(len(v) for v in (avoid or {}).values())
+        # STR 号是"文字 + 背景填充(白底)"画出来的：白底比文字框大一圈，
+        # 避让时不算白底的话，白底照样会盖住底图上的 LBD 标号。
+        # 外扩量按填充间隙的一半估（实测口径；关掉背景填充就不外扩）。
+        try:
+            _bg_on = str(cfg.get("strBgOn", "1")).strip() not in (
+                "0", "", "关", "否", "off", "false", "False")
+            _gap = float(str(cfg.get("strBgGap", "1.0")).strip() or 1.0) if _bg_on else 0.0
+        except Exception:
+            _gap = 1.0
+        _avoid_pad = min(1.0, max(0.0, _gap)) * 0.5
+        detail["avoid_pad"] = round(_avoid_pad, 3)
 
     # 1) 标注/编号结果：LBD 名称 + 支架号都在 JSON 里
     if kind == "anylabeling":
@@ -516,6 +548,7 @@ def build_extract_file(cfg, out_path, prog_path=None):
                 _tip += "；" + detail["split"]
             if _lr_quad_note:
                 _tip += _lr_quad_note(detail["quad"])
+            _tip += avoid_note(detail)
             return True, ("识别结果：LBD %d 个（位置=识别到的 LBD 区域框中心）"
                           " + 支架号 %d 个（按 LBD 分组编号：默认行优先，选了象限规则就按象限走）%s"
                           % (r["lbd"], r["str"], _tip)), detail
@@ -566,6 +599,7 @@ def build_extract_file(cfg, out_path, prog_path=None):
             _stip = ("；" + detail["split"]) if detail.get("split") else ""
             if _lr_quad_note:
                 _stip += _lr_quad_note(detail["quad"])
+            _stip += avoid_note(detail)
             return True, ("识别结果 JSON：%d 页、LBD %d 个（按区域中心）、支架号 %d 个"
                           "（位置按识别到的 LBD 区域中心放）%s"
                           % (r["pages"], r["lbd"], r["str"], _stip)), detail
@@ -589,6 +623,7 @@ def build_extract_file(cfg, out_path, prog_path=None):
         tip += "；" + detail["split"]
     if _lr_quad_note:
         tip += _lr_quad_note(detail.get("quad"))
+    tip += avoid_note(detail)
     return True, ("标签 %d 行：LBD %d 个（来自识别 / 标注结果 JSON）"
                   " + 支架号 %d 个（按 LBD 分组编号：默认行优先，选了象限规则就按象限走）%s"
                   % (detail["lbd"] + detail["str"], detail["lbd"], detail["str"], tip)), detail
@@ -2976,7 +3011,7 @@ class MainWindow(QMainWindow):
                     cb.currentIndexChanged.connect(lambda *_: self.on_refresh_quad_preview())
                     form.addWidget(cb, r, 1)
 
-                elif key in ("strBgOn", "rackAlign"):
+                elif key in ("strBgOn", "rackAlign", "rackAvoid"):
                     cb = NoWheelCombo()
                     cb.setObjectName("Field")
                     cb.setMinimumWidth(320)

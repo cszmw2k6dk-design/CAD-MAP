@@ -1295,6 +1295,102 @@ def lbd_label_boxes(json_path, scale=1.4, lens=None, page_map=None):
     return out
 
 
+def lbd_mark_boxes(json_path, page_map=None, thick_scale=1.3, adv=0.55, pad=0.35,
+                   fallback_ratio=0.35):
+    """底图上印着的 LBD 标号框 -> {图纸页号: [(fx1, fy1, fx2, fy2), ...]}（归一化、fy 从下往上）。
+
+    用途和老的 pdf_lbd_boxes()（读 PDF 文字层）一样：给 STR 号 / CAD 摆 LBD 标签当避让障碍。
+    数据全部来自识别结果 JSON：
+      中心 = 每根 Node 检测自带的 raw.label_pos（标注工具从 PDF 文字层/OCR 抓到的标号位置，
+             页像素）。实测它就是印刷标号框的中心：37/37 落在框内，离框中心 dx≈2.5px、dy≈9px
+             （框本体 27x198 px 那种量级）。
+      大小 = 厚 thick_scale x STR 号字高、长 = 字高 x (adv x 名字字数 + pad)，方向跟区域长短边
+              一致（竖长区域里的标号是竖排的）。实测（37 个样本，对照渲染图上量出来的真标号框）：
+              1.0 倍字高只盖住 88%（几像素的定位偏差就漏），1.3 倍 + 0.55 字距盖住 100%，
+              框面积只有真标号的 1.5 倍 —— 比按「区域中带」估（5.9 倍）小得多，要挪的号也少得多。
+
+    没有 label_pos 的老 JSON：退回用 Node 区域中心，框放大到 fallback_ratio 倍区域长短边
+    （实测 35/35 盖住，但位置是估的、框也大）。
+    查不到名字的 Node 不输出（CAD 那边也不画这个标签，不用避）。
+    """
+    out = {}
+    try:
+        with open(json_path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except Exception:
+        return out
+    page_size = {}
+    for pg in (doc.get("input_data") or {}).get("pages") or []:
+        page_size[pg.get("page_number")] = (pg.get("width") or 0, pg.get("height") or 0)
+    ocr = {p.get("page_number"): (p.get("data") or [])
+           for p in doc.get("ocr_node_name_results") or []}
+    trk = {p.get("page_number"): (p.get("data") or {})
+           for p in doc.get("yolo_tracker_detection_results") or []}
+    for pg in sorted(p for p in trk if isinstance(p, int)):
+        W, H = page_size.get(pg, (0, 0))
+        if not W or not H:
+            continue
+        pg_out = pg if page_map is None else page_map.get(pg)
+        if pg_out is None:
+            continue
+        dets = (trk.get(pg) or {}).get("detections") or []
+        nodes, typs = _page_boxes(dets)
+        if not nodes:
+            continue
+        # STR 号字高 = 本页支架框短边 x1.4（和 avoid_cells_offsets 里那套一致）
+        t_str = 0.0
+        if typs:
+            t_str = _vals_median([min(t["bbox"]["x2"] - t["bbox"]["x1"],
+                                      t["bbox"]["y2"] - t["bbox"]["y1"]) for t in typs]) * 1.4
+        if not t_str:                      # 本页没有支架框：按页高估一个，别让框塌成 0
+            t_str = H * 0.005
+        named = {}
+        for r in ocr.get(pg) or []:
+            nb = r.get("node_bbox") or {}
+            if not all(k in nb for k in ("x1", "y1", "x2", "y2")):
+                continue
+            k = (round(nb["x1"], 1), round(nb["y1"], 1), round(nb["x2"], 1), round(nb["y2"], 1))
+            named[k] = (r.get("final_node_name") or r.get("preliminary_node_name")
+                        or r.get("matched_table_name") or "").strip()
+        boxes = []
+        for d in dets:
+            if (d.get("label") or "").strip().lower() != "node":
+                continue
+            b = d.get("bbox") or {}
+            if not all(k in b for k in ("x1", "y1", "x2", "y2")):
+                continue
+            k = (round(b["x1"], 1), round(b["y1"], 1), round(b["x2"], 1), round(b["y2"], 1))
+            nm = named.get(k, "")
+            if not nm:
+                continue                       # 这个区域没有编号 -> CAD 也不画，不用避
+            bw, bh = b["x2"] - b["x1"], b["y2"] - b["y1"]
+            tr = (d.get("raw") or {}) if isinstance(d.get("raw"), dict) else {}
+            pos = tr.get("label_pos")
+            if (isinstance(pos, (list, tuple)) and len(pos) >= 2
+                    and isinstance(pos[0], (int, float)) and isinstance(pos[1], (int, float))):
+                cx, cy = float(pos[0]), float(pos[1])          # 标号位置（页像素）
+                thin = t_str * thick_scale
+                long_ = t_str * (adv * len(nm) + pad)
+            else:
+                cx, cy = _center(b)                            # 老 JSON：退回区域中心
+                thin = max(t_str, min(bw, bh) * fallback_ratio)
+                long_ = max(t_str, max(bw, bh) * fallback_ratio)
+            if bh > bw:                    # 竖长区域：标号竖排
+                x1, x2 = cx - thin / 2.0, cx + thin / 2.0
+                y1, y2 = cy - long_ / 2.0, cy + long_ / 2.0
+            else:                          # 扁宽区域：标号横排
+                x1, x2 = cx - long_ / 2.0, cx + long_ / 2.0
+                y1, y2 = cy - thin / 2.0, cy + thin / 2.0
+            # 页像素(y 从上) -> 归一化(fy 从下)，和 L 行同一套
+            boxes.append((min(max(x1 / float(W), 0.0), 1.0),
+                          1.0 - min(max(y2 / float(H), 0.0), 1.0),
+                          min(max(x2 / float(W), 0.0), 1.0),
+                          1.0 - min(max(y1 / float(H), 0.0), 1.0)))
+        if boxes:
+            out[pg_out] = boxes
+    return out
+
+
 # ---------------------------------------------------------------- 支架拆分（一列拆成几行）
 # 界面「支架」页每一类支架可以选 不拆 / 2行 / 3行：选了几行，这个支架框就沿长边均分成几段，
 # 每段各给一个 STR 号；一个 LBD 区里的号在整片区域里按选的顺序走同一个顺序，不是同一张
