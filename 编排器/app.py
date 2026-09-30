@@ -30,8 +30,7 @@ try:
                              order_demo_cells as _lr_demo_cells,
                              quad_note as _lr_quad_note,
                              rack_types_text as _lr_rack_text,
-                             set_rack_len_hints as _lr_set_hints,
-                             lbd_label_boxes as _lr_lbd_boxes)
+                             set_rack_len_hints as _lr_set_hints)
 except Exception:                    # 模块缺失时不阻塞主程序
     _lr_candidates = _lr_json_kind = _lr_extract_debug = None
     _lr_write_regions = _lr_write_regions_sheets = None
@@ -41,7 +40,6 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _LR_ORDER_TEXT = _lr_demo_cells = None
     _lr_rack_lines = _lr_page_map = None
     _lr_rack_types = _lr_rack_text = _lr_set_hints = None
-    _lr_lbd_boxes = None
 
 APP_TITLE = "Voltage-CAD MAP"
 APP_VERSION = "2.53"
@@ -67,7 +65,6 @@ FIELDS = [
     ("strQuadIII", "象限 III 左下 的 STR 顺序"),
     ("strQuadIV", "象限 IV 右下 的 STR 顺序"),
     ("rackAlign", "STR 号自动对齐"),
-    ("rackAvoid", "避开 LBD 标签(底图+CAD)"),
     ("rackTypes", "支架类型"), ("rackSplit", "拆不拆"), ("rackStringLen", "单串长度(FT)"),
     ("strBgOn", "STR背景填充"), ("strBgColor", "STR背景色"), ("strBgGap", "STR遮挡间隙"),
     ("strTextColor", "STR 标签字色"),
@@ -97,7 +94,6 @@ DEFAULTS = {
     "strQuadIII": (_LR_QUAD_DEFAULTS or {}).get("III", "3"),
     "strQuadIV": (_LR_QUAD_DEFAULTS or {}).get("IV", "1"),
     "rackAlign": "1",
-    "rackAvoid": "1",
     "rackTypes": "", "rackSplit": "不拆", "rackStringLen": "",
     "rackAuto": True, "rackSplitByType": "",
     "strBgOn": "1", "strBgColor": "2", "strTextColor": "7", "strBgGap": "1.0",
@@ -176,7 +172,6 @@ SECTIONS = [
             ("strHeight", "STR 字高(typical宽倍数)"),
             ("strOrder", "STR 编号顺序(8 种)"),
             ("rackAlign", "STR 号自动对齐"),
-            ("rackAvoid", "避开底图 LBD 标号"),
             ("strBgOn", "STR背景填充"),
             ("strBgColor", "STR背景色"),
             ("strTextColor", "STR 标签字色"),
@@ -259,224 +254,14 @@ def pdf_page_range_count(cfg):
     return pe - ps + 1, "起始 %d ~ 结束 %d，共 %d 页（PDF 总页数 %d）" % (ps, pe, pe - ps + 1, total)
 
 
-def _pdf_rotate(page):
-    """页面的 /Rotate（度，取 0/90/180/270）。"""
-    try:
-        return int(page.get("/Rotate", 0) or 0) % 360
-    except Exception:
-        return 0
-
-
-def _pdf_page_size(page):
-    """这一页「渲染出来」的宽高（带 /Rotate 时和 MediaBox 是反的）。"""
-    try:
-        mb = page.mediabox
-        pw = abs(float(mb.right) - float(mb.left))
-        ph = abs(float(mb.top) - float(mb.bottom))
-    except Exception:
-        pw, ph = 1.0, 1.0
-    if _pdf_rotate(page) % 180 == 90:
-        pw, ph = ph, pw
-    return (pw or 1.0), (ph or 1.0)
-
-
-def _pdf_norm_pt(page, x, y):
-    """PDF 用户坐标 -> 底图（渲染图）上的归一化坐标 (fx, fy)，fy 从下往上。
-
-    ★ 关键：PDF 带 /Rotate 时，文字层坐标是「没转过的」用户空间，而 CAD 里的 PDF
-    底图是「转过之后」渲染出来的，两者差 90°/270°。不换算的话避让框会整片跑到
-    错误位置（实测 HIGHLAND 那套图纸是 /Rotate=270：不换算命中 10/34，换算后 34/34）。
-    """
-    try:
-        cb = page.cropbox
-        x0, y0 = float(cb.left), float(cb.bottom)
-        pw = float(cb.right) - x0
-        ph = float(cb.top) - y0
-    except Exception:
-        x0, y0, pw, ph = 0.0, 0.0, 1.0, 1.0
-    if pw <= 0:
-        pw = 1.0
-    if ph <= 0:
-        ph = 1.0
-    x = float(x) - x0
-    y = float(y) - y0
-    rot = _pdf_rotate(page)
-    if rot == 90:                       # 顺时针转 90° 显示
-        return (y / ph, (pw - x) / pw)
-    if rot == 180:
-        return ((pw - x) / pw, (ph - y) / ph)
-    if rot == 270:                      # 逆时针转 90° 显示
-        return ((ph - y) / ph, x / pw)
-    return (x / pw, y / ph)
-
-
-def _pdf_text_items(page):
-    """一页 PDF -> (文字块列表, 整页文字)。
-
-    文字块 = (文字, fx中心, fy中心, fy标签下沿, fx1, fy1, fx2, fy2)，已经是
-    **底图（渲染图）上的归一化坐标**：fx 从左往右、fy 从下往上。
-    fy标签下沿 = 文字框下沿再往下 15%（LBD 标签原来就画在那儿）；
-    fx1..fy2 是整个文字框，避让算碰撞用。
-    """
-    items = []
-    all_text = []
-
-    def visit_text(text, cm, tm, font, size):
-        if not text:
-            return
-        all_text.append(text)
-        try:
-            m0 = cm[0] * tm[0] + cm[2] * tm[1]
-            m1 = cm[1] * tm[0] + cm[3] * tm[1]
-            m2 = cm[0] * tm[2] + cm[2] * tm[3]
-            m3 = cm[1] * tm[2] + cm[3] * tm[3]
-            m4 = cm[0] * tm[4] + cm[2] * tm[5] + cm[4]
-            m5 = cm[1] * tm[4] + cm[3] * tm[5] + cm[5]
-        except Exception:
-            m0, m1, m2, m3, m4, m5 = 1.0, 0.0, 0.0, 1.0, 0.0, 0.0
-        try:
-            cs = float(size)
-        except Exception:
-            cs = 0.0
-        w = cs * 0.5 * len(text)
-        h = cs
-        xs, ys = [], []
-        for tx, ty in ((0.0, 0.0), (w, 0.0), (0.0, h), (w, h)):
-            xs.append(m0 * tx + m2 * ty + m4)
-            ys.append(m1 * tx + m3 * ty + m5)
-        cx = (min(xs) + max(xs)) * 0.5
-        cy = (min(ys) + max(ys)) * 0.5
-        # 四个角都换算成底图坐标再取包围盒（转过 90° 的页，框的宽高会互换）
-        pts = [_pdf_norm_pt(page, px, py)
-               for px, py in ((min(xs), min(ys)), (max(xs), min(ys)),
-                              (min(xs), max(ys)), (max(xs), max(ys)))]
-        fx1, fx2 = min(p[0] for p in pts), max(p[0] for p in pts)
-        fy1, fy2 = min(p[1] for p in pts), max(p[1] for p in pts)
-        fc = _pdf_norm_pt(page, cx, cy)
-        # 「标签下沿」按底图方向往下 15%（转过 90° 时不能再用 PDF 的 y 下沿）
-        items.append((text, fc[0], fc[1], fy1 - (fy2 - fy1) * 0.15,
-                      fx1, fy1, fx2, fy2))
-
-    page.extract_text(visitor_text=visit_text)
-    return items, all_text
-
-
-def extract_lbd(pdf, out, pageStart, pageEnd, prog=None, page_map=None):
-    # 等价于 pdf_extract.py：就地用已打包的 pypdf 提取 LBD 标签坐标，
-    # 写出的 P/L 制表符格式与 LSP 的 PdfLayout_ReadExtractFile 期望一致。
-    # page_map: {PDF 真实页号: 图纸顺序号}；给了就按它重编号，映射里没有的页整页跳过
-    #           （CAD 侧是按「第几张底图」当页号的，不是 PDF 页码）。
-    # 返回 (ok, err)。
-    try:
-        from pypdf import PdfReader
-    except Exception as e:
-        return False, "pypdf 不可用：%s" % e
-    if not pdf or not os.path.exists(pdf):
-        return False, "PDF 文件不存在：%s" % pdf
-    try:
-        reader = PdfReader(pdf)
-        n = len(reader.pages)
-    except Exception as e:
-        return False, "打开 PDF 失败：%s" % e
-    try:
-        p0 = int(pageStart or 1)
-        p1 = int(pageEnd or 0)
-    except Exception:
-        p0, p1 = 1, 0
-    if p0 < 1:
-        p0 = 1
-    if p1 <= 0:
-        p1 = n
-    if p1 > n:
-        p1 = n
-    lines = []
-    for idx in range(p0 - 1, p1):
-        page = reader.pages[idx]
-        pw, ph = _pdf_page_size(page)
-        try:
-            items, all_text = _pdf_text_items(page)
-        except Exception:
-            items, all_text = [], []
-        pg_out = idx + 1 if page_map is None else page_map.get(idx + 1)
-        if pg_out is None:
-            continue                       # 这一页不在识别到的图纸页里（封面/说明页等）
-        title = "".join(all_text[:100])
-        lines.append("P\t%d\t%.2f\t%.2f\t%s"
-                     % (pg_out, pw, ph, title[:150].replace("\t", " ").replace("\n", " ")))
-        for it in items:
-            if "LBD" not in it[0].upper():
-                continue
-            # it[1] = 文字中心 fx，it[3] = 标签下沿 fy（底图坐标，已按 /Rotate 换算）
-            fx, fy = it[1], it[3]
-            if not (-0.05 <= fx <= 1.05 and -0.05 <= fy <= 1.05):
-                continue                   # 跑到页面外的杂项文字
-            fx = min(max(fx, 0.0), 1.0)
-            fy = min(max(fy, 0.0), 1.0)
-            lines.append("L\t%d\t%.6f\t%.6f\t%s"
-                         % (pg_out, fx, fy, it[0].replace("\t", " ").replace("\n", " ")))
-        if prog:
-            try:
-                with open(prog, "w", encoding="utf-8") as f:
-                    f.write("PAGE %d/%d" % (idx + 1, n))
-            except Exception:
-                pass
-    try:
-        with open(out, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-    except Exception as e:
-        return False, "写提取文件失败：%s" % e
-    return True, ""
-
-
-def pdf_lbd_boxes(pdf, pageStart, pageEnd, page_map=None, want="LBD"):
-    """PDF 文字层里含 want 的文字框 -> {图纸页号: [(fx1, fy1, fx2, fy2), ...]}。
-
-    归一化坐标（fx 从左、fy 从下往上，和 L 行的 fx/fy 同一套）。用来让生成的 STR 号
-    避开底图上本来就印着的 LBD 标号（文字盖文字）。没有 PDF 或没有文字层就返回 {}。
-    """
-    out = {}
-    if not pdf or not os.path.exists(pdf):
-        return out
-    try:
-        from pypdf import PdfReader
-        reader = PdfReader(pdf)
-        n = len(reader.pages)
-    except Exception:
-        return out
-    try:
-        p0 = int(pageStart or 1)
-        p1 = int(pageEnd or 0)
-    except Exception:
-        p0, p1 = 1, 0
-    if p0 < 1:
-        p0 = 1
-    if p1 <= 0 or p1 > n:
-        p1 = n
-    # 有 page_map 时只翻"识别到的图纸页"：整份 PDF 可能上百页，全翻一遍要等很久
-    if page_map:
-        todo = sorted(p for p in page_map if p0 <= p <= p1)
-    else:
-        todo = list(range(p0, p1 + 1))
-    for pgno in todo:
-        page = reader.pages[pgno - 1]
-        pg_out = pgno if page_map is None else page_map.get(pgno)
-        if pg_out is None:
-            continue                     # 不在识别到的图纸页里（封面/说明页）
-        try:
-            items, _t = _pdf_text_items(page)
-        except Exception:
-            continue
-        boxes = []
-        for (text, _fx, _fy, _fyl, fx1, fy1, fx2, fy2) in items:
-            if want.upper() not in text.upper():
-                continue
-            if fx2 < 0.0 or fx1 > 1.0 or fy2 < 0.0 or fy1 > 1.0:
-                continue
-            boxes.append((max(0.0, fx1), max(0.0, fy1),
-                          min(1.0, fx2), min(1.0, fy2)))
-        if boxes:
-            out.setdefault(pg_out, []).extend(boxes)
-    return out
+# 注：这里原先是一整套「Python 读 PDF 文字层」的代码 —— _pdf_rotate / _pdf_page_size /
+# _pdf_norm_pt / _pdf_text_items（把一页的文字块换算成底图归一化坐标）和 pdf_lbd_boxes()
+# （挑出含 "LBD" 的文字框，给 STR 号避让用）。现在文字层统一由标注工具读
+# （「补全编号」/ 核对表，见 标注工具\lbd_annotator.py），主程序只吃 JSON，
+# 不再自己解析文字层；依赖它的「避开底图 LBD 标号」开关也一起去掉了。
+#
+# 还留在主程序里的 pypdf 用法只有「数页数」（pdf_page_range_count / pdf_page_count）
+# 和导出 PDF 时的合并（PdfWriter），都不碰文字层。
 
 
 def rack_prefix(cfg):
@@ -648,40 +433,18 @@ def write_auto_ini(cfg, ini_path):
             f.write("%s=%s\n" % (k, 1 if v is True else (0 if v is False else v)))
 
 
-def avoid_note(detail):
-    """日志里那句"避开了多少处 LBD 标签"（分底图文字 / CAD 里画的）。"""
-    if not detail:
-        return ""
-    n = int(detail.get("avoid") or 0)
-    nc = int(detail.get("avoid_cad") or 0)
-    if not n:
-        return ""
-    s = "；已避开 LBD 标签 %d 处" % n
-    if nc:
-        s += "（其中 CAD 里画的 %d 处）" % nc
-    return s
-
-
 def build_extract_file(cfg, out_path, prog_path=None):
     """生成 CAD 读的标签提取文件（P/L 行）。返回 (ok, 说明, 明细)。
 
     按手上有什么自动选：
       1) 标注/编号结果 JSON（X-AnyLabeling，有 shapes）：LBD 名称和支架号都在里面，直接转；
-      2) 识别结果 debug JSON（有 Node/Tracker 框，但没有 LBD 文字的坐标）：
-         LBD 行仍由 Python 从 **PDF 文字层**提取（老流程 pdf_extract.py 那套，exe 里内置），
-         支架号 STRxx 由 debug JSON 按 LBD 分组现编，追加到同一个文件里；
-      3) 没给 JSON / 给的不顶用：退回纯 PDF 文字层提取（只有 LBD 行）。
+      2) 识别结果 debug JSON（有 Node/Tracker 框）：LBD 标签填到「识别到的 LBD 区域」上，
+         支架号 STRxx 由 debug JSON 按 LBD 分组现编，追加到同一个文件里。
+
+    LBD 名字/位置一律来自 JSON —— 标注工具已经用「补全编号」从 PDF 文字层提过一遍写进
+    JSON 了（见 标注工具\\lbd_annotator.py），主程序不再自己去翻 PDF 文字层。
     """
     jp = (cfg.get("jsonPath") or "").strip()
-    pdf = (cfg.get("pdf") or "").strip()
-    try:
-        p0 = int(cfg.get("pageStart") or 1)
-    except Exception:
-        p0 = 1
-    try:
-        p1 = int(cfg.get("importPages") or 0) or int(cfg.get("pageEnd") or 0)
-    except Exception:
-        p1 = 0
     pre = rack_prefix(cfg)
     order = str(cfg.get("strOrder", "2") or "2").strip() or "2"
     # 象限编号规则：以离每个 LBD 区域最近的汇流箱(Box)中心为原点判象限，
@@ -695,14 +458,7 @@ def build_extract_file(cfg, out_path, prog_path=None):
     split = rack_split_spec(cfg)
     # STR 号自动对齐：开 = 同一排的号按排线对齐（只动高度）；关 = 各画在自己格子中心
     align = str(cfg.get("rackAlign", "1")).strip() not in ("0", "", "关", "否", "off", "false", "False")
-    detail = {"kind": "", "lbd": 0, "str": 0, "pdf_lbd": False}
-
-    def _count(prefix):
-        try:
-            with open(out_path, "r", encoding="utf-8") as f:
-                return sum(1 for ln in f if ln.startswith(prefix))
-        except Exception:
-            return 0
+    detail = {"kind": "", "lbd": 0, "str": 0}
 
     kind = ""
     if jp and os.path.exists(jp) and _lr_json_kind is not None:
@@ -722,38 +478,12 @@ def build_extract_file(cfg, out_path, prog_path=None):
             pgmap = None
     detail["pages"] = len(pgmap) if pgmap else 0
 
-    # STR 号要避开的障碍（带背景填充的号压上去会把名字盖掉）：
-    # 底图上本来就印着的 LBD 标号 —— 直接用 PDF 文字层的框（位置是实测的，准）。
-    # 我们自己画的 LBD 标签不在这里预估了：它的字高在模型单位里是「标签高度」，
-    # 换算成页像素要底图模型尺寸（这里没有），而且 CAD 画的时候还有"上下错行"，
-    # 预估出来的框不准（老代码 scale=0 时甚至塌成 0 尺寸的一个点）。
-    # 改成：CAD 画完 STR 号之后，由标签自己上下让位（真实包围盒判定），
-    # 见 PdfLayout_auto.lsp 的 PdfLayout_LbdPlace。
+    # 原先这里会给 STR 号算「避开底图 LBD 标号」的障碍框（读 PDF 文字层），
+    # 那套代码已随文字层识别一起删掉。CAD 里画的标签仍然由标签自己上下让位
+    # （真实包围盒判定，见 PdfLayout_auto.lsp 的 PdfLayout_LbdPlace）。
+    # 传给 lbd_regions 的 avoid / avoid_pad 用默认值（None / 0.0），即不额外避让。
     avoid = None
-    _avoid_pad = 0.0        # 关掉避让时也要有值：下面几条输出路径都会用到它
-    detail["avoid"] = 0
-    detail["avoid_cad"] = 0
-    if (kind == "debug"
-            and str(cfg.get("rackAvoid", "1")).strip() not in ("0", "", "关", "否", "off", "false", "False")):
-        boxes = {}
-        if pdf and os.path.exists(pdf):
-            try:
-                boxes = pdf_lbd_boxes(pdf, p0, p1, pgmap)
-            except Exception:
-                boxes = {}
-        avoid = boxes or None
-        detail["avoid"] = sum(len(v) for v in (boxes or {}).values())
-        # STR 号是"文字 + 背景填充(白底)"画出来的：白底比文字框大一圈，
-        # 避让时不算白底的话，白底照样会盖住底图上的 LBD 标号。
-        # 外扩量按填充间隙的一半估（实测口径；关掉背景填充就不外扩）。
-        try:
-            _bg_on = str(cfg.get("strBgOn", "1")).strip() not in (
-                "0", "", "关", "否", "off", "false", "False")
-            _gap = float(str(cfg.get("strBgGap", "1.0")).strip() or 1.0) if _bg_on else 0.0
-        except Exception:
-            _gap = 1.0
-        _avoid_pad = min(1.0, max(0.0, _gap)) * 0.5
-        detail["avoid_pad"] = round(_avoid_pad, 3)
+    _avoid_pad = 0.0
 
     # 1) 标注/编号结果：LBD 名称 + 支架号都在 JSON 里
     if kind == "anylabeling":
@@ -786,20 +516,13 @@ def build_extract_file(cfg, out_path, prog_path=None):
                 _tip += "；" + detail["split"]
             if _lr_quad_note:
                 _tip += _lr_quad_note(detail["quad"])
-            _tip += avoid_note(detail)
             return True, ("识别结果：LBD %d 个（位置=识别到的 LBD 区域框中心）"
                           " + 支架号 %d 个（按 LBD 分组编号：默认行优先，选了象限规则就按象限走）%s"
                           % (r["lbd"], r["str"], _tip)), detail
 
-    # 3) LBD 行：Python 从 PDF 文字层提（位置=图纸上 LBD 文字的正下方）—— 老行为 / 关掉开关时走这条
-    pdf_err = ""
-    if pdf and os.path.exists(pdf):
-        ok, err = extract_lbd(pdf, out_path, p0, p1, prog=prog_path, page_map=pgmap)
-        if ok:
-            detail["pdf_lbd"] = True
-            detail["lbd"] = _count("L\t")
-        else:
-            pdf_err = err
+    # 3) LBD 行不再由这里从 PDF 文字层提（标注工具已经提好了，名字/位置都在 JSON 里）。
+    #    走到这儿说明「按区域填标签」那条没成：要么开关关了，要么 JSON 里没有可用的名字。
+    lbd_err = ""
 
     # 支架号：debug JSON 现编（按 LBD 分组、组内行优先，每组从 01 起）
     rack_err = ""
@@ -828,7 +551,7 @@ def build_extract_file(cfg, out_path, prog_path=None):
             except Exception as e:
                 rack_err = str(e)
 
-    # 兜底：PDF 文字层没给出 LBD 行（无文字层的扫描件等），用 debug JSON 的区域中心
+    # 兜底：上面那条没给出 LBD 行（开关关了 / 区域那套没成）时，用 debug JSON 的区域中心
     if detail["lbd"] == 0 and kind == "debug" and _lr_extract_debug is not None:
         # 注意要带 page_map：这条兜底同样要按「底图顺序号」写页号，
         # 漏了它（以前就是漏的）行会写成 JSON 里的原始页号，CAD 那边一张都对不上。
@@ -843,15 +566,15 @@ def build_extract_file(cfg, out_path, prog_path=None):
             _stip = ("；" + detail["split"]) if detail.get("split") else ""
             if _lr_quad_note:
                 _stip += _lr_quad_note(detail["quad"])
-            _stip += avoid_note(detail)
             return True, ("识别结果 JSON：%d 页、LBD %d 个（按区域中心）、支架号 %d 个"
-                          "（PDF 文字层没读到 LBD 文字，位置按区域中心放）%s"
+                          "（位置按识别到的 LBD 区域中心放）%s"
                           % (r["pages"], r["lbd"], r["str"], _stip)), detail
-        pdf_err = pdf_err or (r.get("error") or "")
+        lbd_err = lbd_err or (r.get("error") or "")
 
     if detail["lbd"] == 0 and detail["str"] == 0:
-        why = pdf_err or rack_err or ("这份 JSON 不是识别结果，也不是标注结果（没有 Node/Tracker 也没有 shapes）"
-                                      if jp else "没有 PDF、也没有识别结果 JSON")
+        why = lbd_err or rack_err or ("这份 JSON 不是识别结果，也不是标注结果（没有 Node/Tracker 也没有 shapes）"
+                                      if jp else "没有给识别 / 标注结果 JSON"
+                                                 "（LBD 标签由标注工具提好放在 JSON 里带进来）")
         return False, "没能生成任何标签行：%s" % why, detail
     tip = ""
     if pgmap:
@@ -866,8 +589,7 @@ def build_extract_file(cfg, out_path, prog_path=None):
         tip += "；" + detail["split"]
     if _lr_quad_note:
         tip += _lr_quad_note(detail.get("quad"))
-    tip += avoid_note(detail)
-    return True, ("标签 %d 行：LBD %d 个（Python 从 PDF 文字层识别）"
+    return True, ("标签 %d 行：LBD %d 个（来自识别 / 标注结果 JSON）"
                   " + 支架号 %d 个（按 LBD 分组编号：默认行优先，选了象限规则就按象限走）%s"
                   % (detail["lbd"] + detail["str"], detail["lbd"], detail["str"], tip)), detail
 
@@ -1118,38 +840,33 @@ def ensure_ai_lsp():
 
 def auto_worker(cfg, ini, prog, bus):
     try:
-        # B2：PDF 提取在 exe 内就地完成（复用已打包的 pypdf），不再外挂 Python。
+        # B2：标签文件在 exe 内就地生成（复用已打包的 pypdf / lbd_regions），不再外挂 Python。
+        # LBD 名字和位置不再从这里翻 PDF 文字层：标注工具的「补全编号」已经提好、
+        # 写进识别/标注结果 JSON 了，这一步只把 JSON 转成 CAD 认的 P/L 行。
         lbd_pre = str(cfg.get("lbdPre", "0"))
         lbd_out = (cfg.get("lbdOut") or "").strip()
         if lbd_pre == "1" and lbd_out:
-            bus.prog.emit("0/4 正在提取 PDF LBD 标签…")
-            pdf = (cfg.get("pdf") or "").strip()
+            bus.prog.emit("0/4 正在生成 LBD / 支架标签…")
             logp = os.path.join(tempfile.gettempdir(), "pdflbd_log.txt")
-            try:
-                p0 = int(cfg.get("pageStart") or 1)
-                ipp = int(cfg.get("importPages") or 0)
-                p1 = int(cfg.get("pageEnd") or 0)
-            except Exception:
-                p0, ipp, p1 = 1, 0, 0
-            pg_end = ipp if ipp > 0 else p1
             progx = os.path.join(tempfile.gettempdir(), "pdflbd_progress.txt")
             _jp = (cfg.get("jsonPath") or "").strip()
             if _jp and os.path.exists(_jp):
                 try:
-                    bus.prog.emit("0/4 读取识别结果 JSON…")
+                    bus.prog.emit("0/4 读取识别 / 标注结果 JSON…")
                     _hn = rack_len_hint_note(cfg)
                     if _hn:
                         bus.prog.emit("0/4 支架类型长度FT：" + _hn)
-                    bus.prog.emit("0/4 正在生成标签（LBD 文字从 PDF 里识别，支架号按 LBD 分组编号）…")
+                    bus.prog.emit("0/4 正在生成标签（LBD 名字/位置来自 JSON，支架号按 LBD 分组编号）…")
                     ok, _emsg, _edet = build_extract_file(cfg, lbd_out, progx)
                     bus.prog.emit("0/4 " + _emsg)
                     err = "" if ok else _emsg
                 except Exception as e:
                     ok, err = False, "JSON解析失败:" + str(e)
             else:
-                # 没有识别结果 JSON：退回 PDF 文字层提取（「使用AI自动识别」那个选项已删掉，
-                # 识别现在统一在外部工具里做，结果以 debug JSON 的形式给进来）
-                ok, err = extract_lbd(pdf, lbd_out, p0, pg_end, prog=progx)
+                # 没有 JSON 就没得可生成：LBD 标签由标注工具（读 PDF 文字层的「补全编号」）提好、
+                # 写进识别/标注结果 JSON 里带过来，主程序这边不再自己去翻 PDF。
+                ok, err = False, ("没有给识别 / 标注结果 JSON：LBD 标签由标注工具从 PDF 文字层"
+                                  "提好放在 JSON 里，主程序不再单独提 PDF")
             if not ok:
                 try:
                     with open(logp, "w", encoding="utf-8") as f:
@@ -3259,7 +2976,7 @@ class MainWindow(QMainWindow):
                     cb.currentIndexChanged.connect(lambda *_: self.on_refresh_quad_preview())
                     form.addWidget(cb, r, 1)
 
-                elif key in ("strBgOn", "rackAlign", "rackAvoid"):
+                elif key in ("strBgOn", "rackAlign"):
                     cb = NoWheelCombo()
                     cb.setObjectName("Field")
                     cb.setMinimumWidth(320)
@@ -3805,7 +3522,8 @@ class MainWindow(QMainWindow):
                 self.set_text("count", str(_n))
                 cfg = self.cfg()
                 self.log_msg("复制布局数量：%s" % _msg)
-        # B2：若配置了 PDF，让 exe 就地提取 LBD 标签，并把结果路径/开关交给 LSP。
+        # B2：给了 PDF 或识别/标注结果 JSON，就让 exe 就地生成标签文件（P/L 行），
+        # 并把结果路径/开关交给 LSP；LBD 名字/位置从 JSON 里来（不再由主程序翻 PDF 文字层）。
         _pdf = (cfg.get("pdf") or "").strip()
         _jp0 = (cfg.get("jsonPath") or "").strip()
         if (_pdf and os.path.exists(_pdf)) or (_jp0 and os.path.exists(_jp0)):
@@ -3880,7 +3598,7 @@ class MainWindow(QMainWindow):
         if "区域" in msg and "支架范围" in msg:
             self.run_status = "正在导出 LBD 区域 / 支架范围…"
         elif "0/4" in msg:
-            self.run_status = "正在提取 PDF LBD 标签…"
+            self.run_status = "正在生成 LBD / 支架标签…"
         elif "1/4" in msg or "连接" in msg or "启动" in msg:
             self.run_status = "正在连接 / 启动 ZWCAD…（可能需 10-30 秒，请切到 ZWCAD）"
         elif "2/4" in msg:

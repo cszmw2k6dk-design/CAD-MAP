@@ -56,6 +56,36 @@ def _first_str(src, keys):
     return None
 
 
+def _seq_key(v):
+    """串数归一化：9 / 9.0 / "9" 都当同一个键（建表、查找两边都用它）。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return v
+    return int(f) if f.is_integer() else f
+
+
+def _rack_string_counts(doc):
+    """扫每个支架检测框的 raw["strings"] -> {串数: 张数}。
+
+    这是标注工具「支架按长度差≤10%整册分档」写进去的（见 标注工具\\lbd_annotator.py
+    的 on_rack_grade）：整册逐根标好了串数，比拿框长去猜档准得多。
+    """
+    out = {}
+    for page in doc.get("yolo_tracker_detection_results") or []:
+        for d in (page.get("data") or {}).get("detections") or []:
+            if not isinstance(d, dict):
+                continue
+            if (d.get("label") or "").strip().lower() not in ("tracker", "typical"):
+                continue
+            s = _first_num(d.get("raw") or {}, _RACK_STR_KEYS)
+            if s is None:
+                continue
+            k = _seq_key(s)
+            out[k] = out.get(k, 0) + 1
+    return out
+
+
 # 界面「支架」页明细行手填的「长度FT」（没填时编排器会拿串数当比例给一个替代值）：
 # 识别结果里没有长度时用它，把「框长分档」对到支架类型上（见 rack_type_indices）。
 # 形如 {串数: 长度FT}；只按比例用，绝对值不影响结果。默认空 = 只用识别结果里的长度。
@@ -116,7 +146,7 @@ def rack_types_from_doc(doc):
                 strings = float(m.group(1)) if m else None
             if strings is None:
                 continue
-            key = int(strings) if float(strings).is_integer() else strings
+            key = _seq_key(strings)
             rec = {
                 "strings": key,
                 "code": _first_str(it, _RACK_CODE_KEYS),
@@ -143,6 +173,19 @@ def rack_types_from_doc(doc):
             else:
                 out[key] = rec
                 by_str.append(key)
+
+    # 兜底：类型清单不在 JSON 里（input_data.tracker_definitions 是空的）时，
+    # 用标注工具逐根标好的串数（检测框的 raw.strings）现汇一份类型表。
+    # 这样界面「支架类型」能自动列出 9/13/15 这种，拆分也不必再靠框长猜。
+    for key, cnt in sorted(_rack_string_counts(doc).items()):
+        rec = out.get(key)
+        if rec is None:
+            out[key] = {"strings": key, "code": None, "length_ft": _rack_len_hint(key),
+                        "total_count": cnt, "panel_label": None,
+                        "source": "detections.raw.strings"}
+            by_str.append(key)
+        elif not rec.get("total_count"):
+            rec["total_count"] = cnt
 
     rows = []
     for i, key in enumerate(sorted(by_str)):
@@ -1478,6 +1521,35 @@ def rack_type_indices(trk, page_size, types, split=None):
         return {}, ""
     if len(types) <= 1:
         return {pg: [0] * len(v) for pg, v in per_page.items()}, ""
+
+    # ①′ 最准的一路：检测框里自带串数（标注工具的 raw.strings，整册逐根标好的）。
+    #     整册每一根都标了、而且都能对上类型表时，直接按它定类 —— 不用长度FT、
+    #     也不用框长分档（框长在真实数据里分不出档，见下面 ① 的注释）。
+    idx_of = {}
+    for i, t in enumerate(types):
+        if t.get("strings") is not None:
+            idx_of[_seq_key(t["strings"])] = i
+    if idx_of:
+        direct, dhit = {}, {}
+        for pg, data in (trk or {}).items():
+            if pg not in per_page:
+                continue
+            idx = []
+            for d in (data or {}).get("detections") or []:
+                b = (d or {}).get("bbox") or {}
+                if not all(k in b for k in ("x1", "y1", "x2", "y2")):
+                    continue
+                if (d.get("label") or "").strip().lower() not in ("tracker", "typical"):
+                    continue
+                s = _first_num(d.get("raw") or {}, _RACK_STR_KEYS)
+                idx.append(idx_of.get(_seq_key(s)) if s is not None else None)
+            if idx and all(i is not None for i in idx):
+                direct[pg] = idx
+                for i in idx:
+                    dhit[i] = dhit.get(i, 0) + 1
+        if len(direct) == len(per_page):
+            return direct, "按识别结果里标好的串数定类：" + "；".join(
+                "%s串 %d 张" % (types[i].get("strings"), dhit[i]) for i in sorted(dhit))
 
     vals_all = [v for vs in per_page.values() for v in vs]
 
