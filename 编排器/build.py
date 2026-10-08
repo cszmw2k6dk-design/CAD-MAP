@@ -158,6 +158,18 @@ def main():
             os.path.join("PySide6", "plugins", "platforms"),
             "--add-data", os.path.join(PYSP, "styles") + SEP +
             os.path.join("PySide6", "plugins", "styles")]
+    # 识别：模型跟依赖（onnxruntime / pypdfium2 / numpy / PIL）一起打进包；
+    # 模型放在 exe 同级的 models\ 里，打包也塞进 _MEIPASS\models（见 detect.model_path）。
+    models_dir = os.path.join(HERE, "models")
+    if os.path.isdir(models_dir):
+        # 放进包内的 models\ 子目录（detect.model_path 就是按这个找的）
+        args += ["--add-data", models_dir + SEP + "models"]
+    else:
+        log("  提示：没找到 %s（识别模型），打出来的包不能用「识别」页" % models_dir)
+    args += ["--hidden-import", "detect", "--hidden-import", "lbd_naming",
+             "--hidden-import", "onnxruntime", "--hidden-import", "numpy",
+             "--hidden-import", "PIL.Image", "--hidden-import", "pypdfium2",
+             "--collect-binaries", "onnxruntime"]
     for dll in ("VCRUNTIME140.dll", "VCRUNTIME140_1.dll", "msvcp140.dll", "concrt140.dll"):
         p = find_dll(dll)
         if p:
@@ -171,7 +183,8 @@ def main():
         os.makedirs(spec_dir, exist_ok=True)
     except Exception:
         spec_dir = HERE
-    args += ["--exclude-module", "PIL", "--clean", "--noconfirm",
+    # 注意：以前这里 --exclude-module PIL；现在识别要用 Pillow（渲染图/预处理），不能再排掉
+    args += ["--clean", "--noconfirm",
              "--specpath", spec_dir,
              os.path.join(HERE, "app.py")]
     p = subprocess.run(args, cwd=HERE, env=build_env())

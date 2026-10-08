@@ -518,13 +518,6 @@
           (setq validItems (append validItems (list it)))
         )
       )
-      (if (and *PdfLayout_FilterCluster* (= *PdfLayout_FilterCluster* "1"))
-        (progn
-          (setq nB (length validItems))
-          (setq validItems (PdfLayout_FilterCluster validItems))
-          (PdfLayout_Prog (strcat "LBD_FILTER excluded " (itoa (- nB (length validItems)))))
-        )
-      )
       (setq sheetMap nil)
       (if (and xlsx (/= xlsx "")) (setq sheetMap (PdfLayout_ReadAllLbdLabels xlsx)))
       (setq *PdfLayout_ObsAll* (PdfLayout_ObsRead outPath))
@@ -804,7 +797,6 @@
   (setq cfg (PdfLayout_ReadAutoConfig iniPath))
   (setq py (PdfLayout_ACfg cfg "pythonPath" ""))
   (if (and py (/= py "")) (setq *PdfLayout_PythonPath* py))
-  (setq *PdfLayout_FilterCluster* (PdfLayout_ACfg cfg "filterCluster" "1"))
   (setq *PdfLayout_LbdPre* (PdfLayout_ACfg cfg "lbdPre" "0"))
   (setq *PdfLayout_LbdOut* (PdfLayout_ACfg cfg "lbdOut" ""))
   (PdfLayout_Prog "START")
@@ -889,71 +881,6 @@
   (if (= l 0) 0.0
     (progn (setq s (vl-sort lst (quote <))) (setq m (/ l 2))
       (if (= (rem l 2) 0) (/ (+ (nth (1- m) s) (nth m s)) 2.0) (nth m s)))))
-(defun PdfLayout_ClusterDist (a b / dx dy)
-  (setq dx (- (cadr a) (cadr b)))
-  (setq dy (- (caddr a) (caddr b)))
-  (sqrt (+ (* dx dx) (* dy dy))))
-(defun PdfLayout_ComponentsTouch (a b eps / hit ia ib)
-  (setq hit nil)
-  (foreach ia a
-    (foreach ib b
-      (if (<= (PdfLayout_ClusterDist ia ib) eps) (setq hit T))))
-  hit)
-(defun PdfLayout_ClusterComponents (items eps / comps merged c newc hit o)
-  (setq comps nil)
-  (foreach it items (setq comps (append comps (list (list it)))))
-  (setq merged T)
-  (while merged
-    (setq merged nil)
-    (setq newc nil)
-    (while comps
-      (setq c (car comps))
-      (setq comps (cdr comps))
-      (setq hit T)
-      (while hit
-        (setq hit nil)
-        (foreach o comps
-          (if (PdfLayout_ComponentsTouch c o eps)
-            (progn
-              (setq c (append c o))
-              (setq comps (vl-remove o comps))
-              (setq hit T)))))
-      (setq newc (append newc (list c))))
-    (setq comps newc))
-  comps)
-(defun PdfLayout_FilterClusterGroup (items / kept comps cx cy groups ent n dsq arrs out)
-  (setq kept nil)
-  (foreach c (PdfLayout_ClusterComponents items 0.011)
-    (if (< (length c) 3) (setq kept (append kept c))))
-  (if (< (length kept) 2)
-    kept
-    (progn
-      (setq cx (PdfLayout_Median (mapcar (quote cadr) kept)))
-      (setq cy (PdfLayout_Median (mapcar (quote caddr) kept)))
-      (setq groups nil)
-      (foreach it kept
-        (setq n (PdfLayout_LbdNumFromText (cadddr it)))
-        (setq dsq (+ (* (- (cadr it) cx) (- (cadr it) cx))
-                     (* (- (caddr it) cy) (- (caddr it) cy))))
-        (setq ent (assoc n groups))
-        (if ent
-          (setq groups (subst (cons n (append (cdr ent) (list (cons dsq it)))) ent groups))
-          (setq groups (append groups (list (cons n (list (cons dsq it))))))))
-      (setq out nil)
-      (foreach g groups
-        (setq arrs (cdr g))
-        (setq arrs (vl-sort arrs (quote (lambda (a b) (< (car a) (car b))))))
-        (setq out (append out (list (cdr (car arrs))))))
-      out)))
-(defun PdfLayout_FilterCluster (items / pages pg grp out)
-  (setq out nil pages nil)
-  (foreach it items
-    (setq pg (car it))
-    (setq grp (cdr (assoc pg pages)))
-    (if (not grp) (setq grp nil))
-    (setq pages (append (vl-remove-if (function (lambda (g) (= (car g) pg))) pages) (list (cons pg (append grp (list it)))))))
-  (foreach pg pages (setq out (append out (PdfLayout_FilterClusterGroup (cdr pg)))))
-  out)
 
 (princ "\n[PDFAUTO] 自动化层加载完成。")
 (princ)

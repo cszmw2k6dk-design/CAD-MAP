@@ -3,13 +3,15 @@
 # 业务逻辑（扫描/计划/配置/ZWCAD 自动化）与旧 ctypes 版保持一致。
 import os, sys, json, re, glob, hashlib, tempfile, threading, time, subprocess, shutil
 import urllib.request, urllib.error, urllib.parse
-from PySide6.QtCore import Qt, Signal, QObject, QTimer
-from PySide6.QtGui import QColor, QPainter, QIcon, QPixmap
+from PySide6.QtCore import Qt, Signal, QObject, QTimer, QRectF, QPointF
+from PySide6.QtGui import QColor, QPainter, QIcon, QPixmap, QImage, QPen
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QLabel, QLineEdit, QPushButton, QProgressBar, QStackedWidget,
                                QScrollArea, QFileDialog, QButtonGroup, QPlainTextEdit,
                                QFrame, QGridLayout, QCheckBox, QRadioButton, QComboBox,
-                               QMessageBox, QDialog, QListWidget, QListWidgetItem)
+                               QMessageBox, QDialog, QListWidget, QListWidgetItem,
+                               QTableWidget, QTableWidgetItem,
+                               QGraphicsView, QGraphicsScene, QGraphicsRectItem)
 from pypdf import PdfReader
 
 try:
@@ -51,7 +53,7 @@ UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_PAGE = "https://github.com/%s/releases" % UPDATE_REPO
 FIELDS = [
     ("dwg", "模板 DWG 文件"),
-    ("pdf", "PDF 文件路径"), ("xlsx", "LBD 名称 Excel"), ("jsonPath", "识别结果 JSON文件"),
+    ("pdf", "PDF 文件"), ("xlsx", "标签文件"), ("jsonPath", "识别结果 JSON文件"),
     ("newName", "新文件名(可空)"), ("pageStart", "起始页"), ("pageEnd", "结束页(0=全部)"),
     ("importPages", "导入页码(0=全部)"),
     ("count", "复制数量(0=按识别)"),
@@ -101,9 +103,8 @@ DEFAULTS = {
     "rackTypes": "", "rackSplit": "不拆", "rackStringLen": "",
     "rackAuto": True, "rackSplitByType": "",
     "strBgOn": "1", "strBgColor": "2", "strTextColor": "7", "strBgGap": "1.0",
-    "overwrite": False, "labelWhere": "M", "filterCluster": True,
+    "overwrite": False, "labelWhere": "M",
     "regionFit": True,
-    "lbdFromRegion": True,
 }
 # STR 编号顺序（8 种，和插件 PDFGRID 一致；值 = 界面上的序号）
 STR_ORDER_CHOICES = _LR_ORDER_LABELS or [
@@ -151,9 +152,11 @@ COLOR_CHOICES = [("红", "1"), ("黄", "2"), ("绿", "3"), ("青", "4"),
                  ("蓝", "5"), ("洋红", "6"), ("白", "7"), ("灰", "8")]
 SECTIONS = [
     ("文件与输出", [("dwg", "模板 DWG 文件"),
-                  ("pdf", "PDF 文件路径"), ("xlsx", "LBD 名称 Excel"),
+                  ("pdf", "PDF 文件"), ("xlsx", "标签文件"),
                   ("jsonPath", "识别结果 JSON文件"),
                   ("newName", "新文件名(可空)")]),
+    # 识别：主程序自带的识别（v4c 模型 / onnxruntime），一步出识别结果 JSON
+    ("识别", []),
     # PDF：底图从哪几页来、怎么对准视口
     ("PDF", [("pageStart", "起始页"), ("pageEnd", "结束页(0=全部)"),
              ("importPages", "导入页码(0=全部)"),
@@ -233,6 +236,10 @@ def load_config():
         d = {}
     out = dict(DEFAULTS)
     out.update({k: v for k, v in d.items() if k in DEFAULTS})
+    # 文件路径一律不记忆（DWG / PDF / 标签文件 / 识别结果 JSON）：
+    # 每次打开都是空的，用的时候自己选 —— 免得照着一台机器上的旧路径去跑。
+    for k in BROWSE_KEYS:
+        out[k] = ""
     return out
 
 
@@ -526,8 +533,7 @@ def build_extract_file(cfg, out_path, prog_path=None):
 
     # 2) 识别结果 debug JSON + 开关打开：LBD 标签填到「识别到的 LBD 区域」上
     #    （PDF 文字层里那些 LBD 名常常在图纸右上角的清单表里，填出来会全跑到角落）
-    if (kind == "debug" and cfg.get("lbdFromRegion", True)
-            and _lr_extract_debug is not None):
+    if kind == "debug" and _lr_extract_debug is not None:
         try:
             r = _lr_extract_debug(jp, out_path, prefix=pre, page_map=pgmap,
                                   order=order, split=split, align=align, avoid=avoid,
@@ -784,7 +790,7 @@ def plan_names(cfg):
     返回 (布局名列表, 说明文字)。读不到分表名时返回空列表。"""
     sheets = read_xlsx_sheet_names(cfg.get("xlsx"))
     if not sheets:
-        return [], "读不到分表名：请先在“文件与输出”里选择 LBD 名称 Excel(xlsx)"
+        return [], "读不到分表名：请先在“文件与输出”里选择标签文件(xlsx)"
     try:
         cnt = int(str(cfg.get("count") or "0").strip() or 0)
     except Exception:
@@ -2220,6 +2226,384 @@ class Bus(QObject):
     upd_detail = Signal(str)      # 下载明细：已下多少 / 总大小 / 速度
     upd_log = Signal(str)         # 下载过程写进界面日志（测速、换源等）
     upd_ready = Signal(str)
+    recog_prog = Signal(int, int, str)     # 识别：已识别 / 总数 / 说明
+    recog_log = Signal(str)                # 识别：日志行
+    recog_done = Signal(object)            # 识别：结束（摘要 dict）
+
+
+class RecogBoxItem(QGraphicsRectItem):
+    """识别预览画布上的一个框：可选中、可拖动；右下角小方块改大小。"""
+
+    def __init__(self, canvas, det_index, kind, rect):
+        super().__init__(rect)
+        self.canvas = canvas
+        self.det_index = det_index
+        self.kind = kind
+        self.setFlag(QGraphicsRectItem.ItemIsSelectable, True)
+        self.setFlag(QGraphicsRectItem.ItemIsMovable, True)
+        self.setFlag(QGraphicsRectItem.ItemSendsGeometryChanges, True)
+        col = QColor(0, 120, 255) if kind == "Node" else QColor(255, 40, 40)
+        pen = QPen(col)
+        pen.setWidth(2 if kind == "Node" else 1)
+        self.setPen(pen)
+        self.setBrush(Qt.NoBrush)
+        self.setZValue(10 if kind == "Node" else 5)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsRectItem.ItemPositionHasChanged:
+            self.canvas.note_box_changed(self)
+        elif change == QGraphicsRectItem.ItemSelectedHasChanged:
+            self.canvas.note_selected(self if value else None)
+        return super().itemChange(change, value)
+
+
+class RecogCanvas(QGraphicsView):
+    """识别结果预览/编辑画布：滚轮缩放、中键平移、框可拖动/改大小/删除、编号可改名。
+
+    改动直接写回识别结果 doc（和 JSON 一份数据）；保存交给页面上的「保存修改」。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setScene(QGraphicsScene(self))
+        self.setRenderHint(QPainter.Antialiasing, True)
+        self.setDragMode(QGraphicsView.RubberBandDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setBackgroundBrush(QColor(20, 20, 20))
+        self.doc = None
+        self.page = None
+        self.pix_item = None
+        self.disp_w = 1.0
+        self.page_w = 1.0
+        self.page_h = 1.0
+        self.box_items = []
+        self.name_items = {}
+        self.ocr_of = {}
+        self.on_changed = None
+        self.on_selected = None
+        self._panning = False
+        self._pan_from = None
+        self._undo = []
+        self.handle = None
+        self._make_handle()
+
+    def _make_handle(self):
+        """（重新）造右下角改大小的小方块 —— scene.clear() 之后必须重建。"""
+        self.handle = QGraphicsRectItem()
+        self.handle.setBrush(QColor(255, 216, 0, 220))
+        self.handle.setPen(QPen(QColor(20, 20, 20, 220), 0))
+        self.handle.setFlag(QGraphicsRectItem.ItemIsMovable, True)
+        self.handle.setZValue(50)
+        self.handle.setVisible(False)
+        self.scene().addItem(self.handle)
+
+    # ---------- 载入一页 ----------
+    def load(self, doc, page, pdf_path, dpi=110, max_w=1100):
+        import detect as _d
+        self.doc, self.page = doc, page
+        self.scene().clear()
+        self._make_handle()
+        self.box_items, self.name_items, self.ocr_of = [], {}, {}
+        trk = next((p for p in doc.get("yolo_tracker_detection_results") or []
+                    if p.get("page_number") == page), None)
+        ocr = next((p for p in doc.get("ocr_node_name_results") or []
+                    if p.get("page_number") == page), None)
+        dets = ((trk or {}).get("data") or {}).get("detections") or []
+        recs = (ocr or {}).get("data") or []
+        for p in (doc.get("input_data") or {}).get("pages") or []:
+            if p.get("page_number") == page:
+                self.page_w = p.get("width") or 1
+                self.page_h = p.get("height") or 1
+        im = _d.render_page(pdf_path, page, dpi=dpi)
+        if im.width > max_w:
+            sc = max_w / float(im.width)
+            im = im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))))
+        qimg = QImage(im.tobytes(), im.width, im.height, 3 * im.width, QImage.Format_RGB888)
+        self.pix_item = self.scene().addPixmap(QPixmap.fromImage(qimg))
+        self.pix_item.setZValue(0)
+        self.disp_w = float(im.width)
+        self.resetTransform()
+        self.scene().setSceneRect(0, 0, im.width, im.height)
+        k = 0
+        for i, d in enumerate(dets):
+            kind = d.get("label") or ""
+            if kind not in ("Node", "Tracker"):
+                continue
+            it = RecogBoxItem(self, i, kind, self._disp_rect(d.get("bbox") or {}))
+            self.scene().addItem(it)
+            self.box_items.append(it)
+            if kind == "Node":
+                if k < len(recs):
+                    self.ocr_of[i] = k
+                k += 1
+        for i, d in enumerate(dets):
+            if (d.get("label") or "") != "Node":
+                continue
+            j = self.ocr_of.get(i)
+            if j is None or j >= len(recs):
+                continue
+            name = (recs[j].get("final_node_name") or "").strip()
+            if not name:
+                continue
+            bb = d.get("bbox") or {}
+            t = self.scene().addSimpleText(name)
+            t.setBrush(QColor(255, 196, 0))
+            t.setPos(self._dx(bb.get("x1", 0)) + 3, self._dy(bb.get("y1", 0)) + 2)
+            t.setZValue(20)
+            self.name_items[j] = t
+        self.fit_width()
+
+    # ---------- 坐标换算（页像素 <-> 画布像素）----------
+    def _k(self):
+        return self.disp_w / float(self.page_w or 1)
+
+    def _dx(self, x):
+        return float(x) * self._k()
+
+    def _dy(self, y):
+        return float(y) * self._k()
+
+    def _disp_rect(self, b):
+        return QRectF(self._dx(b.get("x1", 0)), self._dy(b.get("y1", 0)),
+                      max(1.0, self._dx(b.get("x2", 0)) - self._dx(b.get("x1", 0))),
+                      max(1.0, self._dy(b.get("y2", 0)) - self._dy(b.get("y1", 0))))
+
+    # ---------- 缩放 / 平移 ----------
+    def wheelEvent(self, e):
+        self.zoom(1.15 if e.angleDelta().y() > 0 else 1 / 1.15)
+
+    def zoom(self, factor):
+        self.scale(factor, factor)
+
+    def fit_width(self):
+        if not self.pix_item:
+            return
+        self.resetTransform()
+        w = self.viewport().width() - 4
+        if w > 50 and self.pix_item.boundingRect().width() > 0:
+            s = w / self.pix_item.boundingRect().width()
+            self.scale(s, s)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MiddleButton:
+            self._panning = True
+            self._pan_from = e.position()
+            self.setCursor(Qt.ClosedHandCursor)
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._panning and self._pan_from is not None:
+            d = e.position() - self._pan_from
+            self._pan_from = e.position()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - int(d.x()))
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - int(d.y()))
+            e.accept()
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MiddleButton and self._panning:
+            self._panning = False
+            self.unsetCursor()
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+        it = self.itemAt(e.position().toPoint())
+        if it is self.handle:
+            self._apply_resize()
+        else:
+            self._place_handle()
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.delete_selected()
+            e.accept()
+            return
+        if e.key() == Qt.Key_Z and (e.modifiers() & Qt.ControlModifier):
+            self.undo()
+            e.accept()
+            return
+        super().keyPressEvent(e)
+
+    # ---------- 选中 / 编辑 ----------
+    def selected_box(self):
+        for it in self.scene().selectedItems():
+            if isinstance(it, RecogBoxItem):
+                return it
+        return None
+
+    def note_selected(self, box):
+        self._place_handle()
+        if self.on_selected:
+            try:
+                self.on_selected(box)
+            except Exception:
+                pass
+
+    def _place_handle(self):
+        box = self.selected_box()
+        if box is None or self.handle is None:
+            if self.handle is not None:
+                self.handle.setVisible(False)
+            return
+        r = box.sceneBoundingRect()
+        self.handle.setRect(0, 0, 10, 10)
+        self.handle.setPos(r.right() - 5, r.bottom() - 5)
+        self.handle.setVisible(True)
+
+    def _apply_resize(self):
+        box = self.selected_box()
+        if box is None:
+            return
+        hc = self.handle.pos() + QPointF(5, 5)
+        r = box.sceneBoundingRect()
+        w, hgt = max(6.0, hc.x() - r.left()), max(6.0, hc.y() - r.top())
+        box.setRect(0, 0, w, hgt)
+        self.note_box_changed(box)
+        self._place_handle()
+
+    def _page_data(self):
+        doc = self.doc or {}
+        trk = next((p for p in doc.get("yolo_tracker_detection_results") or []
+                    if p.get("page_number") == self.page), None)
+        ocr = next((p for p in doc.get("ocr_node_name_results") or []
+                    if p.get("page_number") == self.page), None)
+        return trk, ocr
+
+    def push_undo(self):
+        import copy
+        trk, ocr = self._page_data()
+        snap = copy.deepcopy({"trk": (trk or {}).get("data"),
+                              "ocr": (ocr or {}).get("data")})
+        self._undo.append((self.page, snap))
+        if len(self._undo) > 30:
+            self._undo.pop(0)
+
+    def undo(self):
+        if not self._undo:
+            return False
+        page, snap = self._undo.pop()
+        trk, ocr = self._page_data()
+        if trk is not None:
+            trk["data"] = snap["trk"]
+        if ocr is not None:
+            ocr["data"] = snap["ocr"]
+        pdf = getattr(self, "_pdf", "")
+        if page == self.page and pdf:
+            self.load(self.doc, self.page, pdf)
+        if self.on_changed:
+            self.on_changed()
+        return True
+
+    def note_box_changed(self, box):
+        """框被拖动/改大小后：写回 doc 里的 bbox（Node 同时更新名字记录里的 node_bbox）。"""
+        trk, ocr = self._page_data()
+        dets = ((trk or {}).get("data") or {}).get("detections") or []
+        if not (0 <= box.det_index < len(dets)):
+            return
+        r = box.sceneBoundingRect()
+        k = float(self.page_w or 1) / max(1.0, self.disp_w)
+        bb = {"x1": r.left() * k, "y1": r.top() * k,
+              "x2": r.right() * k, "y2": r.bottom() * k}
+        dets[box.det_index]["bbox"] = bb
+        j = self.ocr_of.get(box.det_index)
+        recs = ((ocr or {}).get("data") or []) if ocr is not None else []
+        if j is not None and j < len(recs):
+            recs[j]["node_bbox"] = dict(bb)
+            t = self.name_items.get(j)
+            if t is not None:
+                t.setPos(self._dx(bb["x1"]) + 3, self._dy(bb["y1"]) + 2)
+        self._place_handle()
+        if self.on_changed:
+            self.on_changed()
+
+    def delete_selected(self):
+        boxes = [it for it in self.scene().selectedItems() if isinstance(it, RecogBoxItem)]
+        if not boxes:
+            return 0
+        self.push_undo()
+        trk, ocr = self._page_data()
+        dets = ((trk or {}).get("data") or {}).get("detections") or []
+        recs = ((ocr or {}).get("data") or []) if ocr is not None else []
+        kill = sorted({b.det_index for b in boxes}, reverse=True)
+        for i in kill:
+            if 0 <= i < len(dets):
+                del dets[i]
+            j = self.ocr_of.get(i)
+            if j is not None and j < len(recs):
+                recs.pop(j)
+                self.ocr_of = {k: (v - 1 if v > j else v)
+                               for k, v in self.ocr_of.items() if k != i}
+            self.ocr_of.pop(i, None)
+        for b in boxes:
+            self.scene().removeItem(b)
+        self.box_items = [b for b in self.box_items if b.det_index not in kill]
+        self._reindex()
+        if self.on_changed:
+            self.on_changed()
+        return len(kill)
+
+    def _reindex(self):
+        """删过之后 det 下标变了：按当前 dets 顺序重排框和名字下标。"""
+        trk, ocr = self._page_data()
+        dets = ((trk or {}).get("data") or {}).get("detections") or []
+        recs = ((ocr or {}).get("data") or []) if ocr is not None else []
+        order = sorted(self.box_items, key=lambda b: b.det_index)
+        for new_i, b in enumerate(order):
+            b.det_index = new_i
+        self.box_items = order
+        self.ocr_of = {}
+        k = 0
+        for i, d in enumerate(dets):
+            if (d.get("label") or "") == "Node":
+                if k < len(recs):
+                    self.ocr_of[i] = k
+                k += 1
+
+    def rename_selected(self, name):
+        box = self.selected_box()
+        if box is None or box.kind != "Node":
+            return False
+        j = self.ocr_of.get(box.det_index)
+        trk, ocr = self._page_data()
+        recs = ((ocr or {}).get("data") or []) if ocr is not None else []
+        if j is None or j >= len(recs):
+            return False
+        self.push_undo()
+        recs[j]["final_node_name"] = name
+        recs[j]["preliminary_node_name"] = name
+        sel = recs[j].get("selected") or {}
+        sel["text"] = name
+        recs[j]["selected"] = sel
+        t = self.name_items.get(j)
+        if t is not None:
+            self.scene().removeItem(t)
+            self.name_items.pop(j, None)
+        bb = recs[j].get("node_bbox") or {}
+        if name:
+            t = self.scene().addSimpleText(name)
+            t.setBrush(QColor(255, 196, 0))
+            t.setPos(self._dx(bb.get("x1", 0)) + 3, self._dy(bb.get("y1", 0)) + 2)
+            t.setZValue(20)
+            self.name_items[j] = t
+        if self.on_changed:
+            self.on_changed()
+        return True
+
+    def selected_info(self):
+        box = self.selected_box()
+        if box is None:
+            return None
+        trk, ocr = self._page_data()
+        dets = ((trk or {}).get("data") or {}).get("detections") or []
+        recs = ((ocr or {}).get("data") or []) if ocr is not None else []
+        j = self.ocr_of.get(box.det_index)
+        nm = (recs[j].get("final_node_name") or "") if (j is not None and j < len(recs)) else ""
+        cf = (dets[box.det_index].get("confidence")
+              if 0 <= box.det_index < len(dets) else None)
+        return {"kind": box.kind, "name": nm, "conf": cf, "ocr_index": j}
 
 
 class NoWheelCombo(QComboBox):
@@ -2791,6 +3175,9 @@ class MainWindow(QMainWindow):
         self.bus.upd_detail.connect(self.on_upd_detail)
         self.bus.upd_log.connect(self.on_upd_log)
         self.bus.upd_ready.connect(self.on_upd_ready)
+        self.bus.recog_prog.connect(self.on_recog_prog)
+        self.bus.recog_log.connect(self.on_recog_log)
+        self.bus.recog_done.connect(self.on_recog_done)
         self.edits = {}
         self.checkbox = {}
         self.combo = {}
@@ -2944,6 +3331,8 @@ class MainWindow(QMainWindow):
         return sb
 
     def _build_section_page(self, s_idx, sec_title, keys):
+        if sec_title == "识别":
+            return self._build_recog_page()
         page = QWidget()
         outer = QVBoxLayout(page)
         outer.setContentsMargins(28, 24, 28, 24)
@@ -2959,9 +3348,7 @@ class MainWindow(QMainWindow):
         if sec_title == "选项":
             r = 0
             for key, txt, init in [("overwrite", "覆盖同名布局", False),
-                                   ("filterCluster", "排除集中干扰标号", True),
                                    ("regionFit", "生成布局后按 LBD 区域上下限对准视口", True),
-                                   ("lbdFromRegion", "LBD 标签按识别到的区域位置填（不勾=按 PDF 里的 LBD 文字位置）", True),
                                    ("rackAuto", "支架类型自动读识别结果(免手填)", True)]:
                 cb = QCheckBox(txt)
                 cb.setChecked(init)
@@ -3066,6 +3453,453 @@ class MainWindow(QMainWindow):
         sc.setFrameShape(QFrame.NoFrame)
         sc.setWidget(page)
         return sc
+
+    # ---------------- 识别页：主程序自带识别（v4c / onnxruntime） ----------------
+    def _build_recog_page(self):
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(28, 24, 28, 24)
+        outer.setSpacing(12)
+        h = QLabel("识别")
+        h.setObjectName("PageTitle")
+        outer.addWidget(h)
+        tip = QLabel("用「文件与输出」里选的 PDF 文件识别（模型 v4c，直接在程序里跑，不用另装 Python）。\n"
+                     "跑完会自动把结果填进「识别结果 JSON文件」，接着往下走标签 / 执行即可；"
+                     "LBD 编号会自动按 PDF 文字层配上，编号印在哪儿也一起记下来给避让用。")
+        tip.setObjectName("Hint")
+        tip.setWordWrap(True)
+        outer.addWidget(tip)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(QLabel("识别页码"))
+        self.recog_pages_edit = QLineEdit()
+        self.recog_pages_edit.setObjectName("Field")
+        self.recog_pages_edit.setPlaceholderText("留空 = 全部；也可写 3-8,12")
+        self.recog_pages_edit.setMaximumWidth(260)
+        row.addWidget(self.recog_pages_edit)
+        self.recog_btn = QPushButton("开始识别")
+        self.recog_btn.setObjectName("Primary")
+        self.recog_btn.clicked.connect(self.on_recognize)
+        row.addWidget(self.recog_btn)
+        self.recog_status = QLabel("")
+        self.recog_status.setObjectName("Hint")
+        row.addWidget(self.recog_status, 1)
+        outer.addLayout(row)
+        self.recog_bar = QProgressBar()
+        self.recog_bar.setTextVisible(True)
+        self.recog_bar.setValue(0)
+        outer.addWidget(self.recog_bar)
+        # 结果区：左表格 / 右画布
+        res = QHBoxLayout()
+        res.setSpacing(10)
+        self.recog_table = QTableWidget(0, 5)
+        self.recog_table.setHorizontalHeaderLabels(["页", "LBD 区", "支架", "配到编号", "编号位置"])
+        self.recog_table.verticalHeader().setVisible(False)
+        self.recog_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.recog_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.recog_table.setMaximumWidth(360)
+        self.recog_table.itemSelectionChanged.connect(self.on_recog_page_changed)
+        res.addWidget(self.recog_table)
+        pv = QVBoxLayout()
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel("预览"))
+        self.recog_page_combo = NoWheelCombo()
+        self.recog_page_combo.setObjectName("Field")
+        self.recog_page_combo.setMinimumWidth(120)
+        self.recog_page_combo.currentIndexChanged.connect(self.on_recog_page_changed)
+        prow.addWidget(self.recog_page_combo)
+        self.recog_preview_info = QLabel("识别完这里会画出识别到的框（蓝=LBD 区，红=支架，橙=编号位置）")
+        self.recog_preview_info.setObjectName("Hint")
+        prow.addWidget(self.recog_preview_info, 1)
+        pv.addLayout(prow)
+        tb = QHBoxLayout()
+        for text, slot, tip_ in (("＋", self.on_recog_zoom_in, "放大（也可以滚轮）"),
+                                 ("－", self.on_recog_zoom_out, "缩小（也可以滚轮）"),
+                                 ("适应宽度", self.on_recog_fit, "缩放到整页宽"),
+                                 ("删除选中", self.on_recog_delete, "删掉选中的框（Delete 键同效）"),
+                                 ("撤销", self.on_recog_undo, "撤销上一步改动")):
+            b = QPushButton(text)
+            b.setToolTip(tip_)
+            b.clicked.connect(slot)
+            tb.addWidget(b)
+        tb.addWidget(QLabel("编号"))
+        self.recog_name_edit = QLineEdit()
+        self.recog_name_edit.setObjectName("Field")
+        self.recog_name_edit.setPlaceholderText("选中一个 LBD 区后可改名")
+        self.recog_name_edit.setMinimumWidth(170)
+        self.recog_name_edit.returnPressed.connect(self.on_recog_rename)
+        tb.addWidget(self.recog_name_edit, 1)
+        b = QPushButton("改名")
+        b.clicked.connect(self.on_recog_rename)
+        tb.addWidget(b)
+        self.recog_save_btn = QPushButton("保存修改")
+        self.recog_save_btn.setEnabled(False)
+        self.recog_save_btn.clicked.connect(self.on_save_recog_edits)
+        tb.addWidget(self.recog_save_btn)
+        pv.addLayout(tb)
+        self.recog_canvas = RecogCanvas(self)
+        self.recog_canvas.setMinimumHeight(300)
+        self.recog_canvas.on_changed = self._recog_mark_dirty
+        self.recog_canvas.on_selected = self.on_recog_box_selected
+        pv.addWidget(self.recog_canvas, 1)
+        prow2 = QHBoxLayout()
+        self.recog_hint2 = QLabel("滚轮缩放 · 中键拖动平移 · 拖框改位置 · 右下角小方块改大小 · Delete 删除")
+        self.recog_hint2.setObjectName("Hint")
+        prow2.addWidget(self.recog_hint2, 1)
+        self.recog_export_btn = QPushButton("导出识别结果 JSON…")
+        self.recog_export_btn.setEnabled(False)
+        self.recog_export_btn.clicked.connect(self.on_export_recog_json)
+        prow2.addWidget(self.recog_export_btn)
+        pv.addLayout(prow2)
+        res.addLayout(pv, 1)
+        outer.addLayout(res, 1)
+        self.recog_view = QPlainTextEdit()
+        self.recog_view.setObjectName("Log")
+        self.recog_view.setReadOnly(True)
+        self.recog_view.setMaximumHeight(140)
+        outer.addWidget(self.recog_view)
+        return page
+
+    def on_recognize(self):
+        """点「开始识别」：后台起线程跑（不卡界面）。"""
+        cfg = self.cfg()
+        pdf = (cfg.get("pdf") or "").strip()
+        self._recog_write("=== 点了「开始识别」：pdf=%s 页码=%r running=%s"
+                          % (pdf, self.recog_pages_edit.text().strip(),
+                             getattr(self, "_recog_running", False)))
+        if not pdf or not os.path.exists(pdf):
+            self.log_msg("先选 PDF 文件（「文件与输出」页）")
+            self.recog_view.appendPlainText("先选 PDF 文件。")
+            return
+        if getattr(self, "_recog_running", False):
+            self._recog_write("上一轮还在跑（running=True），这次点击忽略")
+            return
+        self._recog_running = True
+        self.recog_btn.setEnabled(False)
+        self.recog_btn.setText("识别中…")
+        self.recog_view.clear()
+        self.recog_bar.setMaximum(0)
+        self.recog_status.setText("准备中…")
+        threading.Thread(target=self._recog_worker,
+                         args=(cfg, self.recog_pages_edit.text().strip()),
+                         daemon=True).start()
+
+    def _recog_write(self, msg):
+        """识别过程的落盘日志（%TEMP%\\vcad_recog_log.txt）—— 卡住时靠它定位。
+
+        可能在后台线程里被调，所以只写文件 + 发信号，界面更新交给主线程。
+        """
+        line = "%s  %s" % (time.strftime("%H:%M:%S"), msg)
+        try:
+            p = os.path.join(tempfile.gettempdir(), "vcad_recog_log.txt")
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+        self.bus.recog_log.emit(msg)
+
+    def _recog_worker(self, cfg, pages_spec):
+        import traceback
+        try:
+            self._recog_worker_inner(cfg, pages_spec)
+        except BaseException:
+            self._recog_write("识别线程异常：\n" + traceback.format_exc())
+            self.bus.recog_done.emit({"ok": False})
+
+    def _recog_worker_inner(self, cfg, pages_spec):
+        import traceback
+        self._recog_write("线程起来了，开始导入识别模块…")
+        try:
+            import detect as _d
+        except Exception as e:
+            self._recog_write("识别模块用不了：%s（打包版应自带 onnxruntime / pypdfium2）" % e)
+            self.bus.recog_done.emit({"ok": False})
+            return
+        pdf = (cfg.get("pdf") or "").strip()
+        try:
+            self._recog_write("识别模块 OK（模型：%s）" % _d.model_path())
+        except Exception:
+            pass
+        try:
+            sheets = read_xlsx_lbd_labels(cfg.get("xlsx") or "")
+        except Exception:
+            sheets = {}
+        self._recog_write("标签文件分表数：%d" % len(sheets))
+        try:
+            total = _d.pdf_page_count(pdf)
+            pages = _d.parse_pages(pages_spec, total)
+            self._recog_write("PDF %d 页，%s" % (total, "识别全部" if not pages
+                                              else "识别 %d 页" % len(pages)))
+            self._recog_write("开始识别（第一页要先建模型会话 / 渲染，稍等）…")
+
+            def _prog(n, alln, pg):
+                self.bus.recog_prog.emit(n, alln, "第 %s 页" % pg)
+                self._recog_write("第 %s 页识别完（%d/%d）" % (pg, n, alln))
+
+            doc, sm = _d.detect_and_name(
+                pdf, pages=pages, sheets=sheets, sheet_names=list(sheets),
+                progress=_prog, log=lambda m: self.bus.recog_log.emit(m))
+        except Exception as e:
+            self._recog_write("识别失败：%s\n%s" % (e, traceback.format_exc()))
+            self.bus.recog_done.emit({"ok": False})
+            return
+        self._recog_write("识别跑完，写 JSON…")
+        out = os.path.join(tempfile.gettempdir(), "vcad_recognize.json")
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                json.dump(doc, f, ensure_ascii=False)
+        except Exception as e:
+            self._recog_write("写识别结果失败：%s" % e)
+            self.bus.recog_done.emit({"ok": False})
+            return
+        self._recog_write("JSON 写好：%s" % out)
+        self.bus.recog_done.emit({"ok": True, "path": out, "summary": sm, "doc": doc})
+
+    def on_recog_prog(self, done, total, text):
+        if not hasattr(self, "recog_bar"):
+            return
+        self.recog_bar.setMaximum(max(1, total))
+        self.recog_bar.setValue(done)
+        self.recog_status.setText("%s（%d/%d）" % (text, done, total))
+
+    def on_recog_log(self, msg):
+        if hasattr(self, "recog_view"):
+            self.recog_view.appendPlainText(msg)
+            self.recog_view.verticalScrollBar().setValue(
+                self.recog_view.verticalScrollBar().maximum())
+        if hasattr(self, "recog_status"):
+            self.recog_status.setText(msg[:70])
+        self.log_msg(msg)
+
+    def on_recog_done(self, info):
+        info = info or {}
+        self._recog_running = False
+        if hasattr(self, "recog_btn"):
+            self.recog_btn.setEnabled(True)
+            self.recog_btn.setText("开始识别")
+        if not info.get("ok"):
+            if hasattr(self, "recog_status"):
+                self.recog_status.setText("识别失败（看下面日志）")
+            return
+        path = info.get("path") or ""
+        self.set_text("jsonPath", path)
+        sm = info.get("summary") or {}
+        st = sm.get("stat") or {}
+        self.on_recog_log("识别完成：%d 页；LBD 区 %d 个（配到编号 %d、按标签表推 %d、没读到 %d），"
+                          "编号位置 %d 个"
+                          % (st.get("pages", 0),
+                             st.get("named", 0) + st.get("auto", 0) + st.get("missed", 0),
+                             st.get("named", 0), st.get("auto", 0),
+                             st.get("missed", 0), st.get("pos", 0)))
+        if sm.get("note"):
+            self.on_recog_log(sm["note"])
+            self.on_recog_log("→ 到「支架」页把每档的串数填上（例如 9:227.3, 13:329），"
+                              "或直接在明细行填「长度FT + 串数」")
+        self.on_recog_log("识别结果已填进「识别结果 JSON文件」：%s" % path)
+        self._recog_doc = info.get("doc") or None
+        self._recog_tmp_path = path
+        self._recog_dirty = False
+        self._fill_recog_table()
+        if hasattr(self, "recog_export_btn"):
+            self.recog_export_btn.setEnabled(bool(self._recog_doc))
+        self.auto_fill_rack_types_async(self.cfg(), announce=True)
+
+    # ---------- 结果表格 / 预览 ----------
+    def _recog_pages_of_doc(self):
+        doc = getattr(self, "_recog_doc", None) or {}
+        dets = {p.get("page_number"): (p.get("data") or {}).get("detections") or []
+                for p in doc.get("yolo_tracker_detection_results") or []}
+        names = {p.get("page_number"): (p.get("data") or [])
+                 for p in doc.get("ocr_node_name_results") or []}
+        size = {p.get("page_number"): (p.get("width"), p.get("height"))
+                for p in (doc.get("input_data") or {}).get("pages") or []}
+        out = []
+        for pg in sorted(dets):
+            n_node = sum(1 for d in dets[pg] if (d.get("label") or "") == "Node")
+            n_trk = sum(1 for d in dets[pg] if (d.get("label") or "") == "Tracker")
+            recs = names.get(pg) or []
+            n_named = sum(1 for r in recs if (r.get("final_node_name") or "").strip())
+            n_pos = sum(1 for r in recs if r.get("label_pos"))
+            w, h = size.get(pg, (0, 0))
+            out.append((pg, n_node, n_trk, n_named, n_pos, w, h))
+        return out
+
+    def _fill_recog_table(self, select_page=None, reload_preview=True):
+        if not hasattr(self, "recog_table"):
+            return
+        rows = self._recog_pages_of_doc()
+        self.recog_table.setRowCount(len(rows))
+        for i, (pg, nn, nt, n_named, n_pos, _w, _h) in enumerate(rows):
+            for j, val in enumerate((pg, nn, nt, n_named, n_pos)):
+                self.recog_table.setItem(i, j, QTableWidgetItem(str(val)))
+        try:
+            self.recog_table.resizeColumnsToContents()
+            self.recog_table.horizontalHeader().setStretchLastSection(True)
+        except Exception:
+            pass
+        if hasattr(self, "recog_page_combo"):
+            self.recog_page_combo.blockSignals(True)
+            self.recog_page_combo.clear()
+            for pg, _a, _b, _c, _d, _w, _h in rows:
+                self.recog_page_combo.addItem("第 %s 页" % pg, pg)
+            if select_page is not None:
+                i = self.recog_page_combo.findData(select_page)
+                if i >= 0:
+                    self.recog_page_combo.setCurrentIndex(i)
+            self.recog_page_combo.blockSignals(False)
+        if rows and reload_preview:
+            pages = [r[0] for r in rows]
+            self._recog_preview_page(select_page if select_page in pages else rows[0][0])
+
+    def on_recog_page_changed(self, *_a):
+        pg = None
+        if hasattr(self, "recog_page_combo") and self.recog_page_combo.count():
+            pg = self.recog_page_combo.currentData()
+        if hasattr(self, "recog_table"):
+            sel = self.recog_table.selectionModel().selectedRows()
+            if sel:
+                try:
+                    pg = int(self.recog_table.item(sel[0].row(), 0).text())
+                except Exception:
+                    pass
+        if pg:
+            if hasattr(self, "recog_page_combo"):
+                i = self.recog_page_combo.findData(pg)
+                if i >= 0 and i != self.recog_page_combo.currentIndex():
+                    self.recog_page_combo.blockSignals(True)
+                    self.recog_page_combo.setCurrentIndex(i)
+                    self.recog_page_combo.blockSignals(False)
+            self._recog_preview_page(pg)
+
+    def _recog_preview_page(self, pg):
+        """把这一页载进画布（可缩放 / 可编辑；蓝=LBD 区 / 红=支架 / 橙=编号位置）。"""
+        doc = getattr(self, "_recog_doc", None)
+        pdf = (self.get_text("pdf") or "").strip()
+        if not doc or not pdf or not os.path.exists(pdf) or not hasattr(self, "recog_canvas"):
+            return
+        try:
+            self.recog_canvas._pdf = pdf
+            self.recog_canvas.load(doc, pg, pdf)
+            self._recog_update_page_info(pg)
+        except Exception as e:
+            self.recog_hint2.setText("这一页画不出来：%s" % e)
+
+    def _recog_update_page_info(self, pg=None):
+        if pg is None:
+            pg = getattr(self, "_recog_page", None)
+        self._recog_page = pg
+        rows = [r for r in self._recog_pages_of_doc() if r[0] == pg]
+        if rows and hasattr(self, "recog_preview_info"):
+            _pg, nn, nt, n_named, n_pos, _w, _h = rows[0]
+            self.recog_preview_info.setText(
+                "第 %s 页：LBD 区 %d、支架 %d、配到编号 %d、编号位置 %d"
+                % (pg, nn, nt, n_named, n_pos))
+
+    # ---------- 画布上的编辑动作 ----------
+    def _recog_mark_dirty(self):
+        self._recog_dirty = True
+        if hasattr(self, "recog_save_btn"):
+            self.recog_save_btn.setEnabled(True)
+        # 只刷新数字，**不重载画布** —— 否则拖动一次就丢选择、缩放被重置
+        self._fill_recog_table(select_page=getattr(self, "_recog_page", None),
+                               reload_preview=False)
+        self._recog_update_page_info()
+
+    def on_recog_box_selected(self, box):
+        info = self.recog_canvas.selected_info() if hasattr(self, "recog_canvas") else None
+        if not info:
+            return
+        if info["kind"] == "Node":
+            self.recog_name_edit.setText(info.get("name") or "")
+            self.recog_name_edit.setEnabled(True)
+        else:
+            self.recog_name_edit.setText("")
+            self.recog_name_edit.setEnabled(False)
+        cf = info.get("conf")
+        self.recog_preview_info.setText("%s　置信度 %s　（改完记得点「保存修改」）"
+                                        % (info["kind"], ("%.3f" % cf) if cf else "—"))
+
+    def on_recog_zoom_in(self):
+        if hasattr(self, "recog_canvas"):
+            self.recog_canvas.zoom(1.25)
+
+    def on_recog_zoom_out(self):
+        if hasattr(self, "recog_canvas"):
+            self.recog_canvas.zoom(1 / 1.25)
+
+    def on_recog_fit(self):
+        if hasattr(self, "recog_canvas"):
+            self.recog_canvas.fit_width()
+
+    def on_recog_delete(self):
+        if not hasattr(self, "recog_canvas"):
+            return
+        n = self.recog_canvas.delete_selected()
+        self._recog_write("删掉了 %d 个框（记得「保存修改」）" % n if n else "先点一个框，再删")
+
+    def on_recog_rename(self):
+        if not hasattr(self, "recog_canvas"):
+            return
+        name = self.recog_name_edit.text().strip()
+        if self.recog_canvas.rename_selected(name):
+            self._recog_write("编号改成：%s（记得「保存修改」）" % (name or "（空）"))
+        else:
+            self._recog_write("先选中一个 LBD 区（蓝框），再改名")
+
+    def on_recog_undo(self):
+        if hasattr(self, "recog_canvas") and self.recog_canvas.undo():
+            self._recog_write("已撤销上一步")
+            self._recog_update_page_info()
+            self._fill_recog_table(select_page=getattr(self, "_recog_page", None),
+                                   reload_preview=False)
+
+    def on_export_recog_json(self):
+        """把识别结果导出成 JSON（导出后下游就用这份）。"""
+        doc = getattr(self, "_recog_doc", None)
+        if not doc:
+            QMessageBox.information(self, "还没识别", "先跑一次「开始识别」，再来导出。")
+            return
+        base = os.path.splitext(os.path.basename(self.get_text("pdf") or "识别结果"))[0]
+        path, _f = QFileDialog.getSaveFileName(self, "导出识别结果 JSON",
+                                              base + "_识别结果.json", "JSON (*.json)")
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(doc, f, ensure_ascii=False)
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", str(e))
+            return
+        self.set_text("jsonPath", path)
+        self._recog_write("识别结果已导出：%s" % path)
+
+    def on_save_recog_edits(self):
+        """把画布上的改动写回 JSON（临时那份 + 你导出过的那份）。"""
+        doc = getattr(self, "_recog_doc", None)
+        if not doc:
+            return
+        paths = []
+        tmp = getattr(self, "_recog_tmp_path", "")
+        if tmp:
+            paths.append(tmp)
+        cur = (self.get_text("jsonPath") or "").strip()
+        if cur and cur not in paths:
+            paths.append(cur)
+        ok = 0
+        for p in paths:
+            try:
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump(doc, f, ensure_ascii=False)
+                ok += 1
+            except Exception as e:
+                self._recog_write("保存失败 %s：%s" % (p, e))
+        if ok:
+            self._recog_dirty = False
+            if hasattr(self, "recog_save_btn"):
+                self.recog_save_btn.setEnabled(False)
+            self._recog_write("修改已保存到 JSON（%d 份：%s）" % (ok, "；".join(paths)))
 
     def _build_rack_panel(self):
         """支架类型明细：每个支架类型单独一行；类型自动来自识别结果，拆不拆手工选。"""
@@ -3417,9 +4251,7 @@ class MainWindow(QMainWindow):
         c["templateLayout"] = DEFAULTS["templateLayout"]
         c["filter"] = DEFAULTS["filter"]
         c["overwrite"] = self.checkbox["overwrite"].isChecked()
-        c["filterCluster"] = self.checkbox["filterCluster"].isChecked()
         c["regionFit"] = self.checkbox["regionFit"].isChecked()
-        c["lbdFromRegion"] = self.checkbox["lbdFromRegion"].isChecked()
         c["rackAuto"] = self.checkbox["rackAuto"].isChecked()
         c["labelWhere"] = "M"          # 固定模型空间（界面不再给「当前布局」选项）
         # 四个象限的顺序合并成一行存进配置（下游只认这一行，见 quad_map_spec）
@@ -3463,9 +4295,7 @@ class MainWindow(QMainWindow):
             else:
                 self.set_text(k, c.get(k, DEFAULTS.get(k, "")))
         self.checkbox["overwrite"].setChecked(bool(c.get("overwrite")))
-        self.checkbox["filterCluster"].setChecked(bool(c.get("filterCluster")))
         self.checkbox["regionFit"].setChecked(bool(c.get("regionFit", True)))
-        self.checkbox["lbdFromRegion"].setChecked(bool(c.get("lbdFromRegion", True)))
         self.checkbox["rackAuto"].setChecked(bool(c.get("rackAuto", True)))
         # 老配置里只有合并那一行 "右上=4;左上=8"（没有四个下拉的值）时，拆回四个下拉
         if not any(str(c.get(k, "") or "").strip() for k, _q in QUAD_FIELDS):
