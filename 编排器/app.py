@@ -288,7 +288,7 @@ TEXT_EN = {
     "蓝": "Blue", "洋红": "Magenta", "白": "White", "灰": "Grey",
     # ---- 识别页 ----
     "PDF 文件": "PDF file",
-    "选 PDF…": "Choose PDF…",
+    "上传 PDF": "Upload PDF",
     "选要识别的 PDF（图纸集）": "PDF to recognize",
     "识别页码": "Pages",
     "留空 = 全部；也可写 3-8,12": "empty = all; also 3-8,12",
@@ -322,8 +322,8 @@ TEXT_EN = {
     "只保留": "Keep only",
     "页范围，如 23-108": "page range, e.g. 23-108",
     "过滤": "Filter",
-    "滚轮缩放 · 中键拖动平移 · 拖框改位置 · 右下角小方块改大小 · Delete 删除":
-        "Wheel = zoom · middle-drag = pan · drag = move · corner handle = resize · Delete = remove",
+    "滚轮缩放 · 中键拖动平移 · 拖框改位置 · 拖控制点改大小 · Delete 删除":
+        "Wheel = zoom · middle-drag = pan · drag = move · drag a control point = resize · Delete = remove",
     "名字栏（选中框 → 这里同步；双击可改名）":
         "Name list (select a box; double-click to rename)",
     "支架类型（识别出来按长度分档，这里填串数；点「应用到支架页」或直接「下一步」）":
@@ -2487,6 +2487,14 @@ QComboBox QAbstractItemView { background-color: #1f2124; color: #DADFE3;
 QListWidget { background-color: #1f2124; border: 1px solid #2a2c2e; border-radius: 8px;
   color: #DADFE3; }
 QListWidget::item { padding: 4px 6px; }
+/* 识别页顶部控件多，这一页单独用更紧凑的尺寸（不动其他页） */
+QWidget#RecogPage QPushButton { padding: 4px 12px; }
+QWidget#RecogPage QLineEdit { padding: 3px 8px; }
+QWidget#RecogPage QComboBox { padding: 1px 8px; }
+QWidget#RecogPage QProgressBar { max-height: 10px; }
+QWidget#RecogPage QListWidget { padding: 0px; }
+QLabel#RecogStatus { color: #5c6064; font-size: 11px; background: transparent; }
+QLabel#RecogTip { color: #5c6064; font-size: 11px; background: transparent; }
 """
 
 
@@ -2542,6 +2550,13 @@ class RecogBoxItem(QGraphicsRectItem):
         return super().itemChange(change, value)
 
 
+# 识别页的快捷键说明：挂在「快捷键」小按钮的提示/弹窗里，不挂在画布上（悬停弹字太烦）
+RECOG_SHORTCUTS = (
+    "滚轮或 Ctrl+＋/－ 缩放 · Ctrl+0 适应页面 · Ctrl+1 适应宽度 · 中键拖动平移 · "
+    "拖框改位置 · 拖八个控制点改大小 · A/D 或 PgUp/PgDn 前后翻页 · "
+    "Delete 删除 · Ctrl+Z 撤销 · Ctrl+C / Ctrl+V 复制粘贴框")
+
+
 class RecogCanvas(QGraphicsView):
     """识别结果预览/编辑画布：滚轮缩放、中键平移、框可拖动/改大小/删除、编号可改名。
 
@@ -2551,13 +2566,18 @@ class RecogCanvas(QGraphicsView):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setScene(QGraphicsScene(self))
-        self.setRenderHint(QPainter.Antialiasing, True)
+        # 和标注工具一样：抗锯齿 + 图片平滑缩放（缩小时底图不毛糙）
+        self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
         self.setDragMode(QGraphicsView.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        # 重绘便宜一点：只刷变化的那块区域，且不用为每个图元保存画笔状态
+        self.setViewportUpdateMode(QGraphicsView.SmartViewportUpdate)
+        self.setOptimizationFlag(QGraphicsView.DontSavePainterState, True)
         self.setBackgroundBrush(QColor(20, 20, 20))
         self.doc = None
         self.page = None
         self.pix_item = None
+        self._img_cache = {}           # {(pdf, 页, dpi, max_w): QImage} —— 同一页不重复渲染
         self.disp_w = 1.0
         self.page_w = 1.0
         self.page_h = 1.0
@@ -2565,10 +2585,12 @@ class RecogCanvas(QGraphicsView):
         self.name_items = {}
         self.ocr_of = {}
         self.on_changed = None
+        self.on_changed_fast = None    # 拖动/缩放过程中用（只标记改动，别重建表格）
         self.on_selected = None
         self.on_added = None           # 拖出一个新框之后的回调（界面刷新名字栏/统计）
         self.on_deleted = None         # 删框之后的回调（界面同步刷新结果）
         self.on_page_key = None        # 键盘翻页回调（PgUp/PgDn、Ctrl+←/→）
+        self.on_rack_step = None       # A/D：前/后跳一个支架（回调给主窗口）
         self.add_mode = ""             # "" = 不在加框模式；否则 = 要画的框类型
         self._rubber = None
         self._rubber_from = None
@@ -2577,20 +2599,18 @@ class RecogCanvas(QGraphicsView):
         self._undo = []
         self._fit_mode = "page"        # "page"=整页装进视口 / "width"=适应宽度 / ""=手动缩放
         self.sel_label = None          # 选中框的名字（和标注软件一样：只显示选中的那个）
-        self.handle = None
+        self._resize = None            # 正在拖控制点改大小：{box, idx, start, rect}
+        self._drag_active = False      # 正按着鼠标拖框/拖控制点
         self._make_handle()
 
     def _make_handle(self):
-        """（重新）造右下角改大小的小方块 —— scene.clear() 之后必须重建。"""
-        self.handle = QGraphicsRectItem()
-        self.handle.setBrush(QColor(255, 216, 0, 220))
-        _hp = QPen(QColor(20, 20, 20, 220), 0)
-        _hp.setCosmetic(True)
-        self.handle.setPen(_hp)
-        self.handle.setFlag(QGraphicsRectItem.ItemIsMovable, True)
-        self.handle.setZValue(50)
-        self.handle.setVisible(False)
-        self.scene().addItem(self.handle)
+        """（重新）造名字标签 —— scene.clear() 之后必须重建。
+
+        改大小的控制点不用图元了（老做法是一个「可移动」的小方块，Qt 在按下时会
+        忽略它、把事件交给下面的框，结果拖角只会把框拖走、尺寸根本不改），
+        改成和标注工具一样：画布自己画 8 个控制点 + 自己做命中检测 + 实时改尺寸。
+        """
+        self._resize = None
         # 选中框的名字标签（只有一个，跟着选中项走）
         self.sel_label = QGraphicsSimpleTextItem()
         self.sel_label.setBrush(QColor(255, 196, 0))
@@ -2602,6 +2622,8 @@ class RecogCanvas(QGraphicsView):
     def load(self, doc, page, pdf_path, dpi=110, max_w=1100):
         import detect as _d
         self.doc, self.page = doc, page
+        # 记住这次用的清晰度：加框/撤销/粘贴后的重载要沿用，否则底图会掉回低清
+        self._load_dpi, self._load_maxw = int(dpi), int(max_w)
         self.scene().clear()
         self._make_handle()
         self.box_items, self.name_items, self.ocr_of = [], {}, {}
@@ -2615,16 +2637,25 @@ class RecogCanvas(QGraphicsView):
             if p.get("page_number") == page:
                 self.page_w = p.get("width") or 1
                 self.page_h = p.get("height") or 1
-        im = _d.render_page(pdf_path, page, dpi=dpi)
-        if im.width > max_w:
-            sc = max_w / float(im.width)
-            im = im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))))
-        qimg = QImage(im.tobytes(), im.width, im.height, 3 * im.width, QImage.Format_RGB888)
+        # 底图渲染一次要 1 秒上下（大图纸更久），而加框/删框/撤销都会重新 load —— 
+        # 缓存住同一页，编辑时就不用反复重渲染（这是「拖起来不顺」的大头）。
+        ck = (pdf_path, page, int(dpi), int(max_w))
+        qimg = self._img_cache.get(ck)
+        if qimg is None:
+            im = _d.render_page(pdf_path, page, dpi=dpi)
+            if im.width > max_w:
+                sc = max_w / float(im.width)
+                im = im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))))
+            qimg = QImage(im.tobytes(), im.width, im.height, 3 * im.width,
+                          QImage.Format_RGB888)
+            self._img_cache[ck] = qimg
+            while len(self._img_cache) > 4:        # 最多留 4 页（一页十几 MB）
+                self._img_cache.pop(next(iter(self._img_cache)))
         self.pix_item = self.scene().addPixmap(QPixmap.fromImage(qimg))
         self.pix_item.setZValue(0)
-        self.disp_w = float(im.width)
+        self.disp_w = float(qimg.width())       # 用缓存里的图也要拿得到宽高
         self.resetTransform()
-        self.scene().setSceneRect(0, 0, im.width, im.height)
+        self.scene().setSceneRect(0, 0, qimg.width(), qimg.height())
         k = 0
         for i, d in enumerate(dets):
             kind = d.get("label") or ""
@@ -2639,6 +2670,19 @@ class RecogCanvas(QGraphicsView):
                 k += 1
         self.name_items = {}          # 名字只显示选中的那个（和标注软件一致）
         self.fit_page()
+
+    def reload_page(self):
+        """按上次的清晰度重画当前页（加框 / 撤销 / 粘贴之后用）。
+
+        这几处以前是 self.load(..., pdf) 用默认参数重载的：底图会从
+        200dpi / 2600px 掉回 110dpi / 1100px —— 画完一个框整页就变糊了。
+        """
+        pdf = getattr(self, "_pdf", "") or ""
+        if not (self.doc and self.page and pdf):
+            return
+        self.load(self.doc, self.page, pdf,
+                  dpi=getattr(self, "_load_dpi", 200),
+                  max_w=getattr(self, "_load_maxw", 2600))
 
     # ---------- 坐标换算（页像素 <-> 画布像素）----------
     def _k(self):
@@ -2708,8 +2752,13 @@ class RecogCanvas(QGraphicsView):
             self.setCursor(Qt.ClosedHandCursor)
             e.accept()
             return
-        # 加框模式：在图上拖一个矩形，松手就落一个新框
+        # 加框模式（和标注工具一样）：第一次点定一个角 → 鼠标移到对角 → 第二次点成框；
+        # 也可以按住左键直接拖出来（拖着画的松手即成型）
         if self.add_mode and e.button() == Qt.LeftButton and self.pix_item is not None:
+            if self._rubber is not None:        # 已经点过第一个角了：这一下就是对角
+                self._finish_add()
+                e.accept()
+                return
             self._rubber_from = self.mapToScene(e.position().toPoint())
             self._rubber = QGraphicsRectItem(QRectF(self._rubber_from, self._rubber_from))
             _pen = QPen(QColor(255, 216, 0))
@@ -2719,8 +2768,25 @@ class RecogCanvas(QGraphicsView):
             self._rubber.setBrush(Qt.NoBrush)
             self._rubber.setZValue(60)
             self.scene().addItem(self._rubber)
+            self.viewport().setCursor(Qt.CursorShape.CrossCursor)
             e.accept()
             return
+        # 拖控制点改大小：命中检测放在最前面，免得被下面的框把事件抢走
+        if e.button() == Qt.LeftButton:
+            box = self.selected_box()
+            if box is not None:
+                sp = self.mapToScene(e.position().toPoint())
+                idx = self._handle_at(sp)
+                if idx is not None:
+                    self.push_undo()
+                    self._resize = {"box": box, "idx": idx, "start": sp,
+                                    "rect": QRectF(box.rect())}
+                    self._drag_active = True
+                    e.accept()
+                    return
+            # 按在框上（准备拖框）也算开始拖动：拖动过程中走「轻量」回调
+            if isinstance(self.itemAt(e.position().toPoint()), RecogBoxItem):
+                self._drag_active = True
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
@@ -2736,11 +2802,24 @@ class RecogCanvas(QGraphicsView):
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - int(d.y()))
             e.accept()
             return
+        if self._resize is not None:
+            d = self._resize
+            p = self.mapToScene(e.position().toPoint())
+            d["box"].setRect(self._resized_rect(d["rect"], d["idx"],
+                                                p.x() - d["start"].x(),
+                                                p.y() - d["start"].y()))
+            self.note_box_changed(d["box"])
+            e.accept()
+            return
+        self._update_handle_cursor(e.position().toPoint())
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
         if self._rubber is not None:
-            self._finish_add()
+            # 拖着画出来的（有面积）→ 直接成型；只是点了一下 → 留在两点画法里等第二次点击
+            r = self._rubber.rect().normalized()
+            if r.width() >= 3 and r.height() >= 3:
+                self._finish_add()
             e.accept()
             return
         if e.button() == Qt.MiddleButton and self._panning:
@@ -2748,12 +2827,24 @@ class RecogCanvas(QGraphicsView):
             self.unsetCursor()
             e.accept()
             return
+        if self._resize is not None and e.button() == Qt.LeftButton:
+            box = self._resize["box"]
+            self._resize = None
+            self._drag_active = False
+            self.note_box_changed(box)          # 松手再写一次，收尾
+            self._update_handle_cursor(e.position().toPoint())
+            e.accept()
+            return
         super().mouseReleaseEvent(e)
-        it = self.itemAt(e.position().toPoint())
-        if it is self.handle:
-            self._apply_resize()
-        else:
-            self._place_handle()
+        if self._drag_active:
+            # 拖框收尾：整个过程只标了脏，这里把表格/统计一次性刷新
+            self._drag_active = False
+            if self.on_changed:
+                try:
+                    self.on_changed()
+                except Exception:
+                    pass
+        self._place_handle()
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key_Delete, Qt.Key_Backspace):
@@ -2772,6 +2863,13 @@ class RecogCanvas(QGraphicsView):
             if self.paste_box():
                 e.accept()
                 return
+        # A/D：前 / 后翻一页（和标注软件一致）
+        if (e.key() in (Qt.Key.Key_A, Qt.Key.Key_D)
+                and not (e.modifiers() & (Qt.ControlModifier | Qt.AltModifier))):
+            if self.on_page_key:
+                self.on_page_key(-1 if e.key() == Qt.Key.Key_A else 1)
+            e.accept()
+            return
         if e.key() == Qt.Key_PageDown or (e.key() == Qt.Key_Right and (e.modifiers() & Qt.ControlModifier)):
             if self.on_page_key:
                 self.on_page_key(1)
@@ -2814,7 +2912,7 @@ class RecogCanvas(QGraphicsView):
                  "preliminary_node_name": "", "selected": {}})
         pdf = getattr(self, "_pdf", "")
         if pdf:
-            self.load(self.doc, self.page, pdf)
+            self.reload_page()
         if self.on_added:
             try:
                 self.on_added(kind, len(dets) - 1)
@@ -2857,20 +2955,91 @@ class RecogCanvas(QGraphicsView):
                 pass
 
     def _place_handle(self):
+        """控制点是画上去的，这里只负责刷新名字标签 + 重绘（名字变了/缩放变了都要叫）。"""
         box = self.selected_box()
-        if box is None or self.handle is None:
-            if self.handle is not None:
-                self.handle.setVisible(False)
+        if box is None:
             if getattr(self, "sel_label", None) is not None:
                 self.sel_label.setVisible(False)
+        else:
+            self._update_sel_label(box)
+        self.viewport().update()
+        self.scene().update()          # drawForeground 挂在场景上，也要催一下
+
+    # ---- 改大小的控制点（对齐标注工具：8 个点、屏幕恒定大小、实时改）----
+    HANDLE_CURSORS = [Qt.CursorShape.SizeFDiagCursor,
+                      Qt.CursorShape.SizeVerCursor,
+                      Qt.CursorShape.SizeBDiagCursor,
+                      Qt.CursorShape.SizeHorCursor,
+                      Qt.CursorShape.SizeHorCursor,
+                      Qt.CursorShape.SizeBDiagCursor,
+                      Qt.CursorShape.SizeVerCursor,
+                      Qt.CursorShape.SizeFDiagCursor]
+    HANDLE_PX = 9.0                    # 控制点在屏幕上的边长
+
+    @staticmethod
+    def _handle_points(r):
+        """左上、上中、右上、左中、右中、左下、下中、右下（和标注工具同一顺序）。"""
+        x1, y1, x2, y2 = r.left(), r.top(), r.right(), r.bottom()
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        return [QPointF(x1, y1), QPointF(cx, y1), QPointF(x2, y1),
+                QPointF(x1, cy), QPointF(x2, cy),
+                QPointF(x1, y2), QPointF(cx, y2), QPointF(x2, y2)]
+
+    def _handle_at(self, scene_pos):
+        """鼠标是不是落在选中框的控制点上，返回控制点序号。"""
+        box = self.selected_box()
+        if box is None or self.add_mode:
+            return None
+        sc = max(1e-6, abs(float(self.transform().m11() or 1.0)))
+        tol = (self.HANDLE_PX / sc) * 0.8
+        for i, p in enumerate(self._handle_points(box.sceneBoundingRect())):
+            if abs(scene_pos.x() - p.x()) <= tol and abs(scene_pos.y() - p.y()) <= tol:
+                return i
+        return None
+
+    @staticmethod
+    def _resized_rect(base, idx, dx, dy):
+        """按第 idx 个控制点拖 (dx,dy)，返回新矩形（允许拖过头翻转）。"""
+        left, top, right, bottom = base.left(), base.top(), base.right(), base.bottom()
+        if idx in (0, 3, 5):
+            left += dx
+        if idx in (2, 4, 7):
+            right += dx
+        if idx in (0, 1, 2):
+            top += dy
+        if idx in (5, 6, 7):
+            bottom += dy
+        r = QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
+        if r.width() < 6.0:
+            r.setWidth(6.0)
+        if r.height() < 6.0:
+            r.setHeight(6.0)
+        return r
+
+    def _update_handle_cursor(self, viewport_pos):
+        if self.add_mode or self._panning or self._resize is not None:
             return
-        sc = max(0.02, float(self.transform().m22() or 1.0))
-        hs = 12.0 / sc                 # 改大小的小方块在屏幕上恒定 12px，缩到整页也点得住
-        r = box.sceneBoundingRect()
-        self.handle.setRect(0, 0, hs, hs)
-        self.handle.setPos(r.right() - hs / 2.0, r.bottom() - hs / 2.0)
-        self.handle.setVisible(True)
-        self._update_sel_label(box, sc)
+        sp = self.mapToScene(viewport_pos)
+        idx = self._handle_at(sp)
+        self.viewport().setCursor(self.HANDLE_CURSORS[idx] if idx is not None
+                                  else Qt.CursorShape.ArrowCursor)
+
+    def drawForeground(self, painter, rect):
+        """在视口坐标里画控制点：不管缩放到多少，屏幕上始终是同样大小的小方块。"""
+        super().drawForeground(painter, rect)
+        box = self.selected_box()
+        if box is None or self.add_mode:
+            return
+        hs = self.HANDLE_PX
+        painter.save()
+        painter.resetTransform()                    # 切到视口坐标
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setPen(QPen(QColor(20, 20, 20, 230), 1))
+        painter.setBrush(QColor(255, 216, 0, 235))
+        for p in self._handle_points(box.sceneBoundingRect()):
+            v = self.mapFromScene(p)
+            painter.drawRect(QRectF(v.x() - hs / 2.0 + 0.5, v.y() - hs / 2.0 + 0.5, hs, hs))
+        painter.restore()
 
     def _update_sel_label(self, box, sc=None):
         """选中框的名字：贴在框上方，字号按缩放反算，屏幕上看始终是同一个大小。"""
@@ -2897,17 +3066,6 @@ class RecogCanvas(QGraphicsView):
         lb = lbl.boundingRect()
         lbl.setPos(r.left(), r.top() - lb.height() - 2.0 / sc)
         lbl.setVisible(True)
-
-    def _apply_resize(self):
-        box = self.selected_box()
-        if box is None:
-            return
-        hc = self.handle.pos() + QPointF(5, 5)
-        r = box.sceneBoundingRect()
-        w, hgt = max(6.0, hc.x() - r.left()), max(6.0, hc.y() - r.top())
-        box.setRect(0, 0, w, hgt)
-        self.note_box_changed(box)
-        self._place_handle()
 
     def _page_data(self):
         doc = self.doc or {}
@@ -2937,7 +3095,7 @@ class RecogCanvas(QGraphicsView):
             ocr["data"] = snap["ocr"]
         pdf = getattr(self, "_pdf", "")
         if page == self.page and pdf:
-            self.load(self.doc, self.page, pdf)
+            self.reload_page()
         if self.on_changed:
             self.on_changed()
         return True
@@ -2958,8 +3116,10 @@ class RecogCanvas(QGraphicsView):
         if j is not None and j < len(recs):
             recs[j]["node_bbox"] = dict(bb)
         self._place_handle()
-        if self.on_changed:
-            self.on_changed()
+        # 拖动过程中只标记改动：每动一下就重建左边表格 + 重算统计会明显卡手
+        cb = self.on_changed_fast if self._drag_active else self.on_changed
+        if cb:
+            cb()
 
     def delete_selected(self):
         boxes = [it for it in self.scene().selectedItems() if isinstance(it, RecogBoxItem)]
@@ -3091,7 +3251,7 @@ class RecogCanvas(QGraphicsView):
             ocr.setdefault("data", []).append(rec)
         pdf = getattr(self, "_pdf", "")
         if pdf:
-            self.load(self.doc, self.page, pdf)
+            self.reload_page()
             self.select_det(new_i)
         if self.on_added:
             try:
@@ -4035,56 +4195,58 @@ class MainWindow(QMainWindow):
     # ---------------- 识别页：主程序自带识别（v4c / onnxruntime） ----------------
     def _build_recog_page(self):
         page = QWidget()
+        page.setObjectName("RecogPage")          # 这一页单独用紧凑尺寸（见 QSS）
         outer = QVBoxLayout(page)
-        outer.setContentsMargins(20, 16, 20, 16)
-        outer.setSpacing(10)
+        outer.setContentsMargins(16, 10, 16, 10)
+        outer.setSpacing(6)
+        # 标题和操作挤在同一行：PDF 走「上传」按钮，文件名不占地方
+        # （长路径显示不下也没意义；完整路径放在状态小字的提示里）
+        head = QHBoxLayout()
+        head.setSpacing(8)
         h = self._reg(QLabel(), "识别")
         h.setObjectName("PageTitle")
-        outer.addWidget(h)
-        tip = self._reg(QLabel(),
-                     "用「文件与输出」里选的 PDF 识别（模型 v4c，直接在程序里跑）。"
-                     "跑完自动填进「识别结果 JSON文件」，接着走标签 / 执行即可。")
-        tip.setObjectName("Hint")
-        self._shrinkable(tip, 120)
-        outer.addWidget(tip)
-        # 识别要的两个输入直接放这一步：PDF + 标签文件（和「文件与输出」页是同一份数据）
-        inrow = QHBoxLayout()
-        inrow.setSpacing(8)
-        inrow.addWidget(self._reg(QLabel(), "PDF 文件"))
-        self.recog_pdf_edit = QLineEdit()
-        self.recog_pdf_edit.setObjectName("Field")
-        self._reg_ph(self.recog_pdf_edit, "选要识别的 PDF（图纸集）")
-        inrow.addWidget(self.recog_pdf_edit, 1)
-        b = self._reg(QPushButton(), "选 PDF…")
+        head.addWidget(h)
+        head.addStretch(1)
+        self.recog_pdf_state = QLabel("")
+        self.recog_pdf_state.setObjectName("RecogStatus")
+        head.addWidget(self.recog_pdf_state)
+        b = self._reg(QPushButton(), "上传 PDF")
+        self._reg_tip(b, "选要识别的 PDF（图纸集）；整本识别，跑完再用「过滤」挑页")
         b.clicked.connect(lambda: self._recog_pick("pdf"))
-        inrow.addWidget(b)
-        outer.addLayout(inrow)
-        # 页码 / 开始识别 单独一行：窄窗口下也摆得下，不会把整页撑宽
-        row2 = QHBoxLayout()
-        row2.setSpacing(8)
-        row2.addWidget(self._reg(QLabel(), "识别页码"))
-        self.recog_pages_edit = QLineEdit()
-        self.recog_pages_edit.setObjectName("Field")
-        self._reg_ph(self.recog_pages_edit, "留空 = 全部；也可写 3-8,12")
-        self.recog_pages_edit.setMinimumWidth(120)
-        self.recog_pages_edit.setMaximumWidth(260)
-        row2.addWidget(self.recog_pages_edit)
+        head.addWidget(b)
         self.recog_btn = self._reg(QPushButton(), "开始识别")
         self.recog_btn.setObjectName("Primary")
         self.recog_btn.clicked.connect(self.on_recognize)
         self.recog_btn.setMinimumWidth(110)
-        row2.addWidget(self.recog_btn)
-        row2.addStretch(1)
-        outer.addLayout(row2)
-        # 状态单独一行：日志文字很长，挤在按钮中间会被截断
-        self.recog_status = QLabel("")
-        self.recog_status.setObjectName("Hint")
-        self._shrinkable(self.recog_status, 120)
-        outer.addWidget(self.recog_status)
+        head.addWidget(self.recog_btn)
+        outer.addLayout(head)
+
+        # 数据载体：PDF 路径和「文件与输出」页共用一份，界面上不显示（只显示上面的「已选择」）
+        self.recog_pdf_edit = QLineEdit()
+        self.recog_pdf_edit.setObjectName("Field")
+        self._reg_ph(self.recog_pdf_edit, "选要识别的 PDF（图纸集）")
+        self.recog_pdf_edit.setVisible(False)
+
+        tip = self._reg(QLabel(),
+                        "整本识别（模型 v4c 在程序里跑），跑完自动填「识别结果 JSON文件」；"
+                        "页数多了就用下面的「只保留 / 过滤」挑页。")
+        tip.setObjectName("RecogTip")
+        self._shrinkable(tip, 120)
+        outer.addWidget(tip)
+
+        # 进度条 + 状态并成一行：进度条细一点，百分比和时间都写在右边文字里
+        prow0 = QHBoxLayout()
+        prow0.setSpacing(8)
         self.recog_bar = QProgressBar()
-        self.recog_bar.setTextVisible(True)
+        self.recog_bar.setTextVisible(False)
         self.recog_bar.setValue(0)
-        outer.addWidget(self.recog_bar)
+        self.recog_bar.setFixedWidth(160)
+        prow0.addWidget(self.recog_bar)
+        self.recog_status = QLabel("")
+        self.recog_status.setObjectName("RecogStatus")   # 单独的小字号（见 QSS）
+        self._shrinkable(self.recog_status, 120)
+        prow0.addWidget(self.recog_status, 1)
+        outer.addLayout(prow0)
         # 结果区：左表格 / 中画布 / 右名字栏（和标注软件一样）
         res = QHBoxLayout()
         res.setSpacing(10)
@@ -4099,19 +4261,8 @@ class MainWindow(QMainWindow):
         self.recog_table.itemSelectionChanged.connect(self.on_recog_page_changed)
         res.addWidget(self.recog_table)
         pv = QVBoxLayout()
-        prow = QHBoxLayout()
-        prow.addWidget(self._reg(QLabel(), "预览"))
-        self.recog_page_combo = NoWheelCombo()
-        self.recog_page_combo.setObjectName("Field")
-        self.recog_page_combo.setMinimumWidth(120)
-        self.recog_page_combo.currentIndexChanged.connect(self.on_recog_page_changed)
-        prow.addWidget(self.recog_page_combo)
-        self.recog_preview_info = self._reg(
-            QLabel(), "识别完这里会画出识别到的框（蓝=LBD 区，红=支架，橙=编号位置）")
-        self.recog_preview_info.setObjectName("Hint")
-        self._shrinkable(self.recog_preview_info, 120)
-        prow.addWidget(self.recog_preview_info, 1)
-        pv.addLayout(prow)
+        # 「预览」那一行去掉了：换页直接点左边表格里的页，或者 PgUp/PgDn（Ctrl+←/→），
+        # 支架前后用 A/D。这行原来的信息（本页统计 / 选中情况）挪到画布下面那行。
         # 工具条分两行摆：窗口窄的时候也不会把整页撑宽（否则只能左右滑）
         tb = QGridLayout()
         tb.setHorizontalSpacing(6)
@@ -4153,23 +4304,32 @@ class MainWindow(QMainWindow):
         self.recog_save_btn.setEnabled(False)
         self.recog_save_btn.clicked.connect(self.on_save_recog_edits)
         tb.addWidget(self.recog_save_btn, 1, col)
+        col += 1
+        self.recog_help_btn = self._reg(QPushButton(), "快捷键")
+        self._reg_tip(self.recog_help_btn, RECOG_SHORTCUTS)
+        self.recog_help_btn.clicked.connect(self.on_recog_help)
+        tb.addWidget(self.recog_help_btn, 1, col)
         pv.addLayout(tb)
         self.recog_canvas = RecogCanvas(self)
         self.recog_canvas.setMinimumWidth(200)     # 窄窗口下画布先让出宽度，别撑出横向滚动
         self.recog_canvas.setMinimumHeight(260)
+        # 画布上**不挂**鼠标提示：悬停就弹一大串字很烦（用户反馈过）。
+        # 快捷键改挂到工具条那个「快捷键」小按钮上，要看自己点。
         self.recog_canvas.on_changed = self._recog_mark_dirty
+        self.recog_canvas.on_changed_fast = self._recog_mark_dirty_light
         self.recog_canvas.on_selected = self.on_recog_box_selected
         self.recog_canvas.on_added = self.on_recog_box_added
         self.recog_canvas.on_deleted = self.on_recog_box_deleted
         self.recog_canvas.on_page_key = self.on_recog_page_step
+        self.recog_canvas.on_rack_step = self.on_recog_rack_step
         pv.addWidget(self.recog_canvas, 1)
         prow2 = QHBoxLayout()
-        self.recog_hint2 = self._reg(
-            QLabel(), "滚轮或 Ctrl+＋/－ 缩放 · Ctrl+0 适应页面 · Ctrl+1 适应宽度 · "
-                      "中键拖动平移 · 拖框改位置 · 右下角小方块改大小 · Delete 删除 · Ctrl+Z 撤销")
-        self.recog_hint2.setObjectName("Hint")
-        self._shrinkable(self.recog_hint2, 120)
-        prow2.addWidget(self.recog_hint2, 1)
+        # 本页统计 / 选中情况（原来挂在「预览」那一行，那行去掉了挪到这里）
+        self.recog_preview_info = self._reg(
+            QLabel(), "识别完这里会画出识别到的框（蓝=LBD 区，红=支架，橙=编号位置）")
+        self.recog_preview_info.setObjectName("RecogTip")
+        self._shrinkable(self.recog_preview_info, 160)
+        prow2.addWidget(self.recog_preview_info, 1)
         self.recog_export_btn = self._reg(QPushButton(), "导出识别结果 JSON…")
         self.recog_export_btn.setEnabled(False)
         self.recog_export_btn.clicked.connect(self.on_export_recog_json)
@@ -4269,13 +4429,12 @@ class MainWindow(QMainWindow):
         return sc
 
     def on_recognize(self):
-        """点「开始识别」：后台起线程跑（不卡界面）。"""
+        """点「开始识别」：后台起线程跑（不卡界面）。整本识别，挑页交给下面的「过滤」。"""
         self._recog_sync_inputs(to_cfg=True)
         cfg = self.cfg()
         pdf = (cfg.get("pdf") or "").strip()
-        self._recog_write("=== 点了「开始识别」：pdf=%s 页码=%r running=%s"
-                          % (pdf, self.recog_pages_edit.text().strip(),
-                             getattr(self, "_recog_running", False)))
+        self._recog_write("=== 点了「开始识别」：pdf=%s（整本）running=%s"
+                          % (pdf, getattr(self, "_recog_running", False)))
         if not pdf or not os.path.exists(pdf):
             self.log_msg("先选 PDF 文件（「文件与输出」页）")
             self.recog_view.appendPlainText("先选 PDF 文件。")
@@ -4287,10 +4446,11 @@ class MainWindow(QMainWindow):
         self.recog_btn.setEnabled(False)
         self.recog_btn.setText("识别中…")
         self.recog_view.clear()
+        self._recog_t0 = time.time()
         self.recog_bar.setMaximum(0)
         self.recog_status.setText("准备中…")
         threading.Thread(target=self._recog_worker,
-                         args=(cfg, self.recog_pages_edit.text().strip()),
+                         args=(cfg, ""),          # 空 = 全部页
                          daemon=True).start()
 
     def _recog_write(self, msg):
@@ -4369,7 +4529,26 @@ class MainWindow(QMainWindow):
             return
         self.recog_bar.setMaximum(max(1, total))
         self.recog_bar.setValue(done)
-        self.recog_status.setText("%s（%d/%d）" % (text, done, total))
+        pct = int(round(done * 100.0 / max(1, total)))
+        # 时间进度：已用 + 按当前速度估的剩余（至少跑完一页才估，不然会乱跳）
+        extra = ""
+        t0 = getattr(self, "_recog_t0", 0.0) or 0.0
+        if t0:
+            el = time.time() - t0
+            extra = "　已用 %s" % self._fmt_mmss(el)
+            if done >= 1 and total > done:
+                extra += " · 剩约 %s" % self._fmt_mmss(el * (total - done) / float(done))
+        self.recog_status.setText("%s（%d/%d，%d%%）%s" % (text, done, total, pct, extra))
+
+    @staticmethod
+    def _fmt_mmss(sec):
+        try:
+            sec = int(max(0, sec))
+        except Exception:
+            return "?"
+        if sec >= 3600:
+            return "%d:%02d:%02d" % (sec // 3600, (sec % 3600) // 60, sec % 60)
+        return "%d:%02d" % (sec // 60, sec % 60)
 
     def on_recog_log(self, msg):
         if hasattr(self, "recog_view"):
@@ -4450,24 +4629,13 @@ class MainWindow(QMainWindow):
             self.recog_table.horizontalHeader().setStretchLastSection(True)
         except Exception:
             pass
-        if hasattr(self, "recog_page_combo"):
-            self.recog_page_combo.blockSignals(True)
-            self.recog_page_combo.clear()
-            for pg, _a, _b, _c, _d, _e, _w, _h in rows:
-                self.recog_page_combo.addItem("第 %s 页" % pg, pg)
-            if select_page is not None:
-                i = self.recog_page_combo.findData(select_page)
-                if i >= 0:
-                    self.recog_page_combo.setCurrentIndex(i)
-            self.recog_page_combo.blockSignals(False)
         if rows and reload_preview:
             pages = [r[0] for r in rows]
             self._recog_preview_page(select_page if select_page in pages else rows[0][0])
 
     def on_recog_page_changed(self, *_a):
+        """左边表格换行 -> 画布换页（「预览」下拉已删，表格就是唯一的页列表）。"""
         pg = None
-        if hasattr(self, "recog_page_combo") and self.recog_page_combo.count():
-            pg = self.recog_page_combo.currentData()
         if hasattr(self, "recog_table"):
             sel = self.recog_table.selectionModel().selectedRows()
             if sel:
@@ -4476,12 +4644,6 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
         if pg:
-            if hasattr(self, "recog_page_combo"):
-                i = self.recog_page_combo.findData(pg)
-                if i >= 0 and i != self.recog_page_combo.currentIndex():
-                    self.recog_page_combo.blockSignals(True)
-                    self.recog_page_combo.setCurrentIndex(i)
-                    self.recog_page_combo.blockSignals(False)
             self._recog_preview_page(pg)
 
     def _recog_preview_page(self, pg):
@@ -4497,7 +4659,18 @@ class MainWindow(QMainWindow):
             self._recog_update_page_info(pg)
             self._recog_refresh_names()      # 右栏名字跟着这页一起换
         except Exception as e:
-            self.recog_hint2.setText("这一页画不出来：%s" % e)
+            self.recog_preview_info.setText("这一页画不出来：%s" % e)
+            self._recog_write("画布载入第 %s 页失败：%s" % (pg, e))
+
+    def _recog_mark_dirty_light(self):
+        """拖框 / 拖控制点的过程中走这条：只标记改动，不重建表格、不重算统计。
+
+        （每动一下鼠标就重建左边那张表 + 遍历整册框重算统计，是最卡的一环；
+          松手时 on_changed 会再走一次完整刷新。）
+        """
+        self._recog_dirty = True
+        if hasattr(self, "recog_save_btn"):
+            self.recog_save_btn.setEnabled(True)
 
     def _recog_update_page_info(self, pg=None):
         if pg is None:
@@ -4606,15 +4779,26 @@ class MainWindow(QMainWindow):
 
         标签文件在识别这一步**不需要**：LBD 编号是从 PDF 文字层直接读出来的
         （读到的就是 INV01A01-LBD-04 这种整段编号），只有后续 CAD 生成布局取分表名时才用得上。
+
+        识别页那个输入框只显示文件名（长路径显示不下也没意义），完整路径记在
+        self._recog_pdf_full 里，回写时用它，别把界面上的短名字写回去。
         """
         if not hasattr(self, "recog_pdf_edit"):
             return
         if to_cfg:
-            p = (self.recog_pdf_edit.text() or "").strip()
+            p = getattr(self, "_recog_pdf_full", "") or ""
             if p:
                 self.set_text("pdf", p)
         else:
-            self.recog_pdf_edit.setText(self.get_text("pdf"))
+            p = self.get_text("pdf")
+            self._recog_pdf_full = p
+            self.recog_pdf_edit.setText(p)          # 数据载体（界面隐藏）
+            self.recog_pdf_edit.setToolTip(p or "")
+            if hasattr(self, "recog_pdf_state"):
+                self.recog_pdf_state.setText("已选择" if p else "未选择")
+                self.recog_pdf_state.setStyleSheet(
+                    "color:%s;" % ("#6fbf73" if p else "#8a8f94"))
+                self.recog_pdf_state.setToolTip(p or "还没选 PDF，点右边「上传 PDF」")
 
     def _on_section_shown(self, idx):
         """切到识别页时，把主参数页上的 PDF / 标签文件同步显示过来。"""
@@ -4935,15 +5119,61 @@ class MainWindow(QMainWindow):
             self._rack_jump_pos = {}
         self._rack_jump_pos[row] = k
         pg, det_i = matches[k]
-        # 切到那一页（下拉变化会触发预览加载），再选中/居中那个框
-        i = self.recog_page_combo.findData(pg)
-        if i >= 0 and i != self.recog_page_combo.currentIndex():
-            self.recog_page_combo.setCurrentIndex(i)
+        # 切到那一页（左边表格也跟着选中），再选中/居中那个框
         self._recog_preview_page(pg)
+        self._select_recog_table_page(pg)
         ok = self.recog_canvas.select_det(det_i)
         self._recog_write("跳到第 %s 页（第 %d/%d 个）：%s串 %.1fFT 的支架%s"
                           % (pg, k + 1, len(matches), strings or "?", target,
                              "" if ok else "（画布上没找到那个框）"))
+
+    def on_recog_help(self):
+        """「快捷键」按钮：把这一页能用的键鼠操作打出来。
+
+        不再挂画布的鼠标提示 —— 那样鼠标一碰中间就弹一大串字。
+        """
+        QMessageBox.information(self, "快捷键", RECOG_SHORTCUTS)
+
+    def on_recog_rack_step(self, d):
+        """在本页里前 / 后跳一个支架（按位置顺序，循环），并把标号报出来。
+
+        注意：**没有绑键** —— A/D 是翻页（和标注软件一致，用户指定）。
+        支架前后跳目前还是靠点下面支架类型表那一行（再点一次看下一个）。
+        要给它配键的话在这里接回去就行。
+        """
+        if not hasattr(self, "recog_canvas"):
+            return
+        pg = getattr(self, "_recog_page", None)
+        doc = getattr(self, "_recog_doc", None) or {}
+        trk = next((p for p in doc.get("yolo_tracker_detection_results") or []
+                    if p.get("page_number") == pg), None)
+        dets = ((trk or {}).get("data") or {}).get("detections") or []
+        boxes = [i for i, x in enumerate(dets) if (x.get("label") or "") == "Tracker"]
+        if not boxes:
+            self.recog_preview_info.setText("第 %s 页没有支架框" % pg)
+            self._recog_write("第 %s 页没有支架框可跳" % pg)
+            return
+        sel = self.recog_canvas.selected_box()
+        if sel is not None and sel.det_index in boxes:
+            cur = boxes.index(sel.det_index)
+        else:
+            cur = -1 if d > 0 else 0
+        nxt = (cur + d) % len(boxes)
+        di = boxes[nxt]
+        ok = self.recog_canvas.select_det(di)
+        x = dets[di] if 0 <= di < len(dets) else {}
+        raw = (x or {}).get("raw") or {}
+        ln, unit = raw.get("len_ft"), "FT"
+        if ln is None:
+            ln, unit = raw.get("len_px"), "px"
+        tag = ("长度 %.1f%s" % (float(ln), unit)) if ln is not None else "长度未记录"
+        if raw.get("strings"):
+            tag += " · %s 串" % raw.get("strings")
+        self.recog_preview_info.setText(
+            "第 %s 页 支架 %d/%d：%s（A/D 前后跳）%s"
+            % (pg, nxt + 1, len(boxes), tag, "" if ok else "（画布上没找到这个框）"))
+        self._recog_write("A/D 跳支架：第 %s 页 第 %d/%d 个（%s）"
+                          % (pg, nxt + 1, len(boxes), tag))
 
     # ---------- 名字栏 / 加框 / 键盘翻页（和标注软件对齐）----------
     def _recog_page_nodes(self, pg=None):
@@ -5040,8 +5270,11 @@ class MainWindow(QMainWindow):
             c.add_mode = mode
             c.setDragMode(QGraphicsView.NoDrag if mode else QGraphicsView.RubberBandDrag)
             c.setCursor(Qt.CrossCursor if mode else Qt.ArrowCursor)
+            # 视口自己的光标优先，之前给视口设过箭头，这里要一起换掉，十字才看得到
+            c.viewport().setCursor(Qt.CrossCursor if mode else Qt.ArrowCursor)
         name = {"Box": "画 Box（汇流箱）", "Tracker": "画支架", "Node": "画 LBD 区"}.get(kind, kind)
-        self._recog_write(("进入「%s」模式：在画布上按住左键拖一个矩形就画一个；再点一下这个按钮退出"
+        self._recog_write(("进入「%s」模式：点一下定第一个角、移到对角再点一下成框"
+                           "（也可以按住左键直接拖）；再点一下这个按钮退出"
                            % name) if mode else "回到选择模式")
 
     def on_recog_box_added(self, kind, det_index):
@@ -5051,15 +5284,35 @@ class MainWindow(QMainWindow):
         self._recog_update_page_info()
 
     def on_recog_page_step(self, delta):
-        """键盘翻页：PgDn/PgUp、Ctrl+←/→。"""
-        cb = getattr(self, "recog_page_combo", None)
-        if cb is None or cb.count() == 0:
+        """键盘翻页：PgDn/PgUp、Ctrl+←/→（页列表直接用左边那张表）。"""
+        rows = self._recog_pages_of_doc()
+        if not rows:
             return
-        i = cb.currentIndex() + int(delta)
-        if 0 <= i < cb.count():
-            cb.setCurrentIndex(i)
-            self._recog_write("第 %s 页（%d/%d，PgUp/PgDn 可翻页）"
-                              % (cb.currentData(), i + 1, cb.count()))
+        pages = [r[0] for r in rows]
+        try:
+            i = pages.index(getattr(self, "_recog_page", None))
+        except ValueError:
+            i = 0
+        j = i + int(delta)
+        if not (0 <= j < len(pages)):
+            return
+        pg = pages[j]
+        self._recog_preview_page(pg)
+        self._select_recog_table_page(pg)
+        self._recog_write("第 %s 页（%d/%d，PgUp/PgDn 可翻页）" % (pg, j + 1, len(pages)))
+
+    def _select_recog_table_page(self, pg):
+        """把左边表格切到这一页那一行（信号挡住，免得再触发一次画布加载）。"""
+        t = getattr(self, "recog_table", None)
+        if t is None:
+            return
+        for i in range(t.rowCount()):
+            it = t.item(i, 0)
+            if it is not None and it.text() == str(pg):
+                t.blockSignals(True)
+                t.selectRow(i)
+                t.blockSignals(False)
+                return
 
     def on_recog_bottom_toggled(self, on):
         """展开 / 收起右下那半区（支架类型表 + 识别日志）。"""

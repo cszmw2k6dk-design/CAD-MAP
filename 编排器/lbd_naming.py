@@ -13,7 +13,14 @@ import re
 KEEP_MANUAL_IOU = 0.3
 
 
+# 去重叠判据（用户要求：重叠 30% 以上就算画重了）
+#   DUP_IOU      —— 交并比（IoU）达到这个值
+#   MIN_OVERLAP  —— 交叠面积占「较小那个框」的比例达到这个值
+# 两个判据满足任意一个就去掉一个（留置信度高的）。
 DUP_IOU = 0.3
+
+
+MIN_OVERLAP = 0.3
 
 
 TRACKER_AR = 0.1
@@ -40,7 +47,7 @@ def _bbox_area(b):
 
 
 def _is_duplicate_pair(a, b):
-    """两个同类框算不算"画重了"：重叠够大，或者一个几乎完全套在另一个里面。"""
+    """两个同类框算不算"画重了"：交并比够大，或者交叠面积占较小框的 30% 以上。"""
     if _bbox_iou(a, b) >= DUP_IOU:
         return True
     x1, y1 = max(a[0], b[0]), max(a[1], b[1])
@@ -49,7 +56,8 @@ def _is_duplicate_pair(a, b):
     if inter <= 0:
         return False
     smaller = min(_bbox_area(a), _bbox_area(b))
-    return smaller > 0 and inter / smaller >= CONTAIN_RATIO
+    # 含「一个几乎套在另一个里面」的情况：那会儿 inter/smaller 接近 1，也 ≥ MIN_OVERLAP
+    return smaller > 0 and inter / smaller >= MIN_OVERLAP
 
 
 # 哪个 source 算"模型画的框"。
