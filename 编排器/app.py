@@ -3,15 +3,19 @@
 # 业务逻辑（扫描/计划/配置/ZWCAD 自动化）与旧 ctypes 版保持一致。
 import os, sys, json, re, glob, hashlib, tempfile, threading, time, subprocess, shutil
 import urllib.request, urllib.error, urllib.parse
-from PySide6.QtCore import Qt, Signal, QObject, QTimer, QRectF, QPointF
-from PySide6.QtGui import QColor, QPainter, QIcon, QPixmap, QImage, QPen
+from PySide6.QtCore import Qt, Signal, QObject, QTimer, QRectF, QPointF, QSize
+from PySide6.QtGui import QColor, QPainter, QIcon, QPixmap, QImage, QPen, QPolygonF
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QLabel, QLineEdit, QPushButton, QProgressBar, QStackedWidget,
                                QScrollArea, QFileDialog, QButtonGroup, QPlainTextEdit,
                                QFrame, QGridLayout, QCheckBox, QRadioButton, QComboBox,
                                QMessageBox, QDialog, QListWidget, QListWidgetItem,
                                QTableWidget, QTableWidgetItem,
-                               QGraphicsView, QGraphicsScene, QGraphicsRectItem)
+                               QGraphicsView, QGraphicsScene, QGraphicsRectItem,
+                               QGraphicsSimpleTextItem,
+                               QSplitter,
+                               QSizePolicy,
+                               QTreeWidget, QTreeWidgetItem)
 from pypdf import PdfReader
 
 try:
@@ -46,7 +50,9 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_mark_boxes = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.55"
+APP_VERSION = "2.56"
+# 这一版先不带「导出 PDF」：按钮和入口藏起来，代码保留（改成 True 就接回来）。
+FEATURE_EXPORT_PDF = False
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
@@ -117,6 +123,17 @@ STR_ORDER_CHOICES = _LR_ORDER_LABELS or [
     ("7 行优先: 上→下行、行内右→左", "7"),
     ("8 行优先: 下→上行、行内右→左", "8"),
 ]
+# 上面 8 种顺序的英文（按值一一对应；中文标签来自 lbd_regions，不靠字符串匹配）
+STR_ORDER_EN = [
+    "1 Column-first: left→right, top→bottom",
+    "2 Row-first: top→bottom, left→right",
+    "3 Column-first: right→left, top→bottom",
+    "4 Row-first: bottom→top, left→right",
+    "5 Column-first: left→right, bottom→top",
+    "6 Column-first: right→left, bottom→top",
+    "7 Row-first: top→bottom, right→left",
+    "8 Row-first: bottom→top, right→left",
+]
 # 象限 STR 顺序：四个象限各一个下拉框（值 = 8 种顺序的序号，0 = 该象限用全局顺序）。
 # 原点 = 本页汇流箱(Box)的几何中心（识别结果 yolo_box_detection_results 的 Box 小框），
 # 判据 = LBD 区域(Node 框)的中心，轴 = 图纸正交轴（u 右为正、v 上为正）。
@@ -150,40 +167,243 @@ def demo_cells(order, cols=3, rows=3):
 
 COLOR_CHOICES = [("红", "1"), ("黄", "2"), ("绿", "3"), ("青", "4"),
                  ("蓝", "5"), ("洋红", "6"), ("白", "7"), ("灰", "8")]
+
+# ---------------- 中英文 ----------------
+# 界面上所有会显示给用户看的文字都走 T("中文原文")：中文环境原样返回，
+# 英文环境查 TEXT_EN 换掉（查不到就退回中文，绝不报错）。
+_LANG = ["zh"]
+LANG_NAMES = {"zh": "中文", "en": "English"}
+
+
+def cur_lang():
+    return _LANG[0]
+
+
+def set_lang(code):
+    _LANG[0] = "en" if str(code).lower().startswith("en") else "zh"
+    return _LANG[0]
+
+
+def T(zh, *args):
+    s = TEXT_EN.get(zh, zh) if _LANG[0] == "en" else zh
+    if args:
+        try:
+            return s % args
+        except Exception:
+            return s
+    return s
+
+
+TEXT_EN = {
+    # ---- 顶栏 / 通用 ----
+    "检查更新": "Check for updates",
+    "更新": "Update",
+    "更新日志": "Changelog",
+    "在线更新": "Update",
+    "版本": "Version",
+    "下载并安装 %s": "Download & install %s",
+    "正在下载…": "Downloading…",
+    "已是最新版本": "Up to date",
+    "检查中…": "Checking…",
+    "发现新版本": "New version",
+    "中英文切换": "Switch language",
+    "语言：中文（点击切到 English）": "Language: 中文 (click for English)",
+    "语言：English（点击切到中文）": "Language: English (click for 中文)",
+    # ---- 页签 ----
+    "文件与输出": "Files & output",
+    "标签": "Labels",
+    "LBD标签": "LBD label",
+    "支架标签": "Rack label (STR)",
+    "支架": "Rack",
+    "选项": "Options",
+    "识别": "Recognize",
+    # ---- 文件与输出 ----
+    "模板 DWG 文件": "Template DWG",
+    "PDF 文件": "PDF file",
+    "标签文件": "Label file (xlsx)",
+    "识别结果 JSON文件": "Recognition JSON",
+    "新文件名(可空)": "New file name (optional)",
+    "选择": "Browse",
+    # ---- PDF 页 ----
+    "起始页": "First page",
+    "结束页(0=全部)": "Last page (0 = all)",
+    "导入页码(0=全部)": "Pages to import (0 = all)",
+    "复制数量(0=按识别)": "Copy count (0 = from recognition)",
+    "视口边距(mm)": "Viewport margin (mm)",
+    "区域对准留白(%)": "Region fit inset (%)",
+    # ---- LBD 标签页 ----
+    "标签高度(模型单位, 0=自动)": "Label height (model units, 0 = auto)",
+    "标签背景色": "Label background colour",
+    "LBD 标签字色": "LBD label text colour",
+    "背景遮挡间隙(倍)": "Background mask gap (x)",
+    "标签页下面那块：LBD 标签的样式参数。": "LBD label appearance.",
+    "刷新象限预览": "Refresh quadrant preview",
+    # ---- 支架标签页 ----
+    "命名前缀(支架号)": "Name prefix (rack no.)",
+    "支架类型(串数:长度FT)": "Rack types (strings:length FT)",
+    "拆不拆": "Split",
+    "单串长度(FT,可空)": "String length (FT, optional)",
+    "STR 字高(typical宽倍数)": "STR text height (x typical width)",
+    "STR 编号顺序(8 种)": "STR numbering order (8)",
+    "STR 号自动对齐": "Auto align STR numbers",
+    "避开底图 LBD 标号": "Avoid LBD marks on the drawing",
+    "STR背景填充": "STR background fill",
+    "STR背景色": "STR background colour",
+    "STR 标签字色": "STR label text colour",
+    "STR遮挡间隙(倍)": "STR mask gap (x)",
+    "按汇流箱(Box)四象限规律命名": "Name by combiner-box quadrant rule",
+    "象限 I 右上 的顺序": "Quadrant I (top right) order",
+    "象限 II 左上 的顺序": "Quadrant II (top left) order",
+    "象限 III 左下 的顺序": "Quadrant III (bottom left) order",
+    "象限 IV 右下 的顺序": "Quadrant IV (bottom right) order",
+    "STR 编号方向 · 按汇流箱(Box)四象限规矩": "STR numbering direction · combiner-box quadrants",
+    "判据：原点 = 本页汇流箱(Box)中心，看 LBD 区域中心的方位（u 右为正、v 上为正）"
+    "——I 右上 / II 左上 / III 左下 / IV 右下；离原点太近、或这页没有汇流箱时用全局顺序。"
+    "关掉开关时四个下拉都不生效。改完看下面的「象限预览」。":
+        "Rule: origin = combiner-box centre on this page; look at the LBD-region centre "
+        "(u right, v up) — I top-right / II top-left / III bottom-left / IV bottom-right. "
+        "Too close to the origin, or no combiner box: the global order is used. "
+        "When the switch is off none of the four dropdowns apply.",
+    "支架类型明细": "Rack type detail",
+    "从识别结果刷新支架类型": "Reload rack types from recognition",
+    "刷新 STR 顺序预览": "Refresh STR order preview",
+    "支架类型": "Rack type",
+    "串数": "Strings",
+    "长度FT": "Length FT",
+    "数量": "Count",
+    # ---- 选项 ----
+    "覆盖同名布局": "Overwrite layouts with the same name",
+    "生成布局后按 LBD 区域上下限对准视口": "Fit viewport to LBD region after layout",
+    "支架类型自动读识别结果(免手填)": "Read rack types from recognition automatically",
+    # ---- 下拉项（显示文字，值不变） ----
+    "开": "On",
+    "关": "Off",
+    "不拆": "No split",
+    "2行": "2 rows",
+    "3行": "3 rows",
+    "开：按四象限规律命名": "On: use the quadrant rule",
+    "关：一律按「支架」页的全局顺序": "Off: use the global order on the rack page",
+    "0 用全局顺序（该象限不改）": "0 use global order (leave this quadrant)",
+    "红": "Red", "黄": "Yellow", "绿": "Green", "青": "Cyan",
+    "蓝": "Blue", "洋红": "Magenta", "白": "White", "灰": "Grey",
+    # ---- 识别页 ----
+    "PDF 文件": "PDF file",
+    "选 PDF…": "Choose PDF…",
+    "选要识别的 PDF（图纸集）": "PDF to recognize",
+    "识别页码": "Pages",
+    "留空 = 全部；也可写 3-8,12": "empty = all; also 3-8,12",
+    "开始识别": "Start recognition",
+    "识别中…": "Recognizing…",
+    "预览": "Preview",
+    "页": "Page",
+    "LBD 区": "LBD area",
+    "支架": "Rack",
+    "箱": "Box",
+    "配到编号": "Assigned no.",
+    "编号位置": "No. position",
+    "识别完这里会画出识别到的框（蓝=LBD 区，红=支架，橙=编号位置）":
+        "Detected boxes appear here (blue = LBD area, red = rack, orange = number)",
+    "放大（也可以滚轮）": "Zoom in (or wheel)",
+    "缩小（也可以滚轮）": "Zoom out (or wheel)",
+    "适应宽度": "Fit width",
+    "删除选中": "Delete selected",
+    "删掉选中的框（Delete 键同效）": "Delete the selected box (Delete key)",
+    "撤销": "Undo",
+    "撤销上一步改动": "Undo the last change",
+    "加框": "Add box",
+    "在画布上拖一下画一个新框（默认给 LBD 区）":
+        "Drag on the canvas to draw a new box (LBD area by default)",
+    "框类型": "Box type",
+    "编号": "Name",
+    "选中一个 LBD 区后可改名": "Select an LBD area to rename it",
+    "改名": "Rename",
+    "保存修改": "Save changes",
+    "导出识别结果 JSON…": "Export recognition JSON…",
+    "只保留": "Keep only",
+    "页范围，如 23-108": "page range, e.g. 23-108",
+    "过滤": "Filter",
+    "滚轮缩放 · 中键拖动平移 · 拖框改位置 · 右下角小方块改大小 · Delete 删除":
+        "Wheel = zoom · middle-drag = pan · drag = move · corner handle = resize · Delete = remove",
+    "名字栏（选中框 → 这里同步；双击可改名）":
+        "Name list (select a box; double-click to rename)",
+    "支架类型（识别出来按长度分档，这里填串数；点「应用到支架页」或直接「下一步」）":
+        "Rack types (bucketed by length; fill in the string count)",
+    "应用到支架页": "Apply to rack page",
+    "下一步：填其它参数 →": "Next: other parameters →",
+    "先选 PDF 文件（「文件与输出」页）": "Choose a PDF first (Files & output page)",
+    "用「文件与输出」里选的 PDF 识别（模型 v4c，直接在程序里跑）。跑完自动填进「识别结果 JSON文件」，接着走标签 / 执行即可。":
+        "Recognizes the PDF chosen on the Files page (model v4c, runs inside the app). "
+        "The result is written into the recognition JSON; continue to Labels / Run.",
+    "选要识别的 PDF（图纸集）": "PDF to recognize",
+    "留空 = 全部；也可写 3-8,12": "empty = all; also 3-8,12",
+    "页范围，如 23-108": "page range, e.g. 23-108",
+    # ---- 底部 / 执行 ----
+    "返回识别": "← Back to recognition",
+    "← 返回识别": "← Back to recognition",
+    "回到识别界面（换 PDF / 重新识别 / 改框和编号）":
+        "Back to recognition (change PDF / re-run / edit boxes and names)",
+    "执行": "Run",
+    "执行输出": "Run",
+    "暂停": "Pause",
+    "继续": "Resume",
+    "停止": "Stop",
+    "暂停执行（随时可停）": "Pause / stop the run at any time",
+    "已暂停（画布与进度已冻结，点「继续」接着跑）":
+        "Paused (frozen – click Resume to continue)",
+    "已停止": "Stopped",
+    # ---- 状态页 ----
+    "准备就绪": "Ready",
+    "已绘制  0 / ？": "Drawn  0 / ?",
+    "生成完成后，点右下角「下载」选择保存位置":
+        "When finished, click «Download» at the bottom right to pick a location",
+    "不会再自动保存到“默认保存目录”，选完路径才写文件":
+        "Nothing is saved automatically – you choose the path",
+    "下载": "Download",
+    "导出 PDF": "Export PDF",
+    "再次另存…": "Save again…",
+    # ---- 日志 / 状态 ----
+    "正在连接 / 启动 CAD…": "Connecting / starting CAD…",
+    "已绘制  %d / %d": "Drawn  %d / %d",
+    "已对准  %d / %d": "Fitted  %d / %d",
+    "完成": "Done",
+    "执行出错：": "Run failed: ",
+    "完成：": "Finished: ",
+    "%s（%d/%d）": "%s (%d/%d)",
+}
 SECTIONS = [
     ("文件与输出", [("dwg", "模板 DWG 文件"),
                   ("pdf", "PDF 文件"), ("xlsx", "标签文件"),
                   ("jsonPath", "识别结果 JSON文件"),
                   ("newName", "新文件名(可空)")]),
-    # 识别：主程序自带的识别（v4c 模型 / onnxruntime），一步出识别结果 JSON
-    ("识别", []),
     # PDF：底图从哪几页来、怎么对准视口
     ("PDF", [("pageStart", "起始页"), ("pageEnd", "结束页(0=全部)"),
              ("importPages", "导入页码(0=全部)"),
              ("count", "复制数量(0=按识别)"),
              ("margin", "视口边距(mm)"),
              ("regionInset", "区域对准留白(%)")]),
-    # 标签：LBD 标签长什么样 + STR 号按哪个方向填（四象限规则原来在「支架」页，挪到这里）
-    ("标签", [("textHeight", "标签高度(模型单位, 0=自动)"), ("labelBgColor", "标签背景色"),
-             ("labelTextColor", "LBD 标签字色"),
-             ("labelBgGap", "背景遮挡间隙(倍)"),
-             ("strQuadOn", "按汇流箱(Box)四象限规律命名"),
-             ("strQuadI", "象限 I 右上 的顺序"),
-             ("strQuadII", "象限 II 左上 的顺序"),
-             ("strQuadIII", "象限 III 左下 的顺序"),
-             ("strQuadIV", "象限 IV 右下 的顺序")]),
-    ("支架", [("rackPrefix", "命名前缀(支架号)"),
-            ("rackTypes", "支架类型(串数:长度FT)"),
-            ("rackSplit", "拆不拆"),
-            ("rackStringLen", "单串长度(FT,可空)"),
-            ("strHeight", "STR 字高(typical宽倍数)"),
-            ("strOrder", "STR 编号顺序(8 种)"),
-            ("rackAlign", "STR 号自动对齐"),
-            ("rackAvoid", "避开底图 LBD 标号"),
-            ("strBgOn", "STR背景填充"),
-            ("strBgColor", "STR背景色"),
-            ("strTextColor", "STR 标签字色"),
-            ("strBgGap", "STR遮挡间隙(倍)")]),
+    # LBD标签：只管 LBD 标签自己长什么样（字高/底色/字色/遮挡间隙）
+    ("LBD标签", [("textHeight", "标签高度(模型单位, 0=自动)"),
+               ("labelBgColor", "标签背景色"),
+               ("labelTextColor", "LBD 标签字色"),
+               ("labelBgGap", "背景遮挡间隙(倍)")]),
+    # 支架标签：和 STR 有关的东西（前缀/类型明细/字高/编号顺序/四象限规律/背景/避让）
+    ("支架标签", [("rackPrefix", "命名前缀(支架号)"),
+              ("rackTypes", "支架类型(串数:长度FT)"),
+              ("rackSplit", "拆不拆"),
+              ("rackStringLen", "单串长度(FT,可空)"),
+              ("strHeight", "STR 字高(typical宽倍数)"),
+              ("strOrder", "STR 编号顺序(8 种)"),
+              ("strQuadOn", "按汇流箱(Box)四象限规律命名"),
+              ("strQuadI", "象限 I 右上 的顺序"),
+              ("strQuadII", "象限 II 左上 的顺序"),
+              ("strQuadIII", "象限 III 左下 的顺序"),
+              ("strQuadIV", "象限 IV 右下 的顺序"),
+              ("rackAlign", "STR 号自动对齐"),
+              ("rackAvoid", "避开底图 LBD 标号"),
+              ("strBgOn", "STR背景填充"),
+              ("strBgColor", "STR背景色"),
+              ("strTextColor", "STR 标签字色"),
+              ("strBgGap", "STR遮挡间隙(倍)")]),
     ("选项", []),
 ]
 FIELDS_INDEX = {k: i for i, (k, _) in enumerate(FIELDS)}
@@ -216,6 +436,53 @@ def find_logo():
     if os.path.exists(cand):
         return cand
     return None
+
+
+# ---------------- 顶栏小图标（不额外带图片文件，直接画） ----------------
+_ICON_CACHE = {}
+
+
+def make_icon(name, size=36, color="#DADFE3"):
+    """按名字画一个小图标（更新 / 日志 / 中英文）。"""
+    key = (name, size, color)
+    if key in _ICON_CACHE:
+        return _ICON_CACHE[key]
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    try:
+        p.setRenderHint(QPainter.Antialiasing, True)
+        pen = QPen(QColor(color))
+        pen.setWidthF(max(1.6, size / 16.0))
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        s = float(size)
+        if name == "update":
+            # 刷新箭头：留缺口的圆环 + 实心三角箭头（18px 下也认得出）
+            r = QRectF(s * 0.22, s * 0.22, s * 0.56, s * 0.56)
+            p.drawArc(r, 35 * 16, 290 * 16)
+            tri = QPolygonF([QPointF(s * 0.88, s * 0.24),
+                             QPointF(s * 0.645, s * 0.26),
+                             QPointF(s * 0.815, s * 0.42)])
+            p.setBrush(QColor(color))
+            p.drawPolygon(tri)
+            p.setBrush(Qt.NoBrush)
+        elif name == "notes":                      # 文档 + 三条线
+            p.drawRoundedRect(QRectF(s * 0.24, s * 0.16, s * 0.52, s * 0.68), s * 0.08, s * 0.08)
+            for i, y in enumerate((0.35, 0.50, 0.65)):
+                p.drawLine(QPointF(s * 0.34, s * y), QPointF(s * 0.66, s * y))
+        elif name == "lang":                       # 地球：圆 + 两条经线 + 赤道
+            p.drawEllipse(QRectF(s * 0.18, s * 0.18, s * 0.64, s * 0.64))
+            p.drawEllipse(QRectF(s * 0.34, s * 0.18, s * 0.32, s * 0.64))
+            p.drawLine(QPointF(s * 0.18, s * 0.50), QPointF(s * 0.82, s * 0.50))
+        else:
+            p.drawEllipse(QRectF(s * 0.22, s * 0.22, s * 0.56, s * 0.56))
+    finally:
+        p.end()
+    ico = QIcon(pm)
+    _ICON_CACHE[key] = ico
+    return ico
 
 
 def config_path():
@@ -666,11 +933,22 @@ def prepare_region_file(cfg, extra_dirs=()):
             last_err = str(e)
             continue
         if r.get("ok"):
-            return out, ("区域对准：按分表顺序 %d 个布局，%d 个匹配到 LBD 区域%s"
-                         " → 生成布局后按区域上下限调视口大小"
-                         % (r["pages"], r["with_region"],
+            # 把"用了哪份 JSON、第几张对应 PDF 哪页"写进日志 —— 视口没对准时一眼能看出错在哪
+            _tip = ""
+            try:
+                _pm = _lr_page_map(jp) if _lr_page_map else None
+                if _pm:
+                    _order = [p for p, _n in sorted(_pm.items(), key=lambda kv: kv[1])]
+                    _tip = "；第 1~%d 张 = PDF 第 %s 页" % (
+                        min(3, len(_order)),
+                        "/".join(str(p) for p in _order[:3]))
+            except Exception:
+                pass
+            return out, ("区域对准：用 %s；按分表顺序 %d 个布局，%d 个匹配到 LBD 区域%s"
+                         " → 生成布局后按区域上下限调视口大小%s"
+                         % (os.path.basename(jp), r["pages"], r["with_region"],
                             ("（%d 个分表没匹配到，按整页对准）" % len(r.get("miss") or []))
-                            if r.get("miss") else ""))
+                            if r.get("miss") else "", _tip))
         last_err = r.get("error") or last_err
     return "", "区域对准：%s（视口按整页对准）" % (last_err or "读取失败")
 
@@ -2161,6 +2439,10 @@ QLabel#VerLabel { color: #727577; background: transparent; }
 QLabel#UpdLabel { color: #F5A800; background: transparent; }
 QPushButton#UpdBtn { background-color: rgba(255,255,255,0.06); color: #DADFE3;
   border: 1px solid rgba(255,255,255,0.10); border-radius: 6px; padding: 4px 12px; }
+/* 顶栏图标按钮：不给内边距，否则 28px 的方块里图标会被压掉一半（显示不全） */
+QPushButton#IconBtn { background-color: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.10);
+  border-radius: 6px; padding: 0px; margin: 0px; }
+QPushButton#IconBtn:hover { background-color: rgba(255,255,255,0.12); }
 QPushButton#UpdBtn:hover { background-color: rgba(255,255,255,0.12); }
 QPushButton#UpdBtn:disabled { color: #5c6064; border: 1px solid rgba(255,255,255,0.06); }
 QFrame#Sidebar { background-color: #131415; border-right: 1px solid #2a2c2e; }
@@ -2180,6 +2462,7 @@ QPushButton { background-color: rgba(255,255,255,0.06); color: #DADFE3;
   border: 1px solid rgba(255,255,255,0.10); border-radius: 8px; padding: 8px 16px; }
 QPushButton:hover { background-color: rgba(255,255,255,0.12); }
 QPushButton#Primary { background-color: #0432FA; color: #fff; border: none; font-weight: 600; }
+QPushButton#DrawTool:checked { background-color: #0432FA; color: #fff; border: none; font-weight: 600; }
 QPushButton#Primary:hover { background-color: #0a46ff; }
 QProgressBar { border: 0; border-radius: 8px; background: rgba(255,255,255,0.12);
   color: #DADFE3; }
@@ -2242,12 +2525,14 @@ class RecogBoxItem(QGraphicsRectItem):
         self.setFlag(QGraphicsRectItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsRectItem.ItemIsMovable, True)
         self.setFlag(QGraphicsRectItem.ItemSendsGeometryChanges, True)
-        col = QColor(0, 120, 255) if kind == "Node" else QColor(255, 40, 40)
+        col = {"Node": QColor(0, 120, 255), "Tracker": QColor(255, 40, 40),
+               "Box": QColor(40, 200, 120)}.get(kind, QColor(255, 200, 0))
         pen = QPen(col)
         pen.setWidth(2 if kind == "Node" else 1)
+        pen.setCosmetic(True)          # 线宽不跟着缩放变：缩小看整页时框也看得见
         self.setPen(pen)
         self.setBrush(Qt.NoBrush)
-        self.setZValue(10 if kind == "Node" else 5)
+        self.setZValue(10 if kind == "Node" else (8 if kind == "Box" else 5))
 
     def itemChange(self, change, value):
         if change == QGraphicsRectItem.ItemPositionHasChanged:
@@ -2281,9 +2566,17 @@ class RecogCanvas(QGraphicsView):
         self.ocr_of = {}
         self.on_changed = None
         self.on_selected = None
+        self.on_added = None           # 拖出一个新框之后的回调（界面刷新名字栏/统计）
+        self.on_deleted = None         # 删框之后的回调（界面同步刷新结果）
+        self.on_page_key = None        # 键盘翻页回调（PgUp/PgDn、Ctrl+←/→）
+        self.add_mode = ""             # "" = 不在加框模式；否则 = 要画的框类型
+        self._rubber = None
+        self._rubber_from = None
         self._panning = False
         self._pan_from = None
         self._undo = []
+        self._fit_mode = "page"        # "page"=整页装进视口 / "width"=适应宽度 / ""=手动缩放
+        self.sel_label = None          # 选中框的名字（和标注软件一样：只显示选中的那个）
         self.handle = None
         self._make_handle()
 
@@ -2291,11 +2584,19 @@ class RecogCanvas(QGraphicsView):
         """（重新）造右下角改大小的小方块 —— scene.clear() 之后必须重建。"""
         self.handle = QGraphicsRectItem()
         self.handle.setBrush(QColor(255, 216, 0, 220))
-        self.handle.setPen(QPen(QColor(20, 20, 20, 220), 0))
+        _hp = QPen(QColor(20, 20, 20, 220), 0)
+        _hp.setCosmetic(True)
+        self.handle.setPen(_hp)
         self.handle.setFlag(QGraphicsRectItem.ItemIsMovable, True)
         self.handle.setZValue(50)
         self.handle.setVisible(False)
         self.scene().addItem(self.handle)
+        # 选中框的名字标签（只有一个，跟着选中项走）
+        self.sel_label = QGraphicsSimpleTextItem()
+        self.sel_label.setBrush(QColor(255, 196, 0))
+        self.sel_label.setZValue(60)
+        self.sel_label.setVisible(False)
+        self.scene().addItem(self.sel_label)
 
     # ---------- 载入一页 ----------
     def load(self, doc, page, pdf_path, dpi=110, max_w=1100):
@@ -2327,7 +2628,7 @@ class RecogCanvas(QGraphicsView):
         k = 0
         for i, d in enumerate(dets):
             kind = d.get("label") or ""
-            if kind not in ("Node", "Tracker"):
+            if kind not in ("Node", "Tracker", "Box"):
                 continue
             it = RecogBoxItem(self, i, kind, self._disp_rect(d.get("bbox") or {}))
             self.scene().addItem(it)
@@ -2336,22 +2637,8 @@ class RecogCanvas(QGraphicsView):
                 if k < len(recs):
                     self.ocr_of[i] = k
                 k += 1
-        for i, d in enumerate(dets):
-            if (d.get("label") or "") != "Node":
-                continue
-            j = self.ocr_of.get(i)
-            if j is None or j >= len(recs):
-                continue
-            name = (recs[j].get("final_node_name") or "").strip()
-            if not name:
-                continue
-            bb = d.get("bbox") or {}
-            t = self.scene().addSimpleText(name)
-            t.setBrush(QColor(255, 196, 0))
-            t.setPos(self._dx(bb.get("x1", 0)) + 3, self._dy(bb.get("y1", 0)) + 2)
-            t.setZValue(20)
-            self.name_items[j] = t
-        self.fit_width()
+        self.name_items = {}          # 名字只显示选中的那个（和标注软件一致）
+        self.fit_page()
 
     # ---------- 坐标换算（页像素 <-> 画布像素）----------
     def _k(self):
@@ -2373,9 +2660,13 @@ class RecogCanvas(QGraphicsView):
         self.zoom(1.15 if e.angleDelta().y() > 0 else 1 / 1.15)
 
     def zoom(self, factor):
+        self._fit_mode = ""
         self.scale(factor, factor)
+        self._place_handle()
 
     def fit_width(self):
+        """适应宽度：整页宽铺满视口（看细节用）。"""
+        self._fit_mode = "width"
         if not self.pix_item:
             return
         self.resetTransform()
@@ -2383,6 +2674,32 @@ class RecogCanvas(QGraphicsView):
         if w > 50 and self.pix_item.boundingRect().width() > 0:
             s = w / self.pix_item.boundingRect().width()
             self.scale(s, s)
+        self._place_handle()
+
+    def fit_page(self, margin=8):
+        """适应页面：整张图纸缩到视口里 —— 一屏看全这一页（默认就按这个来）。"""
+        self._fit_mode = "page"
+        if not self.pix_item:
+            return
+        self.resetTransform()
+        r = self.pix_item.boundingRect()
+        vw = max(60, self.viewport().width() - margin * 2)
+        vh = max(60, self.viewport().height() - margin * 2)
+        if r.width() <= 1 or r.height() <= 1:
+            return
+        s = min(vw / r.width(), vh / r.height())
+        s = max(0.02, min(s, 4.0))
+        self.scale(s, s)
+        self.centerOn(r.center())
+        self._place_handle()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        mode = getattr(self, "_fit_mode", "")
+        if mode == "page":
+            self.fit_page()
+        elif mode == "width":
+            self.fit_width()
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MiddleButton:
@@ -2391,9 +2708,27 @@ class RecogCanvas(QGraphicsView):
             self.setCursor(Qt.ClosedHandCursor)
             e.accept()
             return
+        # 加框模式：在图上拖一个矩形，松手就落一个新框
+        if self.add_mode and e.button() == Qt.LeftButton and self.pix_item is not None:
+            self._rubber_from = self.mapToScene(e.position().toPoint())
+            self._rubber = QGraphicsRectItem(QRectF(self._rubber_from, self._rubber_from))
+            _pen = QPen(QColor(255, 216, 0))
+            _pen.setWidth(1)
+            _pen.setStyle(Qt.DashLine)
+            self._rubber.setPen(_pen)
+            self._rubber.setBrush(Qt.NoBrush)
+            self._rubber.setZValue(60)
+            self.scene().addItem(self._rubber)
+            e.accept()
+            return
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
+        if self._rubber is not None and self._rubber_from is not None:
+            cur = self.mapToScene(e.position().toPoint())
+            self._rubber.setRect(QRectF(self._rubber_from, cur).normalized())
+            e.accept()
+            return
         if self._panning and self._pan_from is not None:
             d = e.position() - self._pan_from
             self._pan_from = e.position()
@@ -2404,6 +2739,10 @@ class RecogCanvas(QGraphicsView):
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
+        if self._rubber is not None:
+            self._finish_add()
+            e.accept()
+            return
         if e.button() == Qt.MiddleButton and self._panning:
             self._panning = False
             self.unsetCursor()
@@ -2425,7 +2764,65 @@ class RecogCanvas(QGraphicsView):
             self.undo()
             e.accept()
             return
+        if e.key() == Qt.Key_C and (e.modifiers() & Qt.ControlModifier):
+            if self.copy_selected():
+                e.accept()
+                return
+        if e.key() == Qt.Key_V and (e.modifiers() & Qt.ControlModifier):
+            if self.paste_box():
+                e.accept()
+                return
+        if e.key() == Qt.Key_PageDown or (e.key() == Qt.Key_Right and (e.modifiers() & Qt.ControlModifier)):
+            if self.on_page_key:
+                self.on_page_key(1)
+            e.accept()
+            return
+        if e.key() == Qt.Key_PageUp or (e.key() == Qt.Key_Left and (e.modifiers() & Qt.ControlModifier)):
+            if self.on_page_key:
+                self.on_page_key(-1)
+            e.accept()
+            return
         super().keyPressEvent(e)
+
+    def _finish_add(self):
+        """把刚拖出来的矩形落成一个新框（写回识别结果 doc）。"""
+        r = self._rubber.rect().normalized() if self._rubber is not None else QRectF()
+        if self._rubber is not None:
+            self.scene().removeItem(self._rubber)
+        self._rubber = None
+        self._rubber_from = None
+        if r.width() < 4 or r.height() < 4 or self.doc is None:
+            return False
+        kind = self.add_mode or "Node"
+        k = float(self.page_w or 1) / max(1.0, self.disp_w)
+        bb = {"x1": r.left() * k, "y1": r.top() * k,
+              "x2": r.right() * k, "y2": r.bottom() * k}
+        self.push_undo()
+        trk, ocr = self._page_data()
+        if trk is None:
+            trk = {"page_number": self.page, "data": {"detections": []}}
+            self.doc.setdefault("yolo_tracker_detection_results", []).append(trk)
+        dets = (trk.setdefault("data", {})).setdefault("detections", [])
+        dets.append({"label": kind, "bbox": bb, "confidence": 1.0,
+                     "source": "manual", "raw": {}})
+        if kind == "Node":
+            if ocr is None:
+                ocr = {"page_number": self.page, "data": []}
+                self.doc.setdefault("ocr_node_name_results", []).append(ocr)
+            ocr.setdefault("data", []).append(
+                {"node_bbox": dict(bb), "final_node_name": "",
+                 "preliminary_node_name": "", "selected": {}})
+        pdf = getattr(self, "_pdf", "")
+        if pdf:
+            self.load(self.doc, self.page, pdf)
+        if self.on_added:
+            try:
+                self.on_added(kind, len(dets) - 1)
+            except Exception:
+                pass
+        if self.on_changed:
+            self.on_changed()
+        return True
 
     # ---------- 选中 / 编辑 ----------
     def selected_box(self):
@@ -2433,6 +2830,23 @@ class RecogCanvas(QGraphicsView):
             if isinstance(it, RecogBoxItem):
                 return it
         return None
+
+    def select_det(self, det_index, min_px=70.0):
+        """选中第 det_index 个框并把它挪到视野中间；太小就顺手放大一点。"""
+        for it in self.box_items:
+            if it.det_index != det_index:
+                continue
+            self.scene().clearSelection()
+            it.setSelected(True)
+            self._place_handle()
+            self.centerOn(it)
+            r = it.sceneBoundingRect()
+            sc = self.transform().m22()
+            if r.height() * sc < min_px:          # 太小看不见：放大到能看清
+                self.zoom(max(1.5, min_px / max(1.0, r.height() * sc)))
+                self.centerOn(it)
+            return True
+        return False
 
     def note_selected(self, box):
         self._place_handle()
@@ -2447,11 +2861,42 @@ class RecogCanvas(QGraphicsView):
         if box is None or self.handle is None:
             if self.handle is not None:
                 self.handle.setVisible(False)
+            if getattr(self, "sel_label", None) is not None:
+                self.sel_label.setVisible(False)
             return
+        sc = max(0.02, float(self.transform().m22() or 1.0))
+        hs = 12.0 / sc                 # 改大小的小方块在屏幕上恒定 12px，缩到整页也点得住
         r = box.sceneBoundingRect()
-        self.handle.setRect(0, 0, 10, 10)
-        self.handle.setPos(r.right() - 5, r.bottom() - 5)
+        self.handle.setRect(0, 0, hs, hs)
+        self.handle.setPos(r.right() - hs / 2.0, r.bottom() - hs / 2.0)
         self.handle.setVisible(True)
+        self._update_sel_label(box, sc)
+
+    def _update_sel_label(self, box, sc=None):
+        """选中框的名字：贴在框上方，字号按缩放反算，屏幕上看始终是同一个大小。"""
+        lbl = getattr(self, "sel_label", None)
+        if lbl is None:
+            return
+        try:
+            trk, ocr = self._page_data()
+            recs = ((ocr or {}).get("data") or []) if ocr is not None else []
+            j = self.ocr_of.get(box.det_index)
+            name = (recs[j].get("final_node_name") or "").strip() if (j is not None and j < len(recs)) else ""
+        except Exception:
+            name = ""
+        if not name:
+            lbl.setVisible(False)
+            return
+        if sc is None:
+            sc = max(0.02, float(self.transform().m22() or 1.0))
+        f = lbl.font()
+        f.setPixelSize(max(9, int(round(13.0 / sc))))
+        lbl.setFont(f)
+        r = box.sceneBoundingRect()
+        lbl.setText(name)
+        lb = lbl.boundingRect()
+        lbl.setPos(r.left(), r.top() - lb.height() - 2.0 / sc)
+        lbl.setVisible(True)
 
     def _apply_resize(self):
         box = self.selected_box()
@@ -2512,9 +2957,6 @@ class RecogCanvas(QGraphicsView):
         recs = ((ocr or {}).get("data") or []) if ocr is not None else []
         if j is not None and j < len(recs):
             recs[j]["node_bbox"] = dict(bb)
-            t = self.name_items.get(j)
-            if t is not None:
-                t.setPos(self._dx(bb["x1"]) + 3, self._dy(bb["y1"]) + 2)
         self._place_handle()
         if self.on_changed:
             self.on_changed()
@@ -2543,6 +2985,11 @@ class RecogCanvas(QGraphicsView):
         self._reindex()
         if self.on_changed:
             self.on_changed()
+        if self.on_deleted:
+            try:
+                self.on_deleted(len(kill))
+            except Exception:
+                pass
         return len(kill)
 
     def _reindex(self):
@@ -2577,17 +3024,7 @@ class RecogCanvas(QGraphicsView):
         sel = recs[j].get("selected") or {}
         sel["text"] = name
         recs[j]["selected"] = sel
-        t = self.name_items.get(j)
-        if t is not None:
-            self.scene().removeItem(t)
-            self.name_items.pop(j, None)
-        bb = recs[j].get("node_bbox") or {}
-        if name:
-            t = self.scene().addSimpleText(name)
-            t.setBrush(QColor(255, 196, 0))
-            t.setPos(self._dx(bb.get("x1", 0)) + 3, self._dy(bb.get("y1", 0)) + 2)
-            t.setZValue(20)
-            self.name_items[j] = t
+        self._place_handle()          # 名字标签跟着刷新（只显示选中这个框）
         if self.on_changed:
             self.on_changed()
         return True
@@ -2604,6 +3041,66 @@ class RecogCanvas(QGraphicsView):
         cf = (dets[box.det_index].get("confidence")
               if 0 <= box.det_index < len(dets) else None)
         return {"kind": box.kind, "name": nm, "conf": cf, "ocr_index": j}
+
+    # ---------- 复制 / 粘贴（和标注软件一样：Ctrl+C / Ctrl+V 复制一个框）----------
+    def copy_selected(self):
+        import copy as _copy
+        box = self.selected_box()
+        if box is None:
+            return False
+        trk, ocr = self._page_data()
+        dets = ((trk or {}).get("data") or {}).get("detections") or []
+        recs = ((ocr or {}).get("data") or []) if ocr is not None else []
+        if not (0 <= box.det_index < len(dets)):
+            return False
+        j = self.ocr_of.get(box.det_index)
+        self._clip = {
+            "det": _copy.deepcopy(dets[box.det_index]),
+            "ocr": _copy.deepcopy(recs[j]) if (j is not None and j < len(recs)) else None,
+        }
+        return True
+
+    def paste_box(self, offset=12.0):
+        """把复制过的框贴到旁边（新框直接选中，方便接着拖）。"""
+        clip = getattr(self, "_clip", None)
+        if not clip or self.doc is None:
+            return False
+        import copy as _copy
+        self.push_undo()
+        trk, ocr = self._page_data()
+        if trk is None:
+            trk = {"page_number": self.page, "data": {"detections": []}}
+            self.doc.setdefault("yolo_tracker_detection_results", []).append(trk)
+        det = _copy.deepcopy(clip["det"])
+        b = dict(det.get("bbox") or {})
+        for k in ("x1", "x2"):
+            b[k] = b.get(k, 0) + offset
+        for k in ("y1", "y2"):
+            b[k] = b.get(k, 0) + offset
+        det["bbox"] = b
+        det["source"] = "manual"
+        dets = (trk.setdefault("data", {})).setdefault("detections", [])
+        dets.append(det)
+        new_i = len(dets) - 1
+        if (det.get("label") or "") == "Node":
+            if ocr is None:
+                ocr = {"page_number": self.page, "data": []}
+                self.doc.setdefault("ocr_node_name_results", []).append(ocr)
+            rec = _copy.deepcopy(clip["ocr"]) if clip.get("ocr") else {}
+            rec["node_bbox"] = dict(b)
+            ocr.setdefault("data", []).append(rec)
+        pdf = getattr(self, "_pdf", "")
+        if pdf:
+            self.load(self.doc, self.page, pdf)
+            self.select_det(new_i)
+        if self.on_added:
+            try:
+                self.on_added(det.get("label") or "Node", new_i)
+            except Exception:
+                pass
+        if self.on_changed:
+            self.on_changed()
+        return True
 
 
 class NoWheelCombo(QComboBox):
@@ -3200,15 +3697,54 @@ class MainWindow(QMainWindow):
         self._poll_timer = None
         self._generated_layouts = []      # 本次生成的布局名（导出 PDF 默认勾这些）
         self._print_prefs = {}            # 上次选过的设备/纸型/目录（只在本次运行内记）
+        # 中英文：所有会显示文字、并且要跟着语言切换刷新的控件
+        self._i18n = []                   # [(控件, 中文原文)]
+        self._i18n_tip = []               # [(控件, 中文 tooltip)]
+        self._i18n_combo = []             # [(下拉框, [(中文, 值)])]
+        self._i18n_headers = []           # [(表格, [中文表头])]
+        self._i18n_ph = []                # [(输入框, 中文占位提示)]
+        self._i18n_nav = []               # 侧边栏导航按钮
+        self._step_times = {}             # 本轮执行每一步的耗时
+        self._run_started = None
+        self._paused = False
         self._build_ui()
         self.set_cfg(load_config())
+        # 打开就是「识别」这一屏（没有参数页/侧边栏）：选 PDF → 识别 → 改好 → 下一步才进画图流程
+        self.show_recog_workspace()
         # 起始页/结束页 失焦或按回车时，按范围自动算出“复制数量”（不逐字触发，避免卡输入）
         for _k in ("pageStart", "pageEnd"):
             _w = self.edits.get(_k)
             if _w:
                 _w.editingFinished.connect(self._recalc_count_from_range)
         self.setWindowTitle("%s v%s" % (APP_TITLE, APP_VERSION))
-        self.resize(1120, 720)
+        # 键盘：Ctrl+B 随时回识别（生成完想改识别结果就按它）；PgUp/PgDn 在识别页翻页
+        try:
+            from PySide6.QtGui import QShortcut, QKeySequence
+            self._sc_back = QShortcut(QKeySequence("Ctrl+B"), self)
+            self._sc_back.activated.connect(self.show_recog_workspace)
+            # 识别画布：缩放 / 适应不再放按钮，全靠快捷键（和标注软件的习惯一致）
+            for _seq, _slot in (("Ctrl++", self.on_recog_zoom_in),
+                                ("Ctrl+=", self.on_recog_zoom_in),
+                                ("Ctrl+-", self.on_recog_zoom_out),
+                                ("Ctrl+0", self.on_recog_fit_page),
+                                ("Ctrl+1", self.on_recog_fit)):
+                _sc = QShortcut(QKeySequence(_seq), self)
+                _sc.activated.connect(_slot)
+        except Exception:
+            pass
+        # 窗口尺寸：默认开到能一眼看全（识别页三栏 + 支架表 + 日志），最小尺寸也放宽一点，
+        # 但页面都能滚动，小屏也不会把控件挤没。
+        self.resize(1560, 960)
+        self.setMinimumSize(1180, 720)
+        try:
+            scr = QApplication.primaryScreen()
+            if scr is not None:
+                av = scr.availableGeometry()
+                w = min(1560, max(1180, av.width() - 80))
+                h = min(960, max(720, av.height() - 80))
+                self.resize(w, h)
+        except Exception:
+            pass
         # 启动后静默查一次更新（只有发现新版才会提示）
         QTimer.singleShot(2500, lambda: self.on_check_update(silent=True))
 
@@ -3244,30 +3780,53 @@ class MainWindow(QMainWindow):
         ver.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         hl.addWidget(ver)
         hl.addSpacing(8)
-        self.upd_btn = QPushButton("检查更新")
-        self.upd_btn.setObjectName("UpdBtn")
-        self.upd_btn.setFixedHeight(28)
-        self.upd_btn.setFixedWidth(160)            # 「检查更新 / 下载并安装 v2.17.1 / 正在下载…」宽度一致
+        # 语言切换（图标按钮，最右边）
+        self.lang_btn = QPushButton()
+        self.lang_btn.setObjectName("IconBtn")
+        self.lang_btn.setFixedSize(28, 28)
+        self.lang_btn.setIcon(make_icon("lang"))
+        self.lang_btn.setIconSize(QSize(18, 18))
+        self.lang_btn.clicked.connect(self.on_switch_lang)
+        self._reg_tip(self.lang_btn, "中英文切换")
+        hl.addWidget(self.lang_btn)
+        hl.addSpacing(6)
+        # 更新 / 更新日志：都改成图标按钮（鼠标悬停有说明）
+        self.upd_btn = QPushButton()
+        self.upd_btn.setObjectName("IconBtn")
+        self.upd_btn.setFixedSize(28, 28)
+        self.upd_btn.setIcon(make_icon("update"))
+        self.upd_btn.setIconSize(QSize(18, 18))
         self.upd_btn.clicked.connect(self.on_upd_click)
+        self.upd_btn.setToolTip("检查更新")
         hl.addWidget(self.upd_btn)
-        self.notes_btn = QPushButton("更新日志")
-        self.notes_btn.setObjectName("UpdBtn")
-        self.notes_btn.setFixedHeight(28)
-        self.notes_btn.setFixedWidth(88)
+        self.notes_btn = QPushButton()
+        self.notes_btn.setObjectName("IconBtn")
+        self.notes_btn.setFixedSize(28, 28)
+        self.notes_btn.setIcon(make_icon("notes"))
+        self.notes_btn.setIconSize(QSize(18, 18))
         self.notes_btn.clicked.connect(self.on_show_notes)
+        self.notes_btn.setToolTip("更新日志")
         hl.addWidget(self.notes_btn)
         root.addWidget(header)
         # 主体：侧边栏 + 内容
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
-        body.addWidget(self._build_sidebar())
+        self.sidebar = self._build_sidebar()
+        body.addWidget(self.sidebar)
         self.content_stack = QStackedWidget()
         self.section_stack = QStackedWidget()
         for s_i, (sec_title, keys) in enumerate(SECTIONS):
-            self.section_stack.addWidget(self._build_section_page(s_i, sec_title, keys))
+            # 每页套一层滚动区：窗口小的时候也不会把控件挤没/挤出去
+            _page = self._build_section_page(s_i, sec_title, keys)
+            _sa = QScrollArea()
+            _sa.setWidgetResizable(True)
+            _sa.setFrameShape(QFrame.NoFrame)
+            _sa.setWidget(_page)
+            self.section_stack.addWidget(_sa)
         self.content_stack.addWidget(self.section_stack)   # 0 = 表单
         self.content_stack.addWidget(self._build_status_page())  # 1 = 执行状态
+        self.content_stack.addWidget(self._build_recog_page())    # 2 = 识别工作区（独立一屏）
         body.addWidget(self.content_stack, 1)
         root.addLayout(body, 1)
         # 底部：操作按钮 + 日志
@@ -3278,10 +3837,29 @@ class MainWindow(QMainWindow):
         fl.setSpacing(8)
         actions = QHBoxLayout()
         actions.setSpacing(8)
+        self.back_recog_btn = self._reg(QPushButton(), "← 返回识别")
+        self._reg_tip(self.back_recog_btn, "回到识别界面（换 PDF / 重新识别 / 改框和编号）")
+        self.back_recog_btn.clicked.connect(self.show_recog_workspace)
+        actions.addWidget(self.back_recog_btn)
         actions.addStretch(1)
-        b = QPushButton("执行输出")
+        # 随时可停：执行旁边一个「暂停 / 继续」（执行中才可用）
+        self.pause_btn = self._reg(QPushButton(), "暂停")
+        self.pause_btn.setObjectName("WarnBtn")
+        self.pause_btn.setEnabled(False)
+        self._reg_tip(self.pause_btn, "暂停执行（随时可停）")
+        self.pause_btn.clicked.connect(self.on_pause)
+        actions.addWidget(self.pause_btn)
+        # 真·随时停止：写停止标记，CAD 侧的插件在每个检查点看到就收尾停下
+        self.stop_btn = self._reg(QPushButton(), "停止")
+        self.stop_btn.setObjectName("WarnBtn")
+        self.stop_btn.setEnabled(False)
+        self._reg_tip(self.stop_btn, "立刻停止本次执行（CAD 侧会在下一个检查点收尾停下）")
+        self.stop_btn.clicked.connect(self.on_stop)
+        actions.addWidget(self.stop_btn)
+        b = self._reg(QPushButton(), "执行")
         b.setObjectName("Primary")
         b.clicked.connect(self.on_run)
+        self.run_btn = b
         actions.addWidget(b)
         fl.addLayout(actions)
         self.log = QPlainTextEdit()
@@ -3308,7 +3886,7 @@ class MainWindow(QMainWindow):
     def _build_sidebar(self):
         sb = QFrame()
         sb.setObjectName("Sidebar")
-        sb.setFixedWidth(230)
+        sb.setFixedWidth(258)
         v = QVBoxLayout(sb)
         v.setContentsMargins(14, 18, 14, 18)
         v.setSpacing(6)
@@ -3318,12 +3896,13 @@ class MainWindow(QMainWindow):
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
         for i, (sec_title, _) in enumerate(SECTIONS):
-            b = QPushButton(sec_title)
+            b = QPushButton(T(sec_title))
             b.setObjectName("Nav")
             b.setCheckable(True)
             b.setFixedHeight(44)
             b.clicked.connect(lambda _=False, idx=i: self.show_section(idx))
             self.nav_group.addButton(b, i)
+            self._i18n_nav.append((b, sec_title))
             v.addWidget(b)
         if SECTIONS:
             self.nav_group.button(0).setChecked(True)
@@ -3331,13 +3910,11 @@ class MainWindow(QMainWindow):
         return sb
 
     def _build_section_page(self, s_idx, sec_title, keys):
-        if sec_title == "识别":
-            return self._build_recog_page()
         page = QWidget()
         outer = QVBoxLayout(page)
         outer.setContentsMargins(28, 24, 28, 24)
         outer.setSpacing(14)
-        h = QLabel(sec_title)
+        h = self._reg(QLabel(), sec_title)
         h.setObjectName("PageTitle")
         outer.addWidget(h)
         form = QGridLayout()
@@ -3350,7 +3927,7 @@ class MainWindow(QMainWindow):
             for key, txt, init in [("overwrite", "覆盖同名布局", False),
                                    ("regionFit", "生成布局后按 LBD 区域上下限对准视口", True),
                                    ("rackAuto", "支架类型自动读识别结果(免手填)", True)]:
-                cb = QCheckBox(txt)
+                cb = self._reg(QCheckBox(), txt)
                 cb.setChecked(init)
                 self.checkbox[key] = cb
                 form.addWidget(cb, r, 0, 1, 2)
@@ -3366,19 +3943,18 @@ class MainWindow(QMainWindow):
             for key, label in keys:
                 if key == "strQuadOn":
                     # 标签页里给「四象限规矩」这一段单独起个小标题，和上面的标签设置分开
-                    sub = QLabel("STR 编号方向 · 按汇流箱(Box)四象限规矩")
+                    sub = self._reg(QLabel(), "STR 编号方向 · 按汇流箱(Box)四象限规矩")
                     sub.setObjectName("FieldLabel")
                     form.addWidget(sub, r, 0, 1, 2)
                     r += 1
-                lb = QLabel(label)
+                lb = self._reg(QLabel(), label)
                 lb.setObjectName("FieldLabel")
                 form.addWidget(lb, r, 0)
                 if key in ("strBgColor", "strTextColor", "labelBgColor", "labelTextColor"):
                     cb = NoWheelCombo()
                     cb.setObjectName("Field")
                     cb.setMinimumWidth(320)
-                    for cname, aci in COLOR_CHOICES:
-                        cb.addItem(cname, aci)
+                    self._reg_combo(cb, COLOR_CHOICES)
                     self.combo[key] = cb
                     form.addWidget(cb, r, 1)
                 elif key in ("strOrder",) + tuple(k for k, _t in QUAD_FIELDS):
@@ -3386,13 +3962,11 @@ class MainWindow(QMainWindow):
                     cb.setObjectName("Field")
                     cb.setMinimumWidth(320)
                     if key == "strOrder":
-                        for label, val in STR_ORDER_CHOICES:
-                            cb.addItem(label, val)
+                        self._reg_combo(cb, STR_ORDER_CHOICES, en=STR_ORDER_EN)
                     else:
                         # 象限下拉：第一项是「0 = 这个象限不改」，其余就是 8 种顺序
-                        cb.addItem("0 用全局顺序（该象限不改）", "0")
-                        for label, val in STR_ORDER_CHOICES:
-                            cb.addItem(label, val)
+                        self._reg_combo(cb, [("0 用全局顺序（该象限不改）", "0")] + list(STR_ORDER_CHOICES),
+                                        en=["0 use global order (leave this quadrant)"] + list(STR_ORDER_EN))
                     self.combo[key] = cb
                     cb.currentIndexChanged.connect(lambda *_: self.on_refresh_str_preview())
                     cb.currentIndexChanged.connect(lambda *_: self.on_refresh_quad_preview())
@@ -3402,16 +3976,24 @@ class MainWindow(QMainWindow):
                     cb = NoWheelCombo()
                     cb.setObjectName("Field")
                     cb.setMinimumWidth(320)
-                    cb.addItem("开", "1")
-                    cb.addItem("关", "0")
+                    self._reg_combo(cb, [("开", "1"), ("关", "0")])
+                    self.combo[key] = cb
+                    form.addWidget(cb, r, 1)
+                elif key == "rackSplit":
+                    # 拆不拆：显示文字跟着语言走，值仍是 ini 里认的「不拆/2行/3行」
+                    cb = NoWheelCombo()
+                    cb.setObjectName("Field")
+                    cb.setMinimumWidth(320)
+                    self._reg_combo(cb, [("不拆", "不拆"), ("2行", "2行"), ("3行", "3行")],
+                                    en=["No split", "2 rows", "3 rows"])
                     self.combo[key] = cb
                     form.addWidget(cb, r, 1)
                 elif key == "strQuadOn":
                     cb = NoWheelCombo()
                     cb.setObjectName("Field")
                     cb.setMinimumWidth(320)
-                    cb.addItem("开：按四象限规律命名", "1")
-                    cb.addItem("关：一律按「支架」页的全局顺序", "0")
+                    self._reg_combo(cb, [("开：按四象限规律命名", "1"),
+                                         ("关：一律按「支架」页的全局顺序", "0")])
                     self.combo[key] = cb
                     cb.currentIndexChanged.connect(lambda *_: self.on_quad_on_changed())
                     form.addWidget(cb, r, 1)
@@ -3422,26 +4004,22 @@ class MainWindow(QMainWindow):
                     self.edits[key] = edit
                     form.addWidget(edit, r, 1)
                     if key in BROWSE_KEYS:
-                        bb = QPushButton("选择")
+                        bb = self._reg(QPushButton(), "选择")
                         bb.clicked.connect(lambda _=False, k=key: self.browse(k))
                         form.addWidget(bb, r, 2)
                 r += 1
                 if key == "strQuadIV":
-                    _qh = QLabel(
-                        "开关关掉时四个下拉全部不生效（一律按「支架」页的全局顺序）；开着时判据是："
-                        "原点 = 本页汇流箱(Box)的几何中心，看这个 LBD 区域中心的方位"
-                        "（u 右为正、v 上为正）——I 右上 / II 左上 / III 左下 / IV 右下；"
-                        "离原点太近（死区）、或这页没有汇流箱时，用全局顺序。"
-                        "改完看下面的「象限预览」——四个小图就是四个象限里的真实样例，"
-                        "换一个顺序，号立刻就换位置。")
+                    _qh = self._reg(QLabel(),
+                        "判据：原点 = 本页汇流箱(Box)中心，看 LBD 区域中心的方位（u 右为正、v 上为正）"
+                        "——I 右上 / II 左上 / III 左下 / IV 右下；离原点太近、或这页没有汇流箱时用全局顺序。"
+                        "关掉开关时四个下拉都不生效。改完看下面的「象限预览」。")
                     _qh.setObjectName("Hint")
-                    _qh.setWordWrap(True)
+                    self._shrinkable(_qh, 120)
                     form.addWidget(_qh, r, 0, 1, 2)
                     r += 1
-            if sec_title == "标签":
-                label_panel = self._build_label_panel()
-            elif sec_title == "支架":
+            if sec_title == "支架标签":
                 rack_panel = self._build_rack_panel()
+                label_panel = self._build_label_panel()
         outer.addLayout(form)
         if rack_panel is not None:
             outer.addWidget(rack_panel)
@@ -3458,110 +4036,241 @@ class MainWindow(QMainWindow):
     def _build_recog_page(self):
         page = QWidget()
         outer = QVBoxLayout(page)
-        outer.setContentsMargins(28, 24, 28, 24)
-        outer.setSpacing(12)
-        h = QLabel("识别")
+        outer.setContentsMargins(20, 16, 20, 16)
+        outer.setSpacing(10)
+        h = self._reg(QLabel(), "识别")
         h.setObjectName("PageTitle")
         outer.addWidget(h)
-        tip = QLabel("用「文件与输出」里选的 PDF 文件识别（模型 v4c，直接在程序里跑，不用另装 Python）。\n"
-                     "跑完会自动把结果填进「识别结果 JSON文件」，接着往下走标签 / 执行即可；"
-                     "LBD 编号会自动按 PDF 文字层配上，编号印在哪儿也一起记下来给避让用。")
+        tip = self._reg(QLabel(),
+                     "用「文件与输出」里选的 PDF 识别（模型 v4c，直接在程序里跑）。"
+                     "跑完自动填进「识别结果 JSON文件」，接着走标签 / 执行即可。")
         tip.setObjectName("Hint")
-        tip.setWordWrap(True)
+        self._shrinkable(tip, 120)
         outer.addWidget(tip)
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        row.addWidget(QLabel("识别页码"))
+        # 识别要的两个输入直接放这一步：PDF + 标签文件（和「文件与输出」页是同一份数据）
+        inrow = QHBoxLayout()
+        inrow.setSpacing(8)
+        inrow.addWidget(self._reg(QLabel(), "PDF 文件"))
+        self.recog_pdf_edit = QLineEdit()
+        self.recog_pdf_edit.setObjectName("Field")
+        self._reg_ph(self.recog_pdf_edit, "选要识别的 PDF（图纸集）")
+        inrow.addWidget(self.recog_pdf_edit, 1)
+        b = self._reg(QPushButton(), "选 PDF…")
+        b.clicked.connect(lambda: self._recog_pick("pdf"))
+        inrow.addWidget(b)
+        outer.addLayout(inrow)
+        # 页码 / 开始识别 单独一行：窄窗口下也摆得下，不会把整页撑宽
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
+        row2.addWidget(self._reg(QLabel(), "识别页码"))
         self.recog_pages_edit = QLineEdit()
         self.recog_pages_edit.setObjectName("Field")
-        self.recog_pages_edit.setPlaceholderText("留空 = 全部；也可写 3-8,12")
+        self._reg_ph(self.recog_pages_edit, "留空 = 全部；也可写 3-8,12")
+        self.recog_pages_edit.setMinimumWidth(120)
         self.recog_pages_edit.setMaximumWidth(260)
-        row.addWidget(self.recog_pages_edit)
-        self.recog_btn = QPushButton("开始识别")
+        row2.addWidget(self.recog_pages_edit)
+        self.recog_btn = self._reg(QPushButton(), "开始识别")
         self.recog_btn.setObjectName("Primary")
         self.recog_btn.clicked.connect(self.on_recognize)
-        row.addWidget(self.recog_btn)
+        self.recog_btn.setMinimumWidth(110)
+        row2.addWidget(self.recog_btn)
+        row2.addStretch(1)
+        outer.addLayout(row2)
+        # 状态单独一行：日志文字很长，挤在按钮中间会被截断
         self.recog_status = QLabel("")
         self.recog_status.setObjectName("Hint")
-        row.addWidget(self.recog_status, 1)
-        outer.addLayout(row)
+        self._shrinkable(self.recog_status, 120)
+        outer.addWidget(self.recog_status)
         self.recog_bar = QProgressBar()
         self.recog_bar.setTextVisible(True)
         self.recog_bar.setValue(0)
         outer.addWidget(self.recog_bar)
-        # 结果区：左表格 / 右画布
+        # 结果区：左表格 / 中画布 / 右名字栏（和标注软件一样）
         res = QHBoxLayout()
         res.setSpacing(10)
-        self.recog_table = QTableWidget(0, 5)
-        self.recog_table.setHorizontalHeaderLabels(["页", "LBD 区", "支架", "配到编号", "编号位置"])
+        self.recog_table = QTableWidget(0, 6)
+        self._reg_headers(self.recog_table,
+                          ["页", "LBD 区", "支架", "箱", "配到编号", "编号位置"])
         self.recog_table.verticalHeader().setVisible(False)
         self.recog_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.recog_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.recog_table.setMaximumWidth(360)
+        self.recog_table.setMinimumWidth(150)      # 窄窗口也能塞下：列里自己横向滚
+        self.recog_table.setMaximumWidth(300)
         self.recog_table.itemSelectionChanged.connect(self.on_recog_page_changed)
         res.addWidget(self.recog_table)
         pv = QVBoxLayout()
         prow = QHBoxLayout()
-        prow.addWidget(QLabel("预览"))
+        prow.addWidget(self._reg(QLabel(), "预览"))
         self.recog_page_combo = NoWheelCombo()
         self.recog_page_combo.setObjectName("Field")
         self.recog_page_combo.setMinimumWidth(120)
         self.recog_page_combo.currentIndexChanged.connect(self.on_recog_page_changed)
         prow.addWidget(self.recog_page_combo)
-        self.recog_preview_info = QLabel("识别完这里会画出识别到的框（蓝=LBD 区，红=支架，橙=编号位置）")
+        self.recog_preview_info = self._reg(
+            QLabel(), "识别完这里会画出识别到的框（蓝=LBD 区，红=支架，橙=编号位置）")
         self.recog_preview_info.setObjectName("Hint")
+        self._shrinkable(self.recog_preview_info, 120)
         prow.addWidget(self.recog_preview_info, 1)
         pv.addLayout(prow)
-        tb = QHBoxLayout()
-        for text, slot, tip_ in (("＋", self.on_recog_zoom_in, "放大（也可以滚轮）"),
-                                 ("－", self.on_recog_zoom_out, "缩小（也可以滚轮）"),
-                                 ("适应宽度", self.on_recog_fit, "缩放到整页宽"),
-                                 ("删除选中", self.on_recog_delete, "删掉选中的框（Delete 键同效）"),
-                                 ("撤销", self.on_recog_undo, "撤销上一步改动")):
-            b = QPushButton(text)
-            b.setToolTip(tip_)
-            b.clicked.connect(slot)
-            tb.addWidget(b)
-        tb.addWidget(QLabel("编号"))
+        # 工具条分两行摆：窗口窄的时候也不会把整页撑宽（否则只能左右滑）
+        tb = QGridLayout()
+        tb.setHorizontalSpacing(6)
+        tb.setVerticalSpacing(4)
+        # 缩放 / 适应 / 删除 / 撤销 都不放按钮了 —— 键盘和鼠标就能做（见下面的快捷键说明）
+        col = 0
+        # 画框工具：和标注软件一套（画 Box / 画支架 / 画 LBD 区），点一下进去、再点一下退出
+        self.recog_draw_btns = {}
+        for _label, _kind in (("画 Box", "Box"), ("画支架", "Tracker"), ("画 LBD 区", "Node")):
+            b = self._reg(QPushButton(), _label)
+            b.setCheckable(True)
+            b.setObjectName("DrawTool")
+            self._reg_tip(b, "点一下进入「%s」模式，再在画布上拖一下就画出来；再点一下退出" % _label)
+            b.clicked.connect(lambda _=False, k=_kind: self.on_recog_draw_mode(k))
+            tb.addWidget(b, 1, col)
+            col += 1
+            self.recog_draw_btns[_kind] = b
+        # 下半区（支架类型 + 日志）默认收起来，把高度让给图纸；要用的时候点一下展开
+        self.recog_bottom_btn = self._reg(QPushButton(), "支架/日志")
+        self.recog_bottom_btn.setCheckable(True)
+        self._reg_tip(self.recog_bottom_btn, "展开 / 收起下面的支架类型表和识别日志")
+        self.recog_bottom_btn.toggled.connect(self.on_recog_bottom_toggled)
+        tb.addWidget(self.recog_bottom_btn, 1, col)
+        col += 1
+        tb.addWidget(self._reg(QLabel(), "编号"), 1, col)
+        col += 1
         self.recog_name_edit = QLineEdit()
         self.recog_name_edit.setObjectName("Field")
-        self.recog_name_edit.setPlaceholderText("选中一个 LBD 区后可改名")
-        self.recog_name_edit.setMinimumWidth(170)
+        self._reg_ph(self.recog_name_edit, "选中一个 LBD 区后可改名")
+        self.recog_name_edit.setMinimumWidth(120)
         self.recog_name_edit.returnPressed.connect(self.on_recog_rename)
-        tb.addWidget(self.recog_name_edit, 1)
-        b = QPushButton("改名")
+        tb.addWidget(self.recog_name_edit, 1, col, 1, 3)
+        col += 3
+        b = self._reg(QPushButton(), "改名")
         b.clicked.connect(self.on_recog_rename)
-        tb.addWidget(b)
-        self.recog_save_btn = QPushButton("保存修改")
+        tb.addWidget(b, 1, col)
+        col += 1
+        self.recog_save_btn = self._reg(QPushButton(), "保存修改")
         self.recog_save_btn.setEnabled(False)
         self.recog_save_btn.clicked.connect(self.on_save_recog_edits)
-        tb.addWidget(self.recog_save_btn)
+        tb.addWidget(self.recog_save_btn, 1, col)
         pv.addLayout(tb)
         self.recog_canvas = RecogCanvas(self)
-        self.recog_canvas.setMinimumHeight(300)
+        self.recog_canvas.setMinimumWidth(200)     # 窄窗口下画布先让出宽度，别撑出横向滚动
+        self.recog_canvas.setMinimumHeight(260)
         self.recog_canvas.on_changed = self._recog_mark_dirty
         self.recog_canvas.on_selected = self.on_recog_box_selected
+        self.recog_canvas.on_added = self.on_recog_box_added
+        self.recog_canvas.on_deleted = self.on_recog_box_deleted
+        self.recog_canvas.on_page_key = self.on_recog_page_step
         pv.addWidget(self.recog_canvas, 1)
         prow2 = QHBoxLayout()
-        self.recog_hint2 = QLabel("滚轮缩放 · 中键拖动平移 · 拖框改位置 · 右下角小方块改大小 · Delete 删除")
+        self.recog_hint2 = self._reg(
+            QLabel(), "滚轮或 Ctrl+＋/－ 缩放 · Ctrl+0 适应页面 · Ctrl+1 适应宽度 · "
+                      "中键拖动平移 · 拖框改位置 · 右下角小方块改大小 · Delete 删除 · Ctrl+Z 撤销")
         self.recog_hint2.setObjectName("Hint")
+        self._shrinkable(self.recog_hint2, 120)
         prow2.addWidget(self.recog_hint2, 1)
-        self.recog_export_btn = QPushButton("导出识别结果 JSON…")
+        self.recog_export_btn = self._reg(QPushButton(), "导出识别结果 JSON…")
         self.recog_export_btn.setEnabled(False)
         self.recog_export_btn.clicked.connect(self.on_export_recog_json)
         prow2.addWidget(self.recog_export_btn)
+        prow2.addWidget(self._reg(QLabel(), "只保留"))
+        self.recog_keep_edit = QLineEdit()
+        self.recog_keep_edit.setObjectName("Field")
+        self._reg_ph(self.recog_keep_edit, "页范围，如 23-108")
+        self.recog_keep_edit.setMaximumWidth(140)
+        prow2.addWidget(self.recog_keep_edit)
+        b = self._reg(QPushButton(), "过滤")
+        self._reg_tip(b, "把不在这段页码里的识别结果丢掉（封面/说明/清单页这类不该画的页）")
+        b.clicked.connect(self.on_recog_filter_pages)
+        prow2.addWidget(b)
         pv.addLayout(prow2)
         res.addLayout(pv, 1)
-        outer.addLayout(res, 1)
+        # 右：名字栏（和标注软件一样，选中框 / 双击改名）
+        nv = QVBoxLayout()
+        nl = self._reg(QLabel(), "名字栏（选中框 → 这里同步；双击可改名）")
+        nl.setObjectName("Hint")
+        self._shrinkable(nl, 90)
+        nv.addWidget(nl)
+        self.recog_names = QListWidget()
+        self.recog_names.setMinimumWidth(130)      # 名字栏也是：窄了就先压窄，不撑页面
+        self.recog_names.setMaximumWidth(260)
+        self.recog_names.itemClicked.connect(self.on_recog_name_clicked)
+        self.recog_names.itemDoubleClicked.connect(self.on_recog_name_double)
+        self.recog_names.itemChanged.connect(self.on_recog_name_edited)
+        nv.addWidget(self.recog_names, 1)
+        res.addLayout(nv)
         self.recog_view = QPlainTextEdit()
         self.recog_view.setObjectName("Log")
         self.recog_view.setReadOnly(True)
-        self.recog_view.setMaximumHeight(140)
-        outer.addWidget(self.recog_view)
-        return page
+        self.recog_view.setMaximumHeight(110)
+        # 支架类型（在识别这一步就改完）——项目树已去掉，这张表占满整行
+        last = QHBoxLayout()
+        last.setSpacing(10)
+        rk = QVBoxLayout()
+        rt = self._reg(QLabel(),
+                       "支架类型（识别出来按长度分档，这里填串数；点「应用到支架页」或直接「下一步」）")
+        rt.setObjectName("Hint")
+        self._shrinkable(rt, 120)
+        rk.addWidget(rt)
+        self.recog_rack_table = QTableWidget(0, 4)
+        self._reg_headers(self.recog_rack_table, ["串数", "长度FT", "数量", "拆不拆"])
+        self.recog_rack_table.verticalHeader().setVisible(False)
+        self.recog_rack_table.setMinimumWidth(220)   # 表格自己横向滚，别把整页撑宽
+        self.recog_rack_table.setMinimumHeight(130)
+        self.recog_rack_table.setMaximumHeight(170)
+        self.recog_rack_table.setToolTip("点某一档 → 跳到那档支架的实际位置（再点一次看下一个）")
+        self.recog_rack_table.cellClicked.connect(self.on_recog_rack_row)
+        rk.addWidget(self.recog_rack_table)
+        hb = QHBoxLayout()
+        for text, slot, tip_ in (("应用到支架页", self.on_apply_recog_racks, "把这张表写进「支架」页明细行"),):
+            b = self._reg(QPushButton(), text)
+            self._reg_tip(b, tip_)
+            b.clicked.connect(slot)
+            hb.addWidget(b)
+        hb.addStretch(1)
+        rk.addLayout(hb)
+        last.addLayout(rk)
+        # 上半 = 表格 / 画布 / 名字栏，下半 = 支架类型 + 日志；中间可拖动，谁也不挤谁
+        main_w = QWidget()
+        main_w.setLayout(res)
+        bot_w = QWidget()
+        bv = QVBoxLayout(bot_w)
+        bv.setContentsMargins(0, 0, 0, 0)
+        bv.setSpacing(6)
+        bv.addLayout(last)
+        bv.addWidget(self.recog_view)
+        split = QSplitter(Qt.Vertical)
+        split.setChildrenCollapsible(False)
+        split.addWidget(main_w)
+        split.addWidget(bot_w)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        split.setSizes([700, 220])
+        self.split = split
+        self._recog_bottom = bot_w
+        outer.addWidget(split, 1)
+        # 默认收起下半区：一屏先把图纸看全 / 看清楚，要填支架串数时再展开
+        bot_w.setVisible(False)
+        self.recog_bottom_btn.setChecked(False)
+        nb = QHBoxLayout()
+        nb.addStretch(1)
+        self.recog_next_btn = self._reg(QPushButton(), "下一步：填其它参数 →")
+        self.recog_next_btn.setObjectName("Primary")
+        self.recog_next_btn.clicked.connect(self.on_recog_next)
+        nb.addWidget(self.recog_next_btn)
+        outer.addLayout(nb)
+        # 外面套一层滚动区：只允许上下滚，横向滚动条一律不放（窗口窄也不会左右滑）
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QFrame.NoFrame)
+        sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        sc.setWidget(page)
+        return sc
 
     def on_recognize(self):
         """点「开始识别」：后台起线程跑（不卡界面）。"""
+        self._recog_sync_inputs(to_cfg=True)
         cfg = self.cfg()
         pdf = (cfg.get("pdf") or "").strip()
         self._recog_write("=== 点了「开始识别」：pdf=%s 页码=%r running=%s"
@@ -3700,6 +4409,9 @@ class MainWindow(QMainWindow):
         self._recog_tmp_path = path
         self._recog_dirty = False
         self._fill_recog_table()
+        self._fill_rack_table_from_summary(sm.get("groups") or [])
+        self._recog_groups = sm.get("groups") or []
+        self._recog_refresh_names()
         if hasattr(self, "recog_export_btn"):
             self.recog_export_btn.setEnabled(bool(self._recog_doc))
         self.auto_fill_rack_types_async(self.cfg(), announce=True)
@@ -3717,11 +4429,12 @@ class MainWindow(QMainWindow):
         for pg in sorted(dets):
             n_node = sum(1 for d in dets[pg] if (d.get("label") or "") == "Node")
             n_trk = sum(1 for d in dets[pg] if (d.get("label") or "") == "Tracker")
+            n_box = sum(1 for d in dets[pg] if (d.get("label") or "") == "Box")
             recs = names.get(pg) or []
             n_named = sum(1 for r in recs if (r.get("final_node_name") or "").strip())
             n_pos = sum(1 for r in recs if r.get("label_pos"))
             w, h = size.get(pg, (0, 0))
-            out.append((pg, n_node, n_trk, n_named, n_pos, w, h))
+            out.append((pg, n_node, n_trk, n_box, n_named, n_pos, w, h))
         return out
 
     def _fill_recog_table(self, select_page=None, reload_preview=True):
@@ -3729,8 +4442,8 @@ class MainWindow(QMainWindow):
             return
         rows = self._recog_pages_of_doc()
         self.recog_table.setRowCount(len(rows))
-        for i, (pg, nn, nt, n_named, n_pos, _w, _h) in enumerate(rows):
-            for j, val in enumerate((pg, nn, nt, n_named, n_pos)):
+        for i, (pg, nn, nt, nb, n_named, n_pos, _w, _h) in enumerate(rows):
+            for j, val in enumerate((pg, nn, nt, nb, n_named, n_pos)):
                 self.recog_table.setItem(i, j, QTableWidgetItem(str(val)))
         try:
             self.recog_table.resizeColumnsToContents()
@@ -3740,7 +4453,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "recog_page_combo"):
             self.recog_page_combo.blockSignals(True)
             self.recog_page_combo.clear()
-            for pg, _a, _b, _c, _d, _w, _h in rows:
+            for pg, _a, _b, _c, _d, _e, _w, _h in rows:
                 self.recog_page_combo.addItem("第 %s 页" % pg, pg)
             if select_page is not None:
                 i = self.recog_page_combo.findData(select_page)
@@ -3779,8 +4492,10 @@ class MainWindow(QMainWindow):
             return
         try:
             self.recog_canvas._pdf = pdf
-            self.recog_canvas.load(doc, pg, pdf)
+            # 200dpi 渲染、允许更大像素：缩小看整页也行，放大看框里的字也清楚
+            self.recog_canvas.load(doc, pg, pdf, dpi=200, max_w=2600)
             self._recog_update_page_info(pg)
+            self._recog_refresh_names()      # 右栏名字跟着这页一起换
         except Exception as e:
             self.recog_hint2.setText("这一页画不出来：%s" % e)
 
@@ -3790,10 +4505,10 @@ class MainWindow(QMainWindow):
         self._recog_page = pg
         rows = [r for r in self._recog_pages_of_doc() if r[0] == pg]
         if rows and hasattr(self, "recog_preview_info"):
-            _pg, nn, nt, n_named, n_pos, _w, _h = rows[0]
+            _pg, nn, nt, nb, n_named, n_pos, _w, _h = rows[0]
             self.recog_preview_info.setText(
-                "第 %s 页：LBD 区 %d、支架 %d、配到编号 %d、编号位置 %d"
-                % (pg, nn, nt, n_named, n_pos))
+                "第 %s 页：LBD 区 %d、支架 %d、汇流箱 %d、配到编号 %d、编号位置 %d"
+                % (pg, nn, nt, nb, n_named, n_pos))
 
     # ---------- 画布上的编辑动作 ----------
     def _recog_mark_dirty(self):
@@ -3809,6 +4524,19 @@ class MainWindow(QMainWindow):
         info = self.recog_canvas.selected_info() if hasattr(self, "recog_canvas") else None
         if not info:
             return
+        # 名字栏跟着选中项走（和标注软件一样）
+        try:
+            w = getattr(self, "recog_names", None)
+            if w is not None and box is not None:
+                for i in range(w.count()):
+                    if w.item(i).data(Qt.UserRole) == box.det_index:
+                        if w.currentRow() != i:
+                            w.blockSignals(True)
+                            w.setCurrentRow(i)
+                            w.blockSignals(False)
+                        break
+        except Exception:
+            pass
         if info["kind"] == "Node":
             self.recog_name_edit.setText(info.get("name") or "")
             self.recog_name_edit.setEnabled(True)
@@ -3831,11 +4559,23 @@ class MainWindow(QMainWindow):
         if hasattr(self, "recog_canvas"):
             self.recog_canvas.fit_width()
 
+    def on_recog_fit_page(self):
+        if hasattr(self, "recog_canvas"):
+            self.recog_canvas.fit_page()
+
     def on_recog_delete(self):
         if not hasattr(self, "recog_canvas"):
             return
         n = self.recog_canvas.delete_selected()
-        self._recog_write("删掉了 %d 个框（记得「保存修改」）" % n if n else "先点一个框，再删")
+        if not n:
+            self._recog_write("先点一个框，再删")
+
+    def on_recog_box_deleted(self, n):
+        """画布上删掉框（按钮或 Delete 键）之后：结果一起同步刷新。"""
+        if not n:
+            return
+        self._recog_sync_all("删掉了 %d 个框" % n)
+        self._recog_write("记得点「保存修改」写回 JSON")
 
     def on_recog_rename(self):
         if not hasattr(self, "recog_canvas"):
@@ -3848,10 +4588,503 @@ class MainWindow(QMainWindow):
 
     def on_recog_undo(self):
         if hasattr(self, "recog_canvas") and self.recog_canvas.undo():
-            self._recog_write("已撤销上一步")
-            self._recog_update_page_info()
-            self._fill_recog_table(select_page=getattr(self, "_recog_page", None),
-                                   reload_preview=False)
+            self._recog_sync_all("撤销上一步")
+
+    # ---------- 识别页的两个输入（PDF / 标签文件）----------
+    def _recog_pick(self, key):
+        filt = {"pdf": "PDF 文件 (*.pdf);;所有文件 (*.*)",
+                "xlsx": "Excel (*.xlsx *.xls);;所有文件 (*.*)"}.get(key, "所有文件 (*.*)")
+        title = "选 PDF 文件" if key == "pdf" else "选标签文件"
+        path, _f = QFileDialog.getOpenFileName(self, title, "", filt)
+        if not path:
+            return
+        self.set_text(key, path)
+        self._recog_sync_inputs()
+
+    def _recog_sync_inputs(self, to_cfg=False):
+        """识别页上的 PDF 与「文件与输出」页共用一份数据。
+
+        标签文件在识别这一步**不需要**：LBD 编号是从 PDF 文字层直接读出来的
+        （读到的就是 INV01A01-LBD-04 这种整段编号），只有后续 CAD 生成布局取分表名时才用得上。
+        """
+        if not hasattr(self, "recog_pdf_edit"):
+            return
+        if to_cfg:
+            p = (self.recog_pdf_edit.text() or "").strip()
+            if p:
+                self.set_text("pdf", p)
+        else:
+            self.recog_pdf_edit.setText(self.get_text("pdf"))
+
+    def _on_section_shown(self, idx):
+        """切到识别页时，把主参数页上的 PDF / 标签文件同步显示过来。"""
+        try:
+            names = [t for t, _k in SECTIONS]
+            if 0 <= idx < len(names) and names[idx] == "识别":
+                self._recog_sync_inputs()
+        except Exception:
+            pass
+
+    def _fill_rack_table_from_summary(self, groups):
+        """把识别出来的支架长度分档填进小表格。
+
+        已经有行的时候（删框 / 加框 / 过滤之后重算）按"长度最接近"把之前填的
+        「串数 / 拆不拆」带过来，改完结果不用重填。
+        """
+        t = getattr(self, "recog_rack_table", None)
+        if t is None:
+            return
+        old = []
+        for i in range(t.rowCount()):
+            try:
+                old.append((float((t.item(i, 1).text() or "0").strip()),
+                            (t.item(i, 0).text() if t.item(i, 0) else "").strip(),
+                            (t.cellWidget(i, 3).currentText() if t.cellWidget(i, 3) else "不拆")))
+            except Exception:
+                old.append((None, "", "不拆"))
+        t.setRowCount(len(groups))
+        for i, g in enumerate(groups):
+            L = float(g.get("length") or 0)
+            keep_n, keep_s = "", "不拆"
+            best = None
+            for oL, oN, oS in old:
+                if oL is None:
+                    continue
+                d = abs(oL - L)
+                if best is None or d < best[0]:
+                    best = (d, oN, oS)
+            if best is not None and best[0] <= max(1.0, 0.10 * max(L, 1.0)):
+                keep_n, keep_s = best[1], best[2]
+            t.setItem(i, 0, QTableWidgetItem(keep_n))
+            t.setItem(i, 1, QTableWidgetItem("%.1f" % L))
+            t.setItem(i, 2, QTableWidgetItem(str(g.get("count") or 0)))
+            cb = NoWheelCombo()
+            cb.addItems(["不拆", "2行", "3行"])
+            j = cb.findText(keep_s)
+            if j >= 0:
+                cb.setCurrentIndex(j)
+            t.setCellWidget(i, 3, cb)
+        try:
+            t.resizeColumnsToContents()
+        except Exception:
+            pass
+
+    def _recog_rack_all_filled(self):
+        rows = self._recog_rack_rows()
+        if not rows:
+            return False
+        return all((r[0] or "").strip() for r in rows)
+
+    def _recog_sync_all(self, why=""):
+        """识别结果被改动（删框 / 加框 / 粘贴 / 撤销 / 过滤）之后，下游一起刷新。
+
+        刷新的东西：结果数字、支架长度分档表（保留已填串数）、右栏名字栏；
+        如果已经「应用到支架页」过，支架页明细也按改后的结果重算。
+        """
+        if getattr(self, "_recog_syncing", False):      # 防重入：刷新过程里再触发一次就跳过
+            return
+        self._recog_syncing = True
+        try:
+            self._recog_mark_dirty()
+            self._recog_regroup()
+            self._recog_refresh_names()
+            if why:
+                self._recog_write("%s：结果已同步刷新（数字 / 支架长度分档 / 名字栏）" % why)
+            if self._rack_types_current() and self._recog_rack_all_filled():
+                try:
+                    if self.on_apply_recog_racks():
+                        self._recog_write("支架页明细也已按改后的结果重新应用（%s）" % (why or "改动"))
+                except Exception as e:
+                    self._recog_write("支架页同步失败：%s" % e)
+        finally:
+            self._recog_syncing = False
+
+    def _recog_rack_rows(self):
+        """读识别页那张小表 -> [(串数, 长度FT, 拆不拆, 数量)]。"""
+        out = []
+        t = getattr(self, "recog_rack_table", None)
+        if t is None:
+            return out
+        for i in range(t.rowCount()):
+            strings = (t.item(i, 0).text().strip() if t.item(i, 0) else "")
+            length = (t.item(i, 1).text().strip() if t.item(i, 1) else "")
+            count = (t.item(i, 2).text().strip() if t.item(i, 2) else "")
+            cb = t.cellWidget(i, 3)
+            split = cb.currentText() if cb is not None else "不拆"
+            out.append((strings, length, split, count))
+        return out
+
+    def on_recog_filter_pages(self):
+        """只保留指定页范围的识别结果 —— 封面 / 说明 / 清单页这种不该画的页丢掉。
+
+        （为什么需要：主程序默认整本都识别，像 HIGHLAND 第 21 页是清单页、能出 900 多个框，
+          混进去以后 CAD 侧按「第几张底图」重编号就整体错位。）
+        """
+        doc = getattr(self, "_recog_doc", None)
+        if not doc:
+            self._recog_write("还没识别，先跑一次「开始识别」")
+            return
+        try:
+            import detect as _d
+            total = max((p.get("page_number") or 0)
+                        for p in (doc.get("input_data") or {}).get("pages") or []) or 0
+            pages = _d.parse_pages((self.recog_keep_edit.text() or "").strip(), total)
+        except Exception as e:
+            self._recog_write("页范围读不出来：%s" % e)
+            return
+        if not pages:
+            self._recog_write("先在「只保留」里写页范围，例如 23-108")
+            return
+        keep = set(pages)
+        before = len(doc.get("yolo_tracker_detection_results") or [])
+        doc["yolo_tracker_detection_results"] = [
+            x for x in (doc.get("yolo_tracker_detection_results") or [])
+            if x.get("page_number") in keep]
+        if doc.get("ocr_node_name_results"):
+            doc["ocr_node_name_results"] = [
+                x for x in doc["ocr_node_name_results"] if x.get("page_number") in keep]
+        if (doc.get("input_data") or {}).get("pages"):
+            doc["input_data"]["pages"] = [
+                x for x in doc["input_data"]["pages"] if x.get("page_number") in keep]
+        after = len(doc["yolo_tracker_detection_results"])
+        self._recog_mark_dirty()
+        self._fill_recog_table()
+        # 过滤之后：支架长度分档 / 名字栏 / 画布 一起刷新，别留着过滤前的旧数
+        self._recog_regroup()
+        self._recog_refresh_names()
+        pg = getattr(self, "_recog_page", None)
+        rows = [r for r in self._recog_pages_of_doc() if r[0] == pg]
+        if rows and hasattr(self, "recog_canvas"):
+            self._recog_preview_page(pg)
+        self._recog_write("按页范围过滤：%d 个支架框 -> %d 个（只留 %s）"
+                          % (before, after, self.recog_keep_edit.text().strip()))
+
+    def _recog_regroup(self):
+        """按当前（可能刚删过框 / 过滤过的）结果重算支架长度分档。
+
+        只用识别结果里已经存好的长度（每根支架的 raw.len_ft / len_px，识别时就写好了），
+        **不再去读 PDF 文字层** —— 大图纸集上 pypdf 每题一页要好几秒，删一个框就卡死。
+        """
+        doc = getattr(self, "_recog_doc", None)
+        if not doc:
+            return
+        try:
+            groups = self._groups_from_doc(doc)
+            self._recog_groups = groups
+            self._fill_rack_table_from_summary(groups)
+            self._recog_write("支架长度分档已按过滤后的结果重算：%d 档、%d 根支架"
+                              % (len(groups), sum(g.get("count") or 0 for g in groups)))
+        except Exception as e:
+            self._recog_write("重算支架长度分档失败：%s" % e)
+
+    @staticmethod
+    def _groups_from_doc(doc, tol=0.10):
+        """从识别结果直接聚类支架长度（英尺优先，其次像素，都没有就按框长）。
+
+        返回 [{"length", "unit", "count", "pages"}]，和 detect.rack_length_groups 同一套
+        判据（长度差 ≤10% 算同一档），但不碰 PDF，纯内存里算 —— 删框 / 过滤后刷新不卡。
+        """
+        ft, px, box = [], [], []
+        for p in doc.get("yolo_tracker_detection_results") or []:
+            pg = p.get("page_number")
+            for d in (p.get("data") or {}).get("detections") or []:
+                if (d.get("label") or "") != "Tracker":
+                    continue
+                raw = d.get("raw") or {}
+                if raw.get("len_ft") is not None:
+                    ft.append((float(raw["len_ft"]), pg))
+                elif raw.get("len_px") is not None:
+                    px.append((float(raw["len_px"]), pg))
+                else:
+                    b = d.get("bbox") or {}
+                    try:
+                        box.append((max(float(b.get("x2", 0)) - float(b.get("x1", 0)),
+                                        float(b.get("y2", 0)) - float(b.get("y1", 0))), pg))
+                    except Exception:
+                        pass
+        if ft:
+            items, unit = ft, "英尺"
+        elif px:
+            items, unit = px, "像素"
+        else:
+            items, unit = box, "框长"
+        if not items:
+            return []
+        items.sort(key=lambda t: t[0])
+        groups = []
+        for L, pg in items:
+            if groups:
+                mean = sum(x[0] for x in groups[-1]) / len(groups[-1])
+                if mean > 0 and abs(L - mean) <= tol * mean:
+                    groups[-1].append((L, pg))
+                    continue
+            groups.append([(L, pg)])
+        out = []
+        for g in groups:
+            ls = sorted(x[0] for x in g)
+            pages = {}
+            for _L, pg in g:
+                pages[pg] = pages.get(pg, 0) + 1
+            out.append({"length": ls[len(ls) // 2], "unit": unit,
+                        "count": len(g), "pages": pages})
+        return out
+
+    def on_apply_recog_racks(self):
+        """把识别页的支架类型表写进「支架」页明细行，并给每根支架标上串数（raw.strings）。"""
+        rows = self._recog_rack_rows()
+        types, len_pref, split_pref, missing = [], {}, {}, []
+        pairs = []                       # [(长度, 串数)] 给支架打标用
+        for strings, length, split, count in rows:
+            if not strings.strip():
+                missing.append(length or "?")
+                continue
+            try:
+                sv = int(float(strings))
+                lv = float(length)
+            except Exception:
+                missing.append(strings or length or "?")
+                continue
+            try:
+                cv = int(float(count))
+            except Exception:
+                cv = None
+            types.append({"strings": sv, "length_ft": lv, "code": None,
+                          "total_count": cv, "panel_label": None, "source": "recog"})
+            len_pref[str(sv)] = "%g" % lv
+            split_pref[str(sv)] = split
+            pairs.append((lv, sv))
+        if missing:
+            self._recog_write("这几档还没填（串数/长度）：%s —— 填上再应用"
+                              % "、".join(str(m) for m in missing[:6]))
+            return False
+        if not types:
+            self._recog_write("这张表是空的：先在「串数」里填每档多少串")
+            return False
+        # 给每根支架标串数：按长度（英尺优先，没有就按像素）找最近的一档（差 ≤10%）
+        doc = getattr(self, "_recog_doc", None) or {}
+        # 表格里的「长度FT」到底是英尺还是像素，跟识别时的口径一致（读不到比例尺就是像素）
+        _g = getattr(self, "_recog_groups", None) or []
+        unit_px = bool(_g) and (_g[0].get("unit") == "像素")
+        tagged = 0
+        for page in doc.get("yolo_tracker_detection_results") or []:
+            for d in (page.get("data") or {}).get("detections") or []:
+                if (d.get("label") or "") != "Tracker":
+                    continue
+                raw = d.get("raw") or {}
+                v = raw.get("len_px") if unit_px else raw.get("len_ft")
+                if v is None:
+                    v = raw.get("len_ft") if unit_px else raw.get("len_px")
+                if v is None:
+                    continue
+                best, bd = None, None
+                for lv, sv in pairs:
+                    dlt = abs(float(v) - lv)
+                    if bd is None or dlt < bd:
+                        best, bd = sv, dlt
+                if best is None or bd is None or bd > 0.10 * max(1.0, float(v)):
+                    continue
+                d["raw"] = dict(raw)
+                d["raw"]["strings"] = best
+                tagged += 1
+        self._rack_types = types
+        self._rack_len_pref = len_pref
+        self._rack_split_pref = split_pref
+        try:
+            self.refresh_rack_rows(self._rack_types, stash=False)
+        except Exception as e:
+            self._recog_write("刷新「支架」页明细行失败：%s" % e)
+            return False
+        self._recog_write("支架类型已应用到「支架」页：%s；给 %d 根支架标了串数"
+                          % ("；".join("%s串=%gFT/%s" % (t["strings"], t["length_ft"],
+                                                       split_pref[str(t["strings"])])
+                                      for t in types), tagged))
+        return True
+
+    def on_recog_rack_row(self, row, _col=0):
+        """点支架类型表里的某一档 -> 画布跳到那档支架的实际位置；再点一次看下一个。"""
+        rows = self._recog_rack_rows()
+        if not (0 <= row < len(rows)):
+            return
+        strings, length, _split, _count = rows[row]
+        try:
+            target = float(length)
+        except Exception:
+            self._recog_write("这一行的长度读不出来（%r）" % length)
+            return
+        doc = getattr(self, "_recog_doc", None) or {}
+        unit_px = bool(getattr(self, "_recog_groups", None)) and \
+            (self._recog_groups[0].get("unit") == "像素")
+        matches = []
+        for page in doc.get("yolo_tracker_detection_results") or []:
+            pg = page.get("page_number")
+            for i, d in enumerate((page.get("data") or {}).get("detections") or []):
+                if (d.get("label") or "") != "Tracker":
+                    continue
+                raw = d.get("raw") or {}
+                v = raw.get("len_px") if unit_px else (raw.get("len_ft") or raw.get("len_px"))
+                if v is None:
+                    continue
+                if abs(float(v) - target) <= 0.10 * max(target, 1.0):
+                    matches.append((pg, i))
+        if not matches:
+            self._recog_write("没找到长度 %.1f 的支架（%s 那一档）" % (target, strings or "?"))
+            return
+        k = (getattr(self, "_rack_jump_pos", {}) or {}).get(row, -1) + 1
+        k %= len(matches)
+        if not hasattr(self, "_rack_jump_pos"):
+            self._rack_jump_pos = {}
+        self._rack_jump_pos[row] = k
+        pg, det_i = matches[k]
+        # 切到那一页（下拉变化会触发预览加载），再选中/居中那个框
+        i = self.recog_page_combo.findData(pg)
+        if i >= 0 and i != self.recog_page_combo.currentIndex():
+            self.recog_page_combo.setCurrentIndex(i)
+        self._recog_preview_page(pg)
+        ok = self.recog_canvas.select_det(det_i)
+        self._recog_write("跳到第 %s 页（第 %d/%d 个）：%s串 %.1fFT 的支架%s"
+                          % (pg, k + 1, len(matches), strings or "?", target,
+                             "" if ok else "（画布上没找到那个框）"))
+
+    # ---------- 名字栏 / 加框 / 键盘翻页（和标注软件对齐）----------
+    def _recog_page_nodes(self, pg=None):
+        """当前页的 LBD 区（Node 框）：[(det 下标, 名字)]。"""
+        if pg is None:
+            pg = getattr(self, "_recog_page", None)
+        doc = getattr(self, "_recog_doc", None) or {}
+        trk = next((p for p in doc.get("yolo_tracker_detection_results") or []
+                    if p.get("page_number") == pg), None)
+        ocr = next((p for p in doc.get("ocr_node_name_results") or []
+                    if p.get("page_number") == pg), None)
+        dets = ((trk or {}).get("data") or {}).get("detections") or []
+        recs = (ocr or {}).get("data") or []
+        out, k = [], 0
+        for i, d in enumerate(dets):
+            if (d.get("label") or "") != "Node":
+                continue
+            nm = (recs[k].get("final_node_name") or "").strip() if k < len(recs) else ""
+            out.append((i, nm))
+            k += 1
+        return out
+
+    def _recog_refresh_names(self, select_index=None):
+        """把当前页的 LBD 区名字刷进右栏（和标注软件一样的选择/改名）。
+
+        名单按 LBD 编号自然排序（LBD-2 排在 LBD-10 前面，不会按字符码排成 10 → 2），
+        没编号的排在最后；画布里的框不受影响（点名字会定位到对应那个框）。
+        """
+        w = getattr(self, "recog_names", None)
+        if w is None:
+            return
+        rows = self._recog_page_nodes()
+
+        def _key(it):
+            nm = (it[1] or "").strip()
+            parts = [int(t) if t.isdigit() else t.lower()
+                     for t in re.split(r"(\d+)", nm)]
+            return (1 if not nm else 0, parts, it[0])
+
+        try:
+            rows.sort(key=_key)
+        except Exception:
+            pass
+        w.blockSignals(True)
+        w.clear()
+        for det_i, nm in rows:
+            it = QListWidgetItem(nm or "（没编号）")
+            it.setData(Qt.UserRole, det_i)
+            it.setFlags(it.flags() | Qt.ItemIsEditable)
+            w.addItem(it)
+            if select_index is not None and det_i == select_index:
+                w.setCurrentItem(it)
+        w.blockSignals(False)
+
+    def on_recog_name_clicked(self, item):
+        i = item.data(Qt.UserRole)
+        if i is not None and hasattr(self, "recog_canvas"):
+            self.recog_canvas.select_det(int(i))
+
+    def on_recog_name_double(self, item):
+        self.on_recog_name_clicked(item)
+        w = getattr(self, "recog_names", None)
+        if w is not None:
+            w.editItem(item)
+
+    def on_recog_name_edited(self, item):
+        """名字栏里直接改名字：写回识别结果（和画布上改名同一条路）。"""
+        if getattr(self, "_recog_names_busy", False):
+            return
+        self._recog_names_busy = True
+        try:
+            i = item.data(Qt.UserRole)
+            if i is not None and hasattr(self, "recog_canvas"):
+                self.recog_canvas.select_det(int(i))
+                name = item.text().strip()
+                if name == "（没编号）":
+                    name = ""
+                if self.recog_canvas.rename_selected(name):
+                    self.recog_name_edit.setText(name)
+                    self._recog_write("编号改成：%s（记得「保存修改」）" % (name or "（空）"))
+        finally:
+            self._recog_names_busy = False
+
+    def on_recog_draw_mode(self, kind):
+        """画框模式（和标注软件一致）：画 Box / 画支架 / 画 LBD 区；再点一次回到选择。"""
+        btns = getattr(self, "recog_draw_btns", {})
+        on = bool(btns.get(kind) and btns[kind].isChecked())
+        for k, b in btns.items():
+            if k != kind:
+                b.setChecked(False)
+        mode = kind if on else ""
+        c = getattr(self, "recog_canvas", None)
+        if c is not None:
+            c.add_mode = mode
+            c.setDragMode(QGraphicsView.NoDrag if mode else QGraphicsView.RubberBandDrag)
+            c.setCursor(Qt.CrossCursor if mode else Qt.ArrowCursor)
+        name = {"Box": "画 Box（汇流箱）", "Tracker": "画支架", "Node": "画 LBD 区"}.get(kind, kind)
+        self._recog_write(("进入「%s」模式：在画布上按住左键拖一个矩形就画一个；再点一下这个按钮退出"
+                           % name) if mode else "回到选择模式")
+
+    def on_recog_box_added(self, kind, det_index):
+        self._recog_sync_all("加了一个%s框" % ("LBD 区" if kind == "Node" else "支架"))
+        self._recog_write("记得点「保存修改」写回 JSON")
+        self._recog_refresh_names(select_index=det_index)
+        self._recog_update_page_info()
+
+    def on_recog_page_step(self, delta):
+        """键盘翻页：PgDn/PgUp、Ctrl+←/→。"""
+        cb = getattr(self, "recog_page_combo", None)
+        if cb is None or cb.count() == 0:
+            return
+        i = cb.currentIndex() + int(delta)
+        if 0 <= i < cb.count():
+            cb.setCurrentIndex(i)
+            self._recog_write("第 %s 页（%d/%d，PgUp/PgDn 可翻页）"
+                              % (cb.currentData(), i + 1, cb.count()))
+
+    def on_recog_bottom_toggled(self, on):
+        """展开 / 收起右下那半区（支架类型表 + 识别日志）。"""
+        w = getattr(self, "_recog_bottom", None)
+        if w is not None:
+            w.setVisible(bool(on))
+        if hasattr(self, "split"):
+            self.split.setSizes([420, 320] if on else [760, 0])
+        if on and hasattr(self, "recog_canvas"):
+            QTimer.singleShot(0, self.recog_canvas.fit_page)
+
+    def on_recog_next(self):
+        """下一步：保存改动 + 把支架类型带过去 + 切到参数页填其它参数。"""
+        if not getattr(self, "_recog_doc", None):
+            QMessageBox.information(self, "还没识别", "先点「开始识别」。")
+            return
+        if getattr(self, "_recog_dirty", False):
+            self.on_save_recog_edits()
+        self.on_apply_recog_racks()
+        self._recog_refresh_names()
+        names = [t for t, _k in SECTIONS]
+        if "文件与输出" in names:
+            self.show_section(names.index("文件与输出"))
+        self.log_msg("识别结果已就绪：%s —— 接着填其它参数，然后「执行输出」"
+                     % (self.get_text("jsonPath") or "（临时 JSON）"))
 
     def on_export_recog_json(self):
         """把识别结果导出成 JSON（导出后下游就用这份）。"""
@@ -3876,10 +5109,21 @@ class MainWindow(QMainWindow):
         self._recog_write("识别结果已导出：%s" % path)
 
     def on_save_recog_edits(self):
-        """把画布上的改动写回 JSON（临时那份 + 你导出过的那份）。"""
+        """把画布上的改动写回 JSON（临时那份 + 你导出过的那份）。
+
+        保存的就是界面上这一份 doc —— 过滤、改框、改名、加框、删框之后
+        内存里的 doc 已经是最新的，这里原样落盘，保证「保存出来的 == 过滤/修改后的」。
+        """
         doc = getattr(self, "_recog_doc", None)
         if not doc:
             return
+        # 存盘前把统计条数记一下，方便和界面上的数字对账（多余/漏存能一眼看出来）
+        try:
+            _tk = sum(len((p.get("data") or {}).get("detections") or [])
+                      for p in doc.get("yolo_tracker_detection_results") or [])
+            _pg = len(doc.get("yolo_tracker_detection_results") or [])
+        except Exception:
+            _tk, _pg = 0, 0
         paths = []
         tmp = getattr(self, "_recog_tmp_path", "")
         if tmp:
@@ -3899,7 +5143,8 @@ class MainWindow(QMainWindow):
             self._recog_dirty = False
             if hasattr(self, "recog_save_btn"):
                 self.recog_save_btn.setEnabled(False)
-            self._recog_write("修改已保存到 JSON（%d 份：%s）" % (ok, "；".join(paths)))
+            self._recog_write("修改已保存到 JSON（%d 份：%s）；当前内容：%d 页 / %d 个框，"
+                              "和过滤、修改后的结果一致" % (ok, "；".join(paths), _pg, _tk))
 
     def _build_rack_panel(self):
         """支架类型明细：每个支架类型单独一行；类型自动来自识别结果，拆不拆手工选。"""
@@ -3988,7 +5233,7 @@ class MainWindow(QMainWindow):
                 w.deleteLater()
         self.rack_rows = []
         for col, head in enumerate(("支架类型", "串数", "长度FT", "数量", "拆不拆")):
-            lb = QLabel(head)
+            lb = QLabel(T(head))
             lb.setObjectName("FieldLabel")
             self.rack_grid.addWidget(lb, 0, col)
         if not types:
@@ -4020,7 +5265,7 @@ class MainWindow(QMainWindow):
             cb.setObjectName("Field")
             cb.setMinimumWidth(90)
             for opt in ("不拆", "2行", "3行"):
-                cb.addItem(opt, opt)
+                cb.addItem(T(opt), opt)
             want = self._rack_split_pref.get(key, "不拆")
             idx = cb.findData(want)
             cb.setCurrentIndex(idx if idx >= 0 else 0)
@@ -4224,7 +5469,10 @@ class MainWindow(QMainWindow):
         self.pdf_btn.setFixedHeight(38)
         self.pdf_btn.setEnabled(False)
         self.pdf_btn.clicked.connect(self.on_export_pdf)
-        fv.addWidget(self.pdf_btn)
+        if FEATURE_EXPORT_PDF:
+            fv.addWidget(self.pdf_btn)
+        else:
+            self.pdf_btn.setVisible(False)      # 这一版不带导出 PDF（代码留着，改开关就回来）
         fv.addWidget(self.save_btn)
         v.addWidget(fin)
         return page
@@ -4233,6 +5481,28 @@ class MainWindow(QMainWindow):
         self.run_active = False
         self.section_stack.setCurrentIndex(idx)
         self.content_stack.setCurrentIndex(0)
+        if hasattr(self, "sidebar"):
+            self.sidebar.setVisible(True)
+        if hasattr(self, "back_recog_btn"):
+            self.back_recog_btn.setVisible(True)
+        if hasattr(self, "log"):
+            self.log.setVisible(True)
+        self._on_section_shown(idx)
+
+    def show_recog_workspace(self):
+        """整个窗口只留识别（和标注软件那样）：侧边栏收起来，识别填完点「下一步」再进流程。"""
+        self.run_active = False
+        self.content_stack.setCurrentIndex(2)
+        if hasattr(self, "sidebar"):
+            self.sidebar.setVisible(False)
+        if hasattr(self, "back_recog_btn"):
+            self.back_recog_btn.setVisible(False)
+        # 识别页自己有日志区，底部那条日志先收起来，把高度让给画布
+        if hasattr(self, "log"):
+            self.log.setVisible(False)
+        if hasattr(self, "split"):
+            self.split.setSizes([720, 220])
+        self._recog_sync_inputs()
 
     def get_text(self, key):
         w = self.edits.get(key)
@@ -4242,6 +5512,125 @@ class MainWindow(QMainWindow):
         w = self.edits.get(key)
         if w:
             w.setText(value or "")
+
+    # ---------------- 中英文 ----------------
+    def _reg(self, w, zh):
+        """登记一个"文字跟着语言走"的控件，并按当前语言先填一次。"""
+        self._i18n.append((w, zh))
+        w.setText(T(zh))
+        return w
+
+    def _reg_tip(self, w, zh):
+        self._i18n_tip.append((w, zh))
+        w.setToolTip(T(zh))
+        return w
+
+    @staticmethod
+    def _shrinkable(w, minw=60):
+        """长中文提示：允许被压窄。
+
+        中文没有空格，wordWrap 的 QLabel 最小宽度会按"最长不可断的一串"算 —— 一句中文
+        就能把整页最小宽度顶到 1000+，窗口一窄就冒出左右滚动条。把宽度策略设成 Ignored
+        就没这个问题（文字照旧换行显示）。
+        """
+        w.setWordWrap(True)
+        w.setMinimumWidth(minw)
+        w.setSizePolicy(QSizePolicy.Ignored, w.sizePolicy().verticalPolicy())
+        return w
+
+    def _reg_combo(self, cb, items, en=None):
+        """登记下拉框（显示文字可翻译，data 值不动）。en = 逐项对应的英文写法。"""
+        self._i18n_combo.append((cb, list(items), list(en) if en else None))
+        self._fill_combo_lang(cb, items, en)
+        return cb
+
+    def _reg_ph(self, w, zh):
+        """登记输入框的占位提示（和 setText 一样跟着语言走）。"""
+        self._i18n_ph.append((w, zh))
+        w.setPlaceholderText(T(zh))
+        return w
+
+    def _fill_combo_lang(self, cb, items, en=None):
+        keep = cb.currentData()
+        cb.blockSignals(True)
+        cb.clear()
+        for i, (zh, val) in enumerate(items):
+            if cur_lang() == "en" and en and i < len(en):
+                cb.addItem(en[i], val)
+            else:
+                cb.addItem(T(zh), val)
+        i = cb.findData(keep) if keep is not None else -1
+        cb.setCurrentIndex(i if i >= 0 else 0)
+        cb.blockSignals(False)
+
+    def _reg_headers(self, table, headers):
+        self._i18n_headers.append((table, list(headers)))
+        table.setHorizontalHeaderLabels([T(h) for h in headers])
+        return table
+
+    def on_switch_lang(self):
+        """顶栏那个地球图标：中文 <-> English。"""
+        set_lang("en" if cur_lang() == "zh" else "zh")
+        self.retranslate()
+        self.log_msg(("已切换语言：%s" % LANG_NAMES[cur_lang()]) if cur_lang() == "zh"
+                     else ("Language switched to %s" % LANG_NAMES[cur_lang()]))
+
+    def retranslate(self):
+        """把界面上登记过的文字全部按当前语言重刷一遍（不重建控件，状态不丢）。"""
+        for w, zh in getattr(self, "_i18n", []):
+            try:
+                w.setText(T(zh))
+            except Exception:
+                pass
+        for w, zh in getattr(self, "_i18n_tip", []):
+            try:
+                w.setToolTip(T(zh))
+            except Exception:
+                pass
+        for cb, items, en in getattr(self, "_i18n_combo", []):
+            try:
+                self._fill_combo_lang(cb, items, en)
+            except Exception:
+                pass
+        for w, zh in getattr(self, "_i18n_ph", []):
+            try:
+                w.setPlaceholderText(T(zh))
+            except Exception:
+                pass
+        for table, headers in getattr(self, "_i18n_headers", []):
+            try:
+                table.setHorizontalHeaderLabels([T(h) for h in headers])
+            except Exception:
+                pass
+        # 动态文字（不在登记表里的）
+        for w, zh in getattr(self, "_i18n_nav", []):
+            try:
+                w.setText(T(zh))
+            except Exception:
+                pass
+        self._lang_tip()
+        try:                       # 支架类型明细行是动态生成的，重建一次就跟着换语言
+            self.refresh_rack_rows(self._rack_types_current(), stash=False)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "recog_rack_table"):
+                self.recog_rack_table.setHorizontalHeaderLabels(
+                    [T(h) for h in ("串数", "长度FT", "数量", "拆不拆")])
+        except Exception:
+            pass
+        if getattr(self, "run_status", ""):
+            self.status_label.setText(self.run_status)
+
+    def _lang_tip(self):
+        if hasattr(self, "lang_btn"):
+            self.lang_btn.setToolTip(
+                "语言：中文（点击切到 English）" if cur_lang() == "zh"
+                else "语言：English（点击切到中文）")
+        if hasattr(self, "upd_btn"):
+            self.upd_btn.setToolTip(T("检查更新"))
+        if hasattr(self, "notes_btn"):
+            self.notes_btn.setToolTip(T("更新日志"))
 
     def cfg(self):
         c = {}
@@ -4450,12 +5839,111 @@ class MainWindow(QMainWindow):
         self._region_seen = 0
         self._region_times = []
         self._region_logged = False
+        # 计时：每一步的开始时间 + 总时长；上一轮的记录全部丢掉（重新执行就是新进程）
+        self._run_started = time.time()
+        self._step_times = {}
+        self._step_name = ""
+        self._step_t0 = self._run_started
+        self._paused = False
+        self._stopped = False
+        if hasattr(self, "pause_btn"):
+            self.pause_btn.setEnabled(True)
+            self.pause_btn.setText(T("暂停"))
+        if hasattr(self, "stop_btn"):
+            self.stop_btn.setEnabled(True)
+        for _p in (self._pause_flag_path(), self._stop_flag_path()):
+            try:
+                os.remove(_p)
+            except Exception:
+                pass
         if self._poll_timer:
             self._poll_timer.stop()
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._poll_prog)
         self._poll_timer.start(150)
         threading.Thread(target=auto_worker, args=(cfg, ini, prog, self.bus), daemon=True).start()
+
+    # ---------------- 暂停 / 继续 ----------------
+    def _pause_flag_path(self):
+        return os.path.join(tempfile.gettempdir(), "vcad_pause.flag")
+
+    def _stop_flag_path(self):
+        return os.path.join(tempfile.gettempdir(), "vcad_stop.flag")
+
+    def on_stop(self):
+        """「停止」：写停止标记 —— CAD 侧插件在每个检查点看到就收尾停下。"""
+        if not self.run_active:
+            self.log_msg("现在没有在执行")
+            return
+        try:
+            with open(self._stop_flag_path(), "w", encoding="utf-8") as f:
+                f.write("stop")
+        except Exception as e:
+            self.log_msg("写停止标记失败：%s" % e)
+        self._stopped = True
+        self.run_status = "已停止（等 CAD 侧收尾）"
+        self.status_label.setText(self.run_status)
+        self.log_msg("已请求停止：CAD 侧会在下一个检查点收尾（不再画剩下的布局 / 不再写标签）；"
+                     "要立刻中断当前命令，请在 ZWCAD 里按 ESC")
+        if self._poll_timer:
+            self._poll_timer.stop()
+        if hasattr(self, "stop_btn"):
+            self.stop_btn.setEnabled(False)
+        self._log_run_times("执行已停止")
+
+    def on_pause(self):
+        """「暂停 / 继续」：冻结界面与进度（随时可停），并把暂停标记写出去。
+
+        真正落图的活儿在 ZWCAD 里跑，Python 这侧停不了 CAD 的当前命令；
+        这里做的是：停止推进进度、停止读进度文件、写下暂停标记（插件侧后续可接力），
+        想立刻停画图就在 CAD 里按 ESC。
+        """
+        if not self.run_active:
+            self.log_msg("现在没有在执行")
+            return
+        self._paused = not self._paused
+        if self._paused:
+            self.pause_btn.setText(T("继续"))
+            self._step_pause()
+            try:
+                with open(self._pause_flag_path(), "w", encoding="utf-8") as f:
+                    f.write("paused")
+            except Exception:
+                pass
+            self.log_msg("已暂停：进度停在当前这一步，点「继续」接着往下跑"
+                         "（CAD 侧正在执行的命令要立刻停，请在 ZWCAD 里按 ESC）")
+            if self._poll_timer:
+                self._poll_timer.stop()
+        else:
+            self.pause_btn.setText(T("暂停"))
+            try:
+                os.remove(self._pause_flag_path())
+            except Exception:
+                pass
+            self.log_msg("继续执行…")
+            self._step_t0 = time.time()
+            if self._poll_timer:
+                self._poll_timer.start(150)
+                self._poll_prog()
+
+    def _step_pause(self):
+        """把当前这一步的累计耗时记下来（暂停时也要把这一段的账结掉）。"""
+        if self._step_name and self._step_t0:
+            self._step_times[self._step_name] = \
+                self._step_times.get(self._step_name, 0.0) + (time.time() - self._step_t0)
+
+    def _step_switch(self, name):
+        """一步做完换下一步：记耗时、写日志（每步都带时间）。"""
+        if not name or name == self._step_name:
+            return
+        now = time.time()
+        if self._step_name and self._step_t0:
+            dt = now - self._step_t0
+            self._step_times[self._step_name] = self._step_times.get(self._step_name, 0.0) + dt
+            self.log_msg("  ✓ %s 用时 %.1f 秒" % (self._step_name, dt))
+        self._step_name = name
+        self._step_t0 = now
+        self.log_msg("▶ %s（%s）" % (name, time.strftime("%H:%M:%S")))
 
     def on_prog(self, msg):
         self.log_msg(msg)
@@ -4494,6 +5982,13 @@ class MainWindow(QMainWindow):
                                if _m else "正在按 LBD 区域上下限对准视口…")
         elif "REGION_TOTAL" in up:
             self.run_status = "正在按 LBD 区域上下限对准视口…"
+        elif "STOPPED" in up:
+            # 用户点了「停止」：插件在检查点收尾，这里跟着收摊（要排在 DONE 前面，
+            # 因为收尾消息是 STOPPED_DONE，也含 DONE）
+            self._stopped = True
+            self.run_status = "已停止"
+            if self._poll_timer:
+                self._poll_timer.stop()
         elif "DONE" in up:
             self.run_status = "完成"
             if self.total:
@@ -4502,6 +5997,7 @@ class MainWindow(QMainWindow):
                 self.total = self.done_n
         elif "ERROR" in up:
             self.run_status = "出错：" + msg
+        self._step_switch(self._step_key_of(self.run_status))
         self.status_label.setText(self.run_status)
         if self.total > 0:
             if self._phase == "REGION":
@@ -4515,11 +6011,48 @@ class MainWindow(QMainWindow):
         self.run_status = msg
         self.status_label.setText(msg)
 
+    @staticmethod
+    def _step_key_of(status):
+        """把状态文字归成"哪一步"，用来计时（状态文字本身会一直变，不能直接当步名）。"""
+        s = status or ""
+        for k in ("连接 / 启动", "打开 DWG", "加载插件", "批量布局",
+                  "区域 / 支架范围", "LBD / 支架标签", "绘制", "打印 / 导出", "完成"):
+            if k in s:
+                return k
+        return s or "执行"
+
+    def _log_run_times(self, title):
+        """跑完/出错：把每一步的耗时和总时长写进日志。"""
+        self._step_pause()
+        if not self._run_started:
+            return
+        total = time.time() - self._run_started
+        parts = ["%s %.1fs" % (k, v) for k, v in self._step_times.items() if v >= 0.05]
+        self.log_msg("%s：总时长 %.1f 秒%s" % (title, total,
+                                             ("（" + "、".join(parts) + "）") if parts else ""))
+        self.log_msg("想调整识别结果（改框 / 改名 / 加框），点左下角「← 返回识别」或按 Ctrl+B，"
+                     "改完再「下一步」回来；改过的地方都会保留。")
+        if hasattr(self, "pause_btn"):
+            self.pause_btn.setEnabled(False)
+            self.pause_btn.setText(T("暂停"))
+        self._paused = False
+        try:
+            os.remove(self._pause_flag_path())
+        except Exception:
+            pass
+        try:
+            os.remove(self._stop_flag_path())
+        except Exception:
+            pass
+        if hasattr(self, "stop_btn"):
+            self.stop_btn.setEnabled(False)
+
     def on_err(self, msg):
         if self._poll_timer:
             self._poll_timer.stop()
         self.status_label.setText("出错：" + msg)
         self.log_msg("执行出错：" + msg)
+        self._log_run_times("执行结束（出错）")
 
     def on_done(self, msg):
         if self._poll_timer:
@@ -4532,6 +6065,7 @@ class MainWindow(QMainWindow):
             self.pbar.setValue(100)
             pass                      # 进度方块已去掉，只保留进度条
         self.log_msg("完成：" + msg)
+        self._log_run_times("执行完成")
 
     def on_save_dwg(self):
         """跑完后由用户选保存位置，再把当前 CAD 图纸 SAVEAS 过去。"""
@@ -4696,7 +6230,7 @@ class MainWindow(QMainWindow):
         self._upd_url = url
         self._upd_tag = tag
         self._upd_install = True
-        self.upd_btn.setText("下载并安装 %s" % tag)
+        self.upd_btn.setToolTip("下载并安装 %s" % tag)
         self.upd_label.setText("发现新版 %s" % tag)
         self.log_msg("== 发现新版本 %s（当前 v%s%s）==" % (
             tag, APP_VERSION, ("，%s 发布" % published) if published else ""))
@@ -4721,7 +6255,7 @@ class MainWindow(QMainWindow):
 
     def on_upd_none(self, tag, notes, published):
         self.upd_btn.setEnabled(True)
-        self.upd_btn.setText("检查更新")
+        self.upd_btn.setToolTip(T("检查更新"))
         self._upd_install = False
         self.upd_label.setText("已是最新 v%s" % APP_VERSION)
         self.log_msg("检查更新：已是最新（远端 %s%s）" % (
@@ -4745,7 +6279,7 @@ class MainWindow(QMainWindow):
     def on_upd_error(self, msg):
         self.upd_btn.setEnabled(True)
         if not self._upd_install:
-            self.upd_btn.setText("检查更新")
+            self.upd_btn.setToolTip(T("检查更新"))
         self.upd_label.setFixedWidth(190)
         self.upd_label.setText("检查更新失败")
         self.log_msg(msg)
@@ -4756,7 +6290,7 @@ class MainWindow(QMainWindow):
             self.log_msg("没有可下载的更新地址，请到发布页手工下载：%s" % UPDATE_PAGE)
             return
         self.upd_btn.setEnabled(False)
-        self.upd_btn.setText("正在下载…")
+        self.upd_btn.setToolTip(T("正在下载…"))
         self._upd_pct = 0
         self._upd_detail = ""
         self._upd_logged = -1
@@ -4793,7 +6327,7 @@ class MainWindow(QMainWindow):
         self.upd_btn.setEnabled(True)
         ok, msg = apply_update(path)
         if not ok:
-            self.upd_btn.setText("检查更新")
+            self.upd_btn.setToolTip(T("检查更新"))
             self.log_msg(msg)
             QMessageBox.warning(self, "无法自动更新", msg)
             return
