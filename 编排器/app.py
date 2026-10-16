@@ -175,6 +175,15 @@ _LANG = ["zh"]
 LANG_NAMES = {"zh": "中文", "en": "English"}
 
 
+def fmt_hms(sec):
+    """秒 -> mm:ss（进度条上显示已用/剩余时间用）。"""
+    try:
+        sec = max(0, int(round(float(sec))))
+    except Exception:
+        sec = 0
+    return "%d:%02d" % (sec // 60, sec % 60)
+
+
 def cur_lang():
     return _LANG[0]
 
@@ -2589,6 +2598,7 @@ class RecogCanvas(QGraphicsView):
         self.on_selected = None
         self.on_added = None           # 拖出一个新框之后的回调（界面刷新名字栏/统计）
         self.on_deleted = None         # 删框之后的回调（界面同步刷新结果）
+        self.on_escape = None          # ESC 退出画框模式的回调（界面把工具按钮弹起来）
         self.on_page_key = None        # 键盘翻页回调（PgUp/PgDn、Ctrl+←/→）
         self.on_rack_step = None       # A/D：前/后跳一个支架（回调给主窗口）
         self.add_mode = ""             # "" = 不在加框模式；否则 = 要画的框类型
@@ -2701,7 +2711,16 @@ class RecogCanvas(QGraphicsView):
 
     # ---------- 缩放 / 平移 ----------
     def wheelEvent(self, e):
+        # 每次都重设锚点：fitInView / resetTransform 会把锚点变回视口中心，
+        # 不重设缩放就不跟光标走（和标注软件同一套做法）
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        cur = self.transform().m11()
+        f = 1.15 if e.angleDelta().y() > 0 else 1 / 1.15
+        if not (0.01 < cur * f < 40):
+            e.accept()
+            return
         self.zoom(1.15 if e.angleDelta().y() > 0 else 1 / 1.15)
+        e.accept()
 
     def zoom(self, factor):
         self._fit_mode = ""
@@ -2815,6 +2834,11 @@ class RecogCanvas(QGraphicsView):
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
+        # 右键：画到一半取消这一笔（画框模式本身不退，方便接着画）
+        if e.button() == Qt.RightButton and self._rubber is not None:
+            self.cancel_draw()
+            e.accept()
+            return
         if self._rubber is not None:
             # 拖着画出来的（有面积）→ 直接成型；只是点了一下 → 留在两点画法里等第二次点击
             r = self._rubber.rect().normalized()
@@ -2847,6 +2871,19 @@ class RecogCanvas(QGraphicsView):
         self._place_handle()
 
     def keyPressEvent(self, e):
+        # ESC：画到一半先丢掉这一笔；再按一次退回选择模式
+        # （不这样的话 add_mode 一直挂着：鼠标一动就拖出虚线框、框也选不中）
+        if e.key() == Qt.Key_Escape:
+            if self.cancel_draw():
+                e.accept()
+                return
+            if self.add_mode and self.on_escape:
+                try:
+                    self.on_escape()
+                except Exception:
+                    pass
+            e.accept()
+            return
         if e.key() in (Qt.Key_Delete, Qt.Key_Backspace):
             self.delete_selected()
             e.accept()
@@ -2920,6 +2957,18 @@ class RecogCanvas(QGraphicsView):
                 pass
         if self.on_changed:
             self.on_changed()
+        return True
+
+    def cancel_draw(self):
+        """丢掉画到一半的那一笔（画框模式不退）。返回是否真的取消了东西。"""
+        if self._rubber is None:
+            return False
+        try:
+            self.scene().removeItem(self._rubber)
+        except Exception:
+            pass
+        self._rubber = None
+        self._rubber_from = None
         return True
 
     # ---------- 选中 / 编辑 ----------
@@ -4008,6 +4057,7 @@ class MainWindow(QMainWindow):
         self.pause_btn.setEnabled(False)
         self._reg_tip(self.pause_btn, "暂停执行（随时可停）")
         self.pause_btn.clicked.connect(self.on_pause)
+        self.pause_btn.setVisible(False)          # 和「停止」重复，先收起来（停止=冻结+让 CAD 收尾停）
         actions.addWidget(self.pause_btn)
         # 真·随时停止：写停止标记，CAD 侧的插件在每个检查点看到就收尾停下
         self.stop_btn = self._reg(QPushButton(), "停止")
@@ -4231,6 +4281,7 @@ class MainWindow(QMainWindow):
                         "整本识别（模型 v4c 在程序里跑），跑完自动填「识别结果 JSON文件」；"
                         "页数多了就用下面的「只保留 / 过滤」挑页。")
         tip.setObjectName("RecogTip")
+        tip.setVisible(False)          # 识别下方的小字不要（用户要求）
         self._shrinkable(tip, 120)
         outer.addWidget(tip)
 
@@ -4238,9 +4289,9 @@ class MainWindow(QMainWindow):
         prow0 = QHBoxLayout()
         prow0.setSpacing(8)
         self.recog_bar = QProgressBar()
-        self.recog_bar.setTextVisible(False)
+        self.recog_bar.setTextVisible(True)
         self.recog_bar.setValue(0)
-        self.recog_bar.setFixedWidth(160)
+        self.recog_bar.setMinimumWidth(340)      # 长一点，能放下百分比 + 已用/剩余时间
         prow0.addWidget(self.recog_bar)
         self.recog_status = QLabel("")
         self.recog_status.setObjectName("RecogStatus")   # 单独的小字号（见 QSS）
@@ -4257,7 +4308,12 @@ class MainWindow(QMainWindow):
         self.recog_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.recog_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.recog_table.setMinimumWidth(150)      # 窄窗口也能塞下：列里自己横向滚
-        self.recog_table.setMaximumWidth(300)
+        self.recog_table.setMaximumWidth(235)      # 左表收窄，中间留竖线，不左右滑也能看全
+        _sep = QFrame()
+        _sep.setFixedWidth(1)
+        _sep.setStyleSheet("background-color:#2a2c2e;")
+        res.addWidget(_sep)
+        res.addSpacing(4)
         self.recog_table.itemSelectionChanged.connect(self.on_recog_page_changed)
         res.addWidget(self.recog_table)
         pv = QVBoxLayout()
@@ -4320,6 +4376,7 @@ class MainWindow(QMainWindow):
         self.recog_canvas.on_selected = self.on_recog_box_selected
         self.recog_canvas.on_added = self.on_recog_box_added
         self.recog_canvas.on_deleted = self.on_recog_box_deleted
+        self.recog_canvas.on_escape = self.on_recog_escape
         self.recog_canvas.on_page_key = self.on_recog_page_step
         self.recog_canvas.on_rack_step = self.on_recog_rack_step
         pv.addWidget(self.recog_canvas, 1)
@@ -4414,11 +4471,16 @@ class MainWindow(QMainWindow):
         bot_w.setVisible(False)
         self.recog_bottom_btn.setChecked(False)
         nb = QHBoxLayout()
-        nb.addStretch(1)
+        # （按钮都靠左放，用户要求）
+        self.recog_prev_btn = self._reg(QPushButton(), "← 上一步")
+        self.recog_prev_btn.setToolTip("回到识别工作区（换 PDF / 重新识别 / 改框）")
+        self.recog_prev_btn.clicked.connect(self.show_recog_workspace)
+        nb.addWidget(self.recog_prev_btn)
         self.recog_next_btn = self._reg(QPushButton(), "下一步：填其它参数 →")
         self.recog_next_btn.setObjectName("Primary")
         self.recog_next_btn.clicked.connect(self.on_recog_next)
         nb.addWidget(self.recog_next_btn)
+        nb.addStretch(1)
         outer.addLayout(nb)
         # 外面套一层滚动区：只允许上下滚，横向滚动条一律不放（窗口窄也不会左右滑）
         sc = QScrollArea()
@@ -4443,6 +4505,7 @@ class MainWindow(QMainWindow):
             self._recog_write("上一轮还在跑（running=True），这次点击忽略")
             return
         self._recog_running = True
+        self._recog_t0 = time.time()      # 进度条上「已用 / 剩余」的起点
         self.recog_btn.setEnabled(False)
         self.recog_btn.setText("识别中…")
         self.recog_view.clear()
@@ -4529,6 +4592,15 @@ class MainWindow(QMainWindow):
             return
         self.recog_bar.setMaximum(max(1, total))
         self.recog_bar.setValue(done)
+        # 进度条上直接写：百分比 + 已用 / 剩余（识别开始时间在 on_recognize 里记）
+        _t0 = getattr(self, "_recog_t0", None)
+        if _t0 and done:
+            _el = time.time() - _t0
+            _left = _el * (total - done) / float(done) if done else 0.0
+            self.recog_bar.setFormat("%%p%%　已用 %s / 剩余约 %s（共 %d 页）"
+                                     % (fmt_hms(_el), fmt_hms(_left), total))
+        else:
+            self.recog_bar.setFormat("%p%")
         pct = int(round(done * 100.0 / max(1, total)))
         # 时间进度：已用 + 按当前速度估的剩余（至少跑完一页才估，不然会乱跳）
         extra = ""
@@ -5259,15 +5331,18 @@ class MainWindow(QMainWindow):
 
     def on_recog_draw_mode(self, kind):
         """画框模式（和标注软件一致）：画 Box / 画支架 / 画 LBD 区；再点一次回到选择。"""
+        c = getattr(self, "recog_canvas", None)
+        if c is not None:
+            c.cancel_draw()          # 换工具/退出时，先丢掉画到一半的那一笔
         btns = getattr(self, "recog_draw_btns", {})
         on = bool(btns.get(kind) and btns[kind].isChecked())
         for k, b in btns.items():
             if k != kind:
                 b.setChecked(False)
         mode = kind if on else ""
-        c = getattr(self, "recog_canvas", None)
         if c is not None:
             c.add_mode = mode
+            c.setFocus()
             c.setDragMode(QGraphicsView.NoDrag if mode else QGraphicsView.RubberBandDrag)
             c.setCursor(Qt.CrossCursor if mode else Qt.ArrowCursor)
             # 视口自己的光标优先，之前给视口设过箭头，这里要一起换掉，十字才看得到
@@ -5276,6 +5351,22 @@ class MainWindow(QMainWindow):
         self._recog_write(("进入「%s」模式：点一下定第一个角、移到对角再点一下成框"
                            "（也可以按住左键直接拖）；再点一下这个按钮退出"
                            % name) if mode else "回到选择模式")
+
+    def on_recog_escape(self):
+        """ESC：退出画框模式，回到选择模式。
+
+        画框模式一直挂着的时候，鼠标一动就拖出虚线框、框也点不中 —— 这两个 bug
+        都是它引起的；标注软件里 ESC 也是这个语义（先丢这一笔，再退模式）。
+        """
+        for b in (getattr(self, "recog_draw_btns", {}) or {}).values():
+            b.setChecked(False)
+        c = getattr(self, "recog_canvas", None)
+        if c is not None:
+            c.cancel_draw()
+            c.add_mode = ""
+            c.setDragMode(QGraphicsView.RubberBandDrag)
+            c.setCursor(Qt.ArrowCursor)
+        self._recog_write("已退出画框模式（回到选择模式）")
 
     def on_recog_box_added(self, kind, det_index):
         self._recog_sync_all("加了一个%s框" % ("LBD 区" if kind == "Node" else "支架"))
