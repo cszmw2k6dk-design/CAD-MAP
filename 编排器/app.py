@@ -4291,7 +4291,8 @@ class MainWindow(QMainWindow):
         self.recog_bar = QProgressBar()
         self.recog_bar.setTextVisible(True)
         self.recog_bar.setValue(0)
-        self.recog_bar.setMinimumWidth(340)      # 长一点，能放下百分比 + 已用/剩余时间
+        self.recog_bar.setMinimumWidth(380)      # 长一点，能放下百分比 + 已用/剩余时间
+        self.recog_bar.setFixedHeight(22)        # 高一点，否则百分比文字被切掉一半
         prow0.addWidget(self.recog_bar)
         self.recog_status = QLabel("")
         self.recog_status.setObjectName("RecogStatus")   # 单独的小字号（见 QSS）
