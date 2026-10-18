@@ -506,6 +506,25 @@ def read_sheet_width_in(items):
     return None
 
 
+def lbd_prefix_of(names):
+    """同一页几个 LBD 名字的公共前缀（去掉末尾数字）：`INV11A101-LBD-`。
+
+    给"读不到具体编号"的 LBD 填前缀用 —— 用户只要在后面补数字，不用整段重打。
+    """
+    from collections import Counter
+    pres = []
+    for nm in names or []:
+        s = str(nm or "").strip()
+        if not s:
+            continue
+        p = re.sub(r"\d+$", "", s)
+        if p and p != s:
+            pres.append(p)
+    if not pres:
+        return ""
+    return Counter(pres).most_common(1)[0][0]
+
+
 def _name_num(name):
     """名字里的"号"：取最后一段数字。'…-LBD-1.01.1.C.5' -> 5，'…-LBD-07' -> 7。"""
     segs = re.findall(r"\d+", str(name or ""))

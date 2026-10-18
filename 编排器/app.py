@@ -342,10 +342,12 @@ TEXT_EN = {
     "过滤": "Filter",
     "滚轮缩放 · 中键拖动平移 · 拖框改位置 · 拖控制点改大小 · Delete 删除":
         "Wheel = zoom · middle-drag = pan · drag = move · drag a control point = resize · Delete = remove",
-    "项目树（LBD → ROW 列 → 每根支架；双击支架改串数，双击 LBD 改名）":
-        "Project tree (LBD → ROW → each rack; double-click a rack to change its string count)",
-    "整册支架长度 → 串数（识别到的每一档都在这儿；填上串数就按它匹配整册支架类型）":
-        "Whole-set rack lengths → string count (fill it in; this drives the rack types)",
+    "项目树": "Tree",
+    "LBD → ROW 列 → 每根支架；双击支架改串数，双击 LBD 改名":
+        "LBD → ROW → each rack; double-click a rack to set its string count",
+    "整册支架长度 → 串数": "Rack lengths → strings",
+    "识别到的每一档都在这儿；填上串数就按它匹配整册支架类型":
+        "Every detected length bucket is listed here; the string count you fill in drives the rack types",
     "日志": "Log",
     "展开 / 收起识别日志（上面那张支架类型表一直露着）":
         "Show / hide the recognition log (the rack-length table above stays visible)",
@@ -4474,11 +4476,15 @@ class MainWindow(QMainWindow):
         prow0 = QHBoxLayout()
         prow0.setSpacing(8)
         self.recog_bar = QProgressBar()
-        self.recog_bar.setTextVisible(True)
+        self.recog_bar.setTextVisible(False)     # 细条只画进度，百分比/时间在右边单独一行
         self.recog_bar.setValue(0)
-        self.recog_bar.setMinimumWidth(380)      # 长一点，能放下百分比 + 已用/剩余时间
-        self.recog_bar.setFixedHeight(22)        # 高一点，否则百分比文字被切掉一半
+        self.recog_bar.setMinimumWidth(240)
+        self.recog_bar.setFixedHeight(8)
         prow0.addWidget(self.recog_bar)
+        self.recog_prog_text = QLabel("")
+        self.recog_prog_text.setObjectName("RecogStatus")
+        self.recog_prog_text.setFixedWidth(260)
+        prow0.addWidget(self.recog_prog_text)
         self.recog_status = QLabel("")
         self.recog_status.setObjectName("RecogStatus")   # 单独的小字号（见 QSS）
         self._shrinkable(self.recog_status, 120)
@@ -4509,6 +4515,7 @@ class MainWindow(QMainWindow):
             _h.setSectionResizeMode(QHeaderView.Stretch)
             _h.setMinimumSectionSize(34)
             _h.setStretchLastSection(False)
+            _h.setDefaultAlignment(Qt.AlignCenter)
         except Exception:
             pass
         self.recog_table.setMinimumWidth(150)
@@ -4608,9 +4615,9 @@ class MainWindow(QMainWindow):
         res.addLayout(pv, 1)
         # 右栏：上面 = 整册支架长度 → 串数（整册的支架类型在这儿填），下面 = 项目树
         nv = QVBoxLayout()
-        rt = self._reg(QLabel(),
-                       "整册支架长度 → 串数（识别到的每一档都在这儿；填上串数就按它匹配整册支架类型）")
+        rt = self._reg(QLabel(), "整册支架长度 → 串数")
         rt.setObjectName("Hint")
+        self._reg_tip(rt, "识别到的每一档都在这儿；填上串数就按它匹配整册支架类型")
         self._shrinkable(rt, 110)
         nv.addWidget(rt)
         self.recog_rack_table = QTableWidget(0, 4)
@@ -4622,6 +4629,7 @@ class MainWindow(QMainWindow):
         self.recog_rack_table.setToolTip("点某一档 → 跳到那档支架的实际位置（再点一次看下一个）")
         try:
             self.recog_rack_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            self.recog_rack_table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
         except Exception:
             pass
         self.recog_rack_table.cellClicked.connect(self.on_recog_rack_row)
@@ -4648,9 +4656,9 @@ class MainWindow(QMainWindow):
         hb2.addWidget(b)
         hb2.addStretch(1)
         nv.addLayout(hb2)
-        nl = self._reg(QLabel(),
-                       "项目树（LBD → ROW 列 → 每根支架；双击支架改串数，双击 LBD 改名）")
+        nl = self._reg(QLabel(), "项目树")
         nl.setObjectName("Hint")
+        self._reg_tip(nl, "LBD → ROW 列 → 每根支架；双击支架改串数，双击 LBD 改名")
         self._shrinkable(nl, 90)
         nv.addWidget(nl)
         # 项目树：一级 = LBD 编号（可改名），展开 = 这个 LBD 里各列的串数
@@ -4793,15 +4801,6 @@ class MainWindow(QMainWindow):
             return
         self.recog_bar.setMaximum(max(1, total))
         self.recog_bar.setValue(done)
-        # 进度条上直接写：百分比 + 已用 / 剩余（识别开始时间在 on_recognize 里记）
-        _t0 = getattr(self, "_recog_t0", None)
-        if _t0 and done:
-            _el = time.time() - _t0
-            _left = _el * (total - done) / float(done) if done else 0.0
-            self.recog_bar.setFormat("%%p%%　已用 %s / 剩余约 %s（共 %d 页）"
-                                     % (fmt_hms(_el), fmt_hms(_left), total))
-        else:
-            self.recog_bar.setFormat("%p%")
         pct = int(round(done * 100.0 / max(1, total)))
         # 时间进度：已用 + 按当前速度估的剩余（至少跑完一页才估，不然会乱跳）
         extra = ""
@@ -4811,6 +4810,11 @@ class MainWindow(QMainWindow):
             extra = "　已用 %s" % self._fmt_mmss(el)
             if done >= 1 and total > done:
                 extra += " · 剩约 %s" % self._fmt_mmss(el * (total - done) / float(done))
+        if hasattr(self, "recog_prog_text"):
+            _l = self.recog_prog_text
+            _l.setText("%d%%（%d/%d）%s" % (pct, done, total,
+                                            extra.replace("　", " · ").strip(" ·")))
+            _l.setToolTip("共 %d 页" % total)
         self.recog_status.setText("%s（%d/%d，%d%%）%s" % (text, done, total, pct, extra))
 
     @staticmethod
@@ -4899,7 +4903,9 @@ class MainWindow(QMainWindow):
         for i, (pg, nn, nt, nb, n_named, n_pos, _w, _h) in enumerate(rows):
             # 左表只留三列：页码 / 识别到的 LBD 数 / 配到编号的数
             for j, val in enumerate((pg, nn, n_named)):
-                self.recog_table.setItem(i, j, QTableWidgetItem(str(val)))
+                _it = QTableWidgetItem(str(val))
+                _it.setTextAlignment(Qt.AlignCenter)
+                self.recog_table.setItem(i, j, _it)
         # 列宽由表头的 Stretch 管（三列平分），不再按内容撑宽 —— 撑宽就会顶出横向滚动
         if rows and reload_preview:
             pages = [r[0] for r in rows]
@@ -4969,8 +4975,7 @@ class MainWindow(QMainWindow):
         if rows and hasattr(self, "recog_preview_info"):
             _pg, nn, nt, nb, n_named, n_pos, _w, _h = rows[0]
             self.recog_preview_info.setText(
-                "第 %s 页：LBD 区 %d、支架 %d、汇流箱 %d、配到编号 %d、编号位置 %d"
-                % (pg, nn, nt, nb, n_named, n_pos))
+                "本页：LBD %d · 支架 %d · 编号 %d" % (nn, nt, n_named))
         self._update_issue_bar(pg)
 
     def _update_issue_bar(self, pg=None):
@@ -5196,9 +5201,10 @@ class MainWindow(QMainWindow):
                     best = (d, oN, oS)
             if best is not None and best[0] <= max(1.0, 0.10 * max(L, 1.0)):
                 keep_n, keep_s = best[1], best[2]
-            t.setItem(i, 0, QTableWidgetItem(keep_n))
-            t.setItem(i, 1, QTableWidgetItem("%.1f" % L))
-            t.setItem(i, 2, QTableWidgetItem(str(g.get("count") or 0)))
+            for col, val in ((0, keep_n), (1, "%.1f" % L), (2, str(g.get("count") or 0))):
+                _it = QTableWidgetItem(val)
+                _it.setTextAlignment(Qt.AlignCenter)
+                t.setItem(i, col, _it)
             cb = NoWheelCombo()
             cb.addItems(["不拆", "2行", "3行"])
             j = cb.findText(keep_s)
@@ -5338,7 +5344,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _groups_from_doc(doc, tol=0.10):
-        """从识别结果直接聚类支架长度（英尺优先，其次像素，都没有就按框长）。
+        """从识别结果直接聚类支架长度（就用框长 / 页面像素；老结果没有像素长度再用英寸）。
 
         返回 [{"length", "unit", "count", "pages"}]，和 detect.rack_length_groups 同一套
         判据（长度差 ≤10% 算同一档），但不碰 PDF，纯内存里算 —— 删框 / 过滤后刷新不卡。
@@ -5350,10 +5356,10 @@ class MainWindow(QMainWindow):
                 if (d.get("label") or "") != "Tracker":
                     continue
                 raw = d.get("raw") or {}
-                if raw.get("len_ft") is not None:
-                    ft.append((float(raw["len_ft"]), pg))
-                elif raw.get("len_px") is not None:
+                if raw.get("len_px") is not None:
                     px.append((float(raw["len_px"]), pg))
+                elif raw.get("len_ft") is not None:
+                    ft.append((float(raw["len_ft"]), pg))
                 else:
                     b = d.get("bbox") or {}
                     try:
@@ -5361,10 +5367,10 @@ class MainWindow(QMainWindow):
                                         float(b.get("y2", 0)) - float(b.get("y1", 0))), pg))
                     except Exception:
                         pass
-        if ft:
-            items, unit = ft, "英尺"
-        elif px:
+        if px:
             items, unit = px, "像素"
+        elif ft:
+            items, unit = ft, "英尺"
         else:
             items, unit = box, "框长"
         if not items:
@@ -5491,9 +5497,11 @@ class MainWindow(QMainWindow):
             self._recog_write("这一行的长度读不出来（%r）" % length)
             return
         doc = getattr(self, "_recog_doc", None) or {}
-        unit_px = bool(getattr(self, "_recog_groups", None)) and \
-            (self._recog_groups[0].get("unit") == "像素")
+        # 口径跟「应用」/项目树共用同一个判断（表里的长度可能是像素、也可能是英尺）
+        unit_px = self._match_unit_px()
+        _u = "像素" if unit_px else "英尺"
         matches = []
+        near, near_d = None, None          # 找不到时用：整册最接近的那根，告诉用户差多少
         for page in doc.get("yolo_tracker_detection_results") or []:
             pg = page.get("page_number")
             for i, d in enumerate((page.get("data") or {}).get("detections") or []):
@@ -5502,10 +5510,20 @@ class MainWindow(QMainWindow):
                 v = self._rack_len_of(d, pg, unit_px)
                 if v is None:
                     continue
+                _dlt = abs(float(v) - target)
+                if near_d is None or _dlt < near_d:
+                    near, near_d = (pg, i, float(v)), _dlt
                 if abs(float(v) - target) <= 0.10 * max(target, 1.0):
                     matches.append((pg, i))
         if not matches:
-            self._recog_write("没找到长度 %.1f 的支架（%s 那一档）" % (target, strings or "?"))
+            if near is not None:
+                self._recog_write(
+                    "没找到长度 %.1f %s 的支架（%s 那一档）；整册最接近的是第 %s 页的 %.1f %s，差 %.1f%%"
+                    % (target, _u, strings or "?", near[0], near[2], _u,
+                       100.0 * near_d / max(target, 1.0)))
+            else:
+                self._recog_write("没找到长度 %.1f %s 的支架（%s 那一档）：整册没有可算长度的支架框"
+                                  % (target, _u, strings or "?"))
             return
         k = (getattr(self, "_rack_jump_pos", {}) or {}).get(row, -1) + 1
         k %= len(matches)
@@ -5838,13 +5856,14 @@ class MainWindow(QMainWindow):
         return None
 
     def _match_unit_px(self):
-        """整册该按哪套口径跟「支架类型」表里的长度匹配：True = 像素，False = 英尺。
+        """长度口径：现在一律用框长（页面像素），不再读图纸比例尺换算英尺。
 
-        表里填的可能是像素值、也可能是英尺值，跟识别结果里存的那套不一定一致。
-        先按分档表当前的口径扫一遍整册：配上一半以上就直接用它；配上很少（口径十有八九
-        不对）就换另一套再扫一遍，谁配上的多用谁。结果按识别结果缓存，应用和项目树共用
-        同一个结论，免得两处显示不一样。
+        （以前会两套口径都试；用户要求"就用本身长度"，这里固定像素，省掉读比例尺。）
         """
+        return True
+
+    def _match_unit_px_legacy(self):
+        """老逻辑（像素/英尺自动判定）：留着备用，目前不用。"""
         doc = getattr(self, "_recog_doc", None) or {}
         _g = getattr(self, "_recog_groups", None) or []
         base = bool(_g) and (_g[0].get("unit") == "像素")
@@ -6115,7 +6134,8 @@ class MainWindow(QMainWindow):
                     nm = (recs[i].get("final_node_name")
                           or recs[i].get("preliminary_node_name") or "").strip()
                 names.append(nm)
-            unnamed = sum(1 for n in names if not n)
+            _noname = sum(1 for n in names if not n)
+            _prefonly = sum(1 for n in names if n and not re.search(r"\d$", n))
             dup = [n for n, c in Counter(n for n in names if n).items() if c > 1]
             orphan = 0
             if _lr_assign_parent is not None and nodes:
@@ -6133,8 +6153,11 @@ class MainWindow(QMainWindow):
                         except Exception:
                             pass
             parts = []
-            if unnamed:
-                parts.append("%d 个 LBD 没编号" % unnamed)
+            if _noname or _prefonly:
+                _t = "%d 个 LBD 没编号" % (_noname + _prefonly)
+                if _prefonly:
+                    _t += "（其中 %d 个已填前缀，补数字即可）" % _prefonly
+                parts.append(_t)
             if dup:
                 parts.append("重复编号 %s" % "、".join(dup[:3]))
             if orphan:
@@ -6226,14 +6249,29 @@ class MainWindow(QMainWindow):
                 rec["node_bbox"] = {t: round(float(b[t]), 2) for t in ("x1", "y1", "x2", "y2")}
             dets[i]["raw"] = dict(s.get("raw") or dets[i].get("raw") or {})
             k += 1
+        # 读不到具体编号的：填上同页公共前缀（如 INV11A101-LBD-），用户只要补数字
+        pref, filled = "", 0
+        try:
+            import lbd_naming as _N2
+            pref = _N2.lbd_prefix_of([r.get("final_node_name") for r in recs[:k]])
+        except Exception:
+            pref = ""
+        if pref:
+            for r in recs[:k]:
+                if not (r.get("final_node_name") or "").strip():
+                    r["final_node_name"] = pref
+                    r["preliminary_node_name"] = pref
+                    filled += 1
         self._recog_dirty = True
         if hasattr(self, "recog_save_btn"):
             self.recog_save_btn.setEnabled(True)
         self._recog_mark_dirty()
         self._recog_refresh_names()
         self._recog_update_page_info(pg)
-        self._recog_write("重新识别 LBD 编号（第 %s 页）：改到 %d 个、%d 个没读到（保留原值）"
-                          % (pg, changed, kept))
+        self._recog_write("重新识别 LBD 编号（第 %s 页）：改到 %d 个、%d 个没读到%s"
+                          % (pg, changed, kept,
+                             ("（%d 个填了前缀 %s，补数字即可）" % (filled, pref))
+                             if filled else "（保留原值）"))
 
     def on_recog_lock_lbd(self, on):
         """锁定 / 解锁本页的 LBD 区（写进识别结果，和标注软件同一套：点不中/拖不动/删不掉）。"""

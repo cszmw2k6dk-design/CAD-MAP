@@ -2046,7 +2046,9 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
             rec = rec_for_box(b, recs_pg, rec_by_key) or {}
             n["name"] = (rec.get("final_node_name")
                          or rec.get("preliminary_node_name") or "").strip()
-            if not n["name"]:
+            # 只有前缀（如 INV11A101-LBD-）还没补数字的，也算"没名字"：
+            # CAD 那边不画半截标签，生成时会提示哪些页缺编号
+            if not n["name"] or not re.search(r"\d$", n["name"]):
                 unnamed.append((pg_out, ni))
                 continue
             cx, cy = _center(b)

@@ -405,35 +405,82 @@ def dedup_dets(dets):
     return out, stats
 
 
-def rack_length_groups(per_page, text_items_of, dpi=RENDER_DPI, tol=0.10):
-    """整册支架按长度聚类（长度先按该页比例尺折算成英尺，读不到就用像素）。
+def drop_outliers(dets, width, height, min_count=8, gap_ratio=0.10):
+    """去掉离「主体」很远的框（同一张图上的细节图 / 角落误检）。
 
-    返回 (分组列表, 说明)。每组 = {"length": 中位长度, "unit": "英尺/像素",
+    做法：按类别把中心点连成一簇簇 —— 两个框中心相距 ≤ gap_ratio × 页面长边就算同一簇
+    （单链接，图纸阵列里支架挨得近，整片阵列是一簇；角落里单独的细节图是另一簇）。
+    只保留**框最多的那一簇**，其余全删（"离大部分位置很远的一律删掉"）。
+    该类框少于 min_count 个时不动（样本太少，分不出主体）。
+    返回 (保留的检测, {"removed": n, "by_label": {类: n}})。
+    """
+    if not dets:
+        return dets, {"removed": 0, "by_label": {}}
+    W, H = float(width or 0), float(height or 0)
+    if not W or not H:
+        return dets, {"removed": 0, "by_label": {}}
+    tol = gap_ratio * max(W, H)
+    by_label = {}
+    for d in dets:
+        by_label.setdefault((d.get("label") or "").strip(), []).append(d)
+    kill = set()
+    by = {}
+    for lab, arr in by_label.items():
+        if len(arr) < min_count:
+            continue
+        cs = []
+        for d in arr:
+            b = d.get("bbox") or {}
+            cs.append(((b.get("x1", 0) + b.get("x2", 0)) / 2.0,
+                       (b.get("y1", 0) + b.get("y2", 0)) / 2.0))
+        # 并查集（单链接聚类）
+        par = list(range(len(cs)))
+
+        def find(i):
+            while par[i] != i:
+                par[i] = par[par[i]]
+                i = par[i]
+            return i
+
+        for i in range(len(cs)):
+            for j in range(i + 1, len(cs)):
+                dx = cs[i][0] - cs[j][0]
+                dy = cs[i][1] - cs[j][1]
+                if dx * dx + dy * dy <= tol * tol:
+                    a, b_ = find(i), find(j)
+                    if a != b_:
+                        par[a] = b_
+        cnt = {}
+        for i in range(len(cs)):
+            r = find(i)
+            cnt[r] = cnt.get(r, 0) + 1
+        main = max(cnt, key=lambda k2: cnt[k2]) if cnt else None
+        if main is None:
+            continue
+        for d, i in zip(arr, range(len(cs))):
+            if find(i) != main:
+                kill.add(id(d))
+                by[lab] = by.get(lab, 0) + 1
+    if not kill:
+        return dets, {"removed": 0, "by_label": {}}
+    return [d for d in dets if id(d) not in kill], {"removed": len(kill), "by_label": by}
+
+
+def rack_length_groups(per_page, text_items_of, dpi=RENDER_DPI, tol=0.10):
+    """整册支架按长度聚类，长度直接用框长（页面像素）。
+
+    不再读图纸比例尺换算英尺（用户要求：就用本身长度）。按长度差 ≤tol 分档，
+    同一档的框长本身一致（同分辨率渲染），不需要比例尺也分得对。
+    返回 (分组列表, 说明)。每组 = {"length": 中位长度, "unit": "像素",
                                     "count": 根数, "pages": {页号: 根数}}
     """
-    import lbd_naming as N
     items = []
-    scales = {}
-    for pg, res in per_page.items():
-        ts = text_items_of(pg) if text_items_of else []
-        sc, _why = N.read_page_scale(ts) if ts else (None, "")
-        if sc:
-            scales[pg] = sc
-    dom = None
-    if scales:
-        cnt = {}
-        for v in scales.values():
-            cnt[round(v, 3)] = cnt.get(round(v, 3), 0) + 1
-        dom = max(cnt, key=lambda k: cnt[k])
-    use_ft = bool(scales)
     for pg, res in sorted(per_page.items()):
         for d in res["detections"]:
             if d["label"] != "Tracker":
                 continue
             b = d["bbox"]
             L = max(b["x2"] - b["x1"], b["y2"] - b["y1"])
-            if use_ft:
-                L = (L / float(dpi)) * (scales.get(pg) or dom)
             items.append((L, pg))
     if not items:
         return [], ""
@@ -452,13 +499,11 @@ def rack_length_groups(per_page, text_items_of, dpi=RENDER_DPI, tol=0.10):
         pages = {}
         for _L, pg in g:
             pages[pg] = pages.get(pg, 0) + 1
-        out.append({"length": ls[len(ls) // 2], "unit": "英尺" if use_ft else "像素",
+        out.append({"length": ls[len(ls) // 2], "unit": "像素",
                     "count": len(g), "pages": pages})
     note = "整册 %d 根支架，按长度差≤10%% 分成 %d 档：%s" % (
         len(items), len(out),
         "；".join("%.1f%s %d 根" % (g["length"], g["unit"], g["count"]) for g in out))
-    if use_ft:
-        note += "（长度已按每页比例尺折算）"
     return out, note
 
 
@@ -507,6 +552,12 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
             if log:
                 log("第 %s 页：去掉 %d 个重叠框（%d -> %d）"
                     % (pg, _dd.get("by_overlap"), _dd.get("total", 0), len(dets)))
+        # 离群框：离"这一页大部分同类框"很远的（图纸角落的误检）直接丢掉
+        dets, _od = drop_outliers(dets, im.width, im.height)
+        if _od.get("removed") and log:
+            log("第 %s 页：去掉 %d 个离群框（%s）"
+                % (pg, _od["removed"],
+                   "、".join("%s %d" % (k, v) for k, v in (_od.get("by_label") or {}).items())))
         per_page[pg] = {"width": im.width, "height": im.height, "detections": dets}
         text_of[pg] = _text_of(pg) if pdf_path else []
         if progress:
@@ -533,6 +584,14 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
         num_set = set((sheets.get(sheet) or {}).keys()) if sheet else set()
         shapes = _shapes_of(r["detections"])
         st = N.autofill_shapes(shapes, ts, sheet, num_set, r["width"], r["height"])
+        # 读不到具体编号的：先把同页公共前缀（如 INV11A101-LBD-）填上，
+        # 用户只要补后面的数字（生成 L 行时前缀-only 的仍算"没名字"，不会画出半截标签）
+        _pref = N.lbd_prefix_of([s.get("name") for s in shapes
+                                 if s.get("label") == "Node"])
+        if _pref:
+            for s in shapes:
+                if s.get("label") == "Node" and not (s.get("name") or "").strip():
+                    s["name"] = _pref
         # 写回：名字 + 位置（label_pos / label_bbox）挂回检测框
         for d, s in zip(r["detections"], shapes):
             d["raw"] = s.get("raw") or {}
@@ -554,22 +613,8 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
     groups, gnote = rack_length_groups(per_page, lambda pg: text_of.get(pg) or [], dpi=dpi)
     # 每根支架的长度也写进 raw —— 「支架类型」的应用 / 点档位跳转 / 右栏项目树都按长度
     # 匹配，以前这里不写，这三处全都对不上（界面上表现为 0 根支架标上串数、树里全是 ?）。
-    # 英尺优先（按该页比例尺折算）；这页读不到比例尺就按整册最常见的那把；一把都没有则只存像素。
-    scales = {}
-    for pg in per_page:
-        ts = text_of.get(pg) or []
-        sc, _why = N.read_page_scale(ts) if ts else (None, "")
-        if sc:
-            scales[pg] = sc
-    dom = None
-    if scales:
-        cnt = {}
-        for v in scales.values():
-            cnt[round(v, 3)] = cnt.get(round(v, 3), 0) + 1
-        dom = max(cnt, key=lambda k: cnt[k])
-    unit_ft = bool(scales)
+    # 长度就用框长（页面像素），不再读图纸比例尺换算英尺（用户要求）
     for pg, r in per_page.items():
-        sc = scales.get(pg) or dom
         for d in r["detections"]:
             if d["label"] != "Tracker":
                 continue
@@ -577,21 +622,14 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
             L = max(b["x2"] - b["x1"], b["y2"] - b["y1"])
             raw = dict(d.get("raw") or {})
             raw["len_px"] = round(L, 2)
-            if unit_ft and sc:
-                raw["len_ft"] = round((L / float(dpi)) * sc, 2)
             d["raw"] = raw
     if rack_strings and groups:
         for pg, r in per_page.items():
-            sc = scales.get(pg) or dom
             for d in r["detections"]:
                 if d["label"] != "Tracker":
                     continue
                 b = d["bbox"]
                 L = max(b["x2"] - b["x1"], b["y2"] - b["y1"])
-                if unit_ft:
-                    if not sc:            # 比例尺一把都没读到，长度对不上档 -> 不猜
-                        continue
-                    L = (L / float(dpi)) * sc
                 best, bd = None, None
                 for g in groups:
                     dlt = abs(L - g["length"])
@@ -605,9 +643,9 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
                     d["raw"]["strings"] = rack_strings[key]
 
     doc = debug_json(pdf_path, per_page)
-    # 比例尺也写进 JSON：下游（应用支架类型 / 右栏项目树）算长度要用，写进去就不用再读一遍图纸
-    doc["page_scales"] = {str(pg): round(float(sc), 4) for pg, sc in scales.items()}
-    doc["scale_dominant"] = (round(float(dom), 4) if dom else None)
+    # 不再读图纸比例尺：长度直接是框长（像素）。这两个键保留成空值，老下游读到也不会出错
+    doc["page_scales"] = {}
+    doc["scale_dominant"] = None
     # 名字记录（下游按 node_bbox 对名字、按 label_pos/label_bbox 避让）
     ocr = []
     for pg, r in sorted(per_page.items()):
