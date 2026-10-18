@@ -406,7 +406,10 @@ def dedup_dets(dets):
 
 
 def drop_outliers(dets, width, height, min_count=8, gap_ratio=0.10):
-    """去掉离「主体」很远的框（同一张图上的细节图 / 角落误检）。
+    """【暂未启用】去掉离「主体」很远的框（同一张图上的细节图 / 角落误检）。
+
+    注意：实测这套判据删得太多（阵列边缘 / 细节图会被误删），
+    detect_and_name 里已经不去调它了；等阈值和判据调稳再启用。
 
     做法：按类别把中心点连成一簇簇 —— 两个框中心相距 ≤ gap_ratio × 页面长边就算同一簇
     （单链接，图纸阵列里支架挨得近，整片阵列是一簇；角落里单独的细节图是另一簇）。
@@ -552,12 +555,8 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
             if log:
                 log("第 %s 页：去掉 %d 个重叠框（%d -> %d）"
                     % (pg, _dd.get("by_overlap"), _dd.get("total", 0), len(dets)))
-        # 离群框：离"这一页大部分同类框"很远的（图纸角落的误检）直接丢掉
-        dets, _od = drop_outliers(dets, im.width, im.height)
-        if _od.get("removed") and log:
-            log("第 %s 页：去掉 %d 个离群框（%s）"
-                % (pg, _od["removed"],
-                   "、".join("%s %d" % (k, v) for k, v in (_od.get("by_label") or {}).items())))
+        # 离群框过滤先停用：实测删得太多（细节图/阵列边缘会被误删）。
+        # drop_outliers() 留着，等判据调好再在这里接回来。
         per_page[pg] = {"width": im.width, "height": im.height, "detections": dets}
         text_of[pg] = _text_of(pg) if pdf_path else []
         if progress:
