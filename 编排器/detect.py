@@ -552,18 +552,44 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
                                    st.get("missed"))))
 
     groups, gnote = rack_length_groups(per_page, lambda pg: text_of.get(pg) or [], dpi=dpi)
+    # 每根支架的长度也写进 raw —— 「支架类型」的应用 / 点档位跳转 / 右栏项目树都按长度
+    # 匹配，以前这里不写，这三处全都对不上（界面上表现为 0 根支架标上串数、树里全是 ?）。
+    # 英尺优先（按该页比例尺折算）；这页读不到比例尺就按整册最常见的那把；一把都没有则只存像素。
+    scales = {}
+    for pg in per_page:
+        ts = text_of.get(pg) or []
+        sc, _why = N.read_page_scale(ts) if ts else (None, "")
+        if sc:
+            scales[pg] = sc
+    dom = None
+    if scales:
+        cnt = {}
+        for v in scales.values():
+            cnt[round(v, 3)] = cnt.get(round(v, 3), 0) + 1
+        dom = max(cnt, key=lambda k: cnt[k])
+    unit_ft = bool(scales)
+    for pg, r in per_page.items():
+        sc = scales.get(pg) or dom
+        for d in r["detections"]:
+            if d["label"] != "Tracker":
+                continue
+            b = d["bbox"]
+            L = max(b["x2"] - b["x1"], b["y2"] - b["y1"])
+            raw = dict(d.get("raw") or {})
+            raw["len_px"] = round(L, 2)
+            if unit_ft and sc:
+                raw["len_ft"] = round((L / float(dpi)) * sc, 2)
+            d["raw"] = raw
     if rack_strings and groups:
-        unit_ft = groups[0]["unit"] == "英尺"
         for pg, r in per_page.items():
-            ts = text_of.get(pg) or []
-            sc, _why = N.read_page_scale(ts) if ts else (None, "")
+            sc = scales.get(pg) or dom
             for d in r["detections"]:
                 if d["label"] != "Tracker":
                     continue
                 b = d["bbox"]
                 L = max(b["x2"] - b["x1"], b["y2"] - b["y1"])
                 if unit_ft:
-                    if not sc:            # 这页比例尺没读到，长度对不上档 -> 不猜
+                    if not sc:            # 比例尺一把都没读到，长度对不上档 -> 不猜
                         continue
                     L = (L / float(dpi)) * sc
                 best, bd = None, None
@@ -579,6 +605,9 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
                     d["raw"]["strings"] = rack_strings[key]
 
     doc = debug_json(pdf_path, per_page)
+    # 比例尺也写进 JSON：下游（应用支架类型 / 右栏项目树）算长度要用，写进去就不用再读一遍图纸
+    doc["page_scales"] = {str(pg): round(float(sc), 4) for pg, sc in scales.items()}
+    doc["scale_dominant"] = (round(float(dom), 4) if dom else None)
     # 名字记录（下游按 node_bbox 对名字、按 label_pos/label_bbox 避让）
     ocr = []
     for pg, r in sorted(per_page.items()):
@@ -596,7 +625,9 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
                    "matched_table_name": None,
                    "preliminary_node_name": d.get("name") or "",
                    "error": None,
-                   "node_bbox": {"x1": b["x1"], "y1": b["y1"], "x2": b["x2"], "y2": b["y2"]},
+                   # 和 debug_json 里检测框一样取 2 位小数：两边坐标必须完全一致，
+                   # 不然差 0.1 像素下游就按 bbox 找不到名字（LBD 标签会整行丢掉）
+                   "node_bbox": {k: round(float(b[k]), 2) for k in ("x1", "y1", "x2", "y2")},
                    "final_node_name": d.get("name") or ""}
             if raw.get("label_pos"):
                 rec["label_pos"] = list(raw["label_pos"])

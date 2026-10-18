@@ -336,6 +336,32 @@ def _assign_parent(tb, nodes):
     return best if best_ratio > 0.02 else None
 
 
+def rec_for_box(b, recs, by_key=None):
+    """按 bbox 找这个 LBD 区的名字记录：先精确比，对不上再按重叠最大（IoU≥0.85）配。
+
+    识别时检测框坐标做过两位小数取整、ocr 记录里存的是原值 —— 差 0.1 像素就精确对不上，
+    LBD 标签的 L 行会整行丢掉（CAD 那边拿不到名字就不画标签）。这里兜一手。
+    """
+    if not b or not all(k in b for k in ("x1", "y1", "x2", "y2")):
+        return None
+    key = (round(b["x1"], 1), round(b["y1"], 1), round(b["x2"], 1), round(b["y2"], 1))
+    if by_key is not None:
+        r = by_key.get(key)
+        if r is not None:
+            return r
+    best, bi = None, 0.0
+    for r in recs or []:
+        nb = r.get("node_bbox") or {}
+        if not all(k in nb for k in ("x1", "y1", "x2", "y2")):
+            continue
+        inter = _inter(b, nb)
+        uni = _area(b) + _area(nb) - inter
+        iou = inter / uni if uni > 0 else 0.0
+        if iou > bi:
+            best, bi = r, iou
+    return best if bi >= 0.85 else None
+
+
 def extract_lbd_typical(json_path, out_dir, csv_encoding="utf-8-sig", want_symbols=True):
     """读 debug JSON -> 写 lbd_regions.csv / typicals.csv / lbd_symbols.csv /
     pages.csv / lbd_typical.json。返回结果摘要 dict(不抛异常)。"""
@@ -404,7 +430,7 @@ def extract_lbd_typical(json_path, out_dir, csv_encoding="utf-8-sig", want_symbo
         for i, n in enumerate(nodes):
             b = n["bbox"]
             key = (round(b["x1"], 1), round(b["y1"], 1), round(b["x2"], 1), round(b["y2"], 1))
-            rec = name_by_box.get(key) or {}
+            rec = rec_for_box(b, ocr_pages.get(page) or [], name_by_box) or {}
             name = rec.get("final_node_name") or rec.get("preliminary_node_name")
             regions.append({
                 "page": page,
@@ -1344,14 +1370,13 @@ def lbd_mark_boxes(json_path, page_map=None, thick_scale=1.3, adv=0.55, pad=0.35
                                       t["bbox"]["y2"] - t["bbox"]["y1"]) for t in typs]) * 1.4
         if not t_str:                      # 本页没有支架框：按页高估一个，别让框塌成 0
             t_str = H * 0.005
-        named = {}
+        named, recs_pg, rec_by_key = {}, (ocr.get(pg) or []), {}
         for r in ocr.get(pg) or []:
             nb = r.get("node_bbox") or {}
             if not all(k in nb for k in ("x1", "y1", "x2", "y2")):
                 continue
             k = (round(nb["x1"], 1), round(nb["y1"], 1), round(nb["x2"], 1), round(nb["y2"], 1))
-            named[k] = (r.get("final_node_name") or r.get("preliminary_node_name")
-                        or r.get("matched_table_name") or "").strip()
+            rec_by_key[k] = r
         boxes = []
         for d in dets:
             if (d.get("label") or "").strip().lower() != "node":
@@ -1359,8 +1384,9 @@ def lbd_mark_boxes(json_path, page_map=None, thick_scale=1.3, adv=0.55, pad=0.35
             b = d.get("bbox") or {}
             if not all(k in b for k in ("x1", "y1", "x2", "y2")):
                 continue
-            k = (round(b["x1"], 1), round(b["y1"], 1), round(b["x2"], 1), round(b["y2"], 1))
-            nm = named.get(k, "")
+            rec = rec_for_box(b, recs_pg, rec_by_key) or {}
+            nm = (rec.get("final_node_name") or rec.get("preliminary_node_name")
+                  or rec.get("matched_table_name") or "").strip()
             if not nm:
                 continue                       # 这个区域没有编号 -> CAD 也不画，不用避
             bw, bh = b["x2"] - b["x1"], b["y2"] - b["y1"]
@@ -1991,6 +2017,7 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
     tmap, note = (rack_type_indices(trk, page_size, types, split_map) if types else ({}, ""))
     counts = {}                       # 类型下标 -> [拆几行, 列数]（只为日志）
     lines, n_lbd, n_str, n_pages = [], 0, 0, 0
+    unnamed = []                       # [(图纸页号, 第几个 LBD)]：有框但没名字 -> CAD 不画标签
     # 全册统一 STR 字高（同 rack_lines_from_debug）
     gratio = _global_short_ratio(page_size, trk)
     for pg in sorted(p for p in trk if isinstance(p, int)):
@@ -2006,21 +2033,21 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
         n_pages += 1
 
         # Node 名称：OCR 结果按 node_bbox 对上（坐标一致，做了 0.1 像素取整）
-        name_by_key = {}
+        rec_by_key, recs_pg = {}, ocr.get(pg) or []
         for r in ocr.get(pg) or []:
             nb = r.get("node_bbox") or {}
             if not all(k in nb for k in ("x1", "y1", "x2", "y2")):
                 continue
             key = (round(nb["x1"], 1), round(nb["y1"], 1),
                    round(nb["x2"], 1), round(nb["y2"], 1))
-            name_by_key[key] = (r.get("final_node_name")
-                                or r.get("preliminary_node_name") or "").strip()
-        for n in nodes:
+            rec_by_key[key] = r
+        for ni, n in enumerate(nodes, 1):
             b = n["bbox"]
-            key = (round(b["x1"], 1), round(b["y1"], 1),
-                   round(b["x2"], 1), round(b["y2"], 1))
-            n["name"] = name_by_key.get(key, "")
+            rec = rec_for_box(b, recs_pg, rec_by_key) or {}
+            n["name"] = (rec.get("final_node_name")
+                         or rec.get("preliminary_node_name") or "").strip()
             if not n["name"]:
+                unnamed.append((pg_out, ni))
                 continue
             cx, cy = _center(b)
             # 第 7 列 = LBD 区域(Node)宽 / 页高：CAD 端字高 = 该比例 x 底图高 x 倍数(1.4)
@@ -2099,6 +2126,7 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
     except Exception as e:
         return {"ok": False, "error": "写提取文件失败：%s" % e}
     return {"ok": True, "lines": len(lines), "lbd": n_lbd, "str": n_str,
+            "unnamed": unnamed,
             "pages": n_pages, "path": os.path.abspath(out_path),
             "split": note or split_note(counts), "quad": quad_counts}
 
@@ -2286,17 +2314,17 @@ def preview_group(json_path, order=DEFAULT_STR_ORDER, prefix="STR", digits=2, sp
         nodes, typs = _page_boxes((trk.get(pg) or {}).get("detections"))
         if not typs or not nodes:
             continue
-        for r in ocr.get(pg) or []:
+        recs_pg, rec_by_key = (ocr.get(pg) or []), {}
+        for r in recs_pg:
             nb = r.get("node_bbox") or {}
             if not all(k in nb for k in ("x1", "y1", "x2", "y2")):
                 continue
             key = (round(nb["x1"], 1), round(nb["y1"], 1), round(nb["x2"], 1), round(nb["y2"], 1))
-            nm = (r.get("final_node_name") or r.get("preliminary_node_name") or "").strip()
-            for n in nodes:
-                b = n["bbox"]
-                if key == (round(b["x1"], 1), round(b["y1"], 1),
-                           round(b["x2"], 1), round(b["y2"], 1)):
-                    n["name"] = nm
+            rec_by_key[key] = r
+        for n in nodes:
+            rec = rec_for_box(n["bbox"], recs_pg, rec_by_key) or {}
+            n["name"] = (rec.get("final_node_name")
+                         or rec.get("preliminary_node_name") or "").strip()
         groups, heights = {}, []
         for ti, t in enumerate(typs):
             b = t["bbox"]
