@@ -10,9 +10,200 @@
 import re
 
 
+KEEP_MANUAL_IOU = 0.3
+
+
+# 去重叠判据（用户要求：重叠 30% 以上就算画重了）
+#   DUP_IOU      —— 交并比（IoU）达到这个值
+#   MIN_OVERLAP  —— 交叠面积占「较小那个框」的比例达到这个值
+# 两个判据满足任意一个就去掉一个（留置信度高的）。
+DUP_IOU = 0.3
+
+
+MIN_OVERLAP = 0.3
+
+
+TRACKER_AR = 0.1
+# 同类别的两个框，如果一个有 90% 以上落在另一个里面，也算重复（"套着"的那种）。
+# 依据：现有 76752 个标注框里，同类嵌套的对数是 0 —— 所以这条不会误伤。
+
+
+CONTAIN_RATIO = 0.9
+
+
+def _bbox_iou(a, b):
+    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0.0, x2 - x1), max(0.0, y2 - y1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    ua = ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+    return inter / ua if ua > 0 else 0.0
+
+
+def _bbox_area(b):
+    return max(0.0, abs(b[2] - b[0])) * max(0.0, abs(b[3] - b[1]))
+
+
+def _is_duplicate_pair(a, b):
+    """两个同类框算不算"画重了"：交并比够大，或者交叠面积占较小框的 30% 以上。"""
+    if _bbox_iou(a, b) >= DUP_IOU:
+        return True
+    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    if inter <= 0:
+        return False
+    smaller = min(_bbox_area(a), _bbox_area(b))
+    # 含「一个几乎套在另一个里面」的情况：那会儿 inter/smaller 接近 1，也 ≥ MIN_OVERLAP
+    return smaller > 0 and inter / smaller >= MIN_OVERLAP
+
+
+# 哪个 source 算"模型画的框"。
+# 标注工具写 "model" / "onnxruntime:tracker"；主程序识别链路（detect.py）写的是 "v4c-onnx"。
+# 以前只认 "model"，主程序识别出来的框就全被当成人工框 → clean_shapes 一开始就
+# "没有模型框" 直接返回，去重叠一个都没删（这就是"识别过后去重叠不生效"）。
+_MODEL_HINTS = ("model", "onnx", "yolo", "v4c")
+_HUMAN_SOURCES = ("manual", "human", "user", "hand", "人工")
+
+
+def _is_model_shape(s):
+    src = (s.get("source") or "").strip().lower()
+    if not src or src in _HUMAN_SOURCES:
+        return False
+    return any(k in src for k in _MODEL_HINTS)
+
+
 def _has_read_name(s):
     """框里真的读到过编号文字（排除"按标签表位置补的号"——那个是猜的）。"""
     return bool((s.get("name") or "").strip()) and not s.get("_auto")
+
+
+def clean_shapes(shapes, keep_manual=True, use_number=True, use_shape=True,
+                 clean_manual=False):
+    """清理多余的框。返回 (保留的框列表, 统计)。
+
+    默认只删模型画的框（人工框不动）。clean_manual=True 时多做一遍：
+    同类别的**人工框**之间如果互相重叠 >= DUP_IOU，也只留一个
+    （优先留框里真读到过编号的，其次留置信度高的，最后留大的）。
+    """
+    stats = {"total": len(shapes), "manual": 0, "kept_manual": 0, "by_manual": 0,
+             "by_number": 0, "by_overlap": 0, "by_shape": 0, "manual_dup": 0,
+             "removed": 0, "kept": 0}
+    manual = [s for s in shapes if not _is_model_shape(s)]
+    models = [s for s in shapes if _is_model_shape(s)]
+    stats["manual"] = len(manual)
+    # 注意：这里不能在 clean_manual=True 时提前返回 —— 否则"整页都是手工框"
+    # 的情况（没跑过识别、只想清理旧标注）就永远走不到第 5 步。
+    if not models and not clean_manual:
+        stats["kept"] = len(shapes)
+        return list(shapes), stats
+
+    dropped = set()
+
+    # 1) 人工优先
+    if keep_manual:
+        for m in models:
+            mb = m.get("bbox")
+            if not mb:
+                continue
+            for h in manual:
+                hb = h.get("bbox")
+                if hb and h.get("label") == m.get("label") and _bbox_iou(mb, hb) >= KEEP_MANUAL_IOU:
+                    dropped.add(id(m))
+                    stats["by_manual"] += 1
+                    break
+
+    # 4) 形状离谱（先做，免得带进后面的配对）
+    if use_shape:
+        for m in models:
+            if id(m) in dropped or m.get("label") != "Tracker":
+                continue
+            b = m.get("bbox")
+            if not b:
+                continue
+            w, h = abs(b[2] - b[0]), abs(b[3] - b[1])
+            if h > 0 and w / h > TRACKER_AR:
+                dropped.add(id(m))
+                stats["by_shape"] += 1
+
+    # 2) 同编号
+    if use_number:
+        groups = {}
+        for m in models:
+            if id(m) in dropped or not _has_read_name(m):
+                continue
+            key = ((m.get("name") or "").strip().lower(), m.get("label"))
+            groups.setdefault(key, []).append(m)
+        for g in groups.values():
+            if len(g) < 2:
+                continue
+            g.sort(key=lambda s: (-float(s.get("confidence") or 0.0),
+                                  _bbox_area(s.get("bbox") or [0, 0, 0, 0])))
+            for extra in g[1:]:
+                dropped.add(id(extra))
+                stats["by_number"] += 1
+
+    # 3) 高重叠
+    alive = [m for m in models if id(m) not in dropped and m.get("bbox")]
+    for i in range(len(alive)):
+        a = alive[i]
+        if id(a) in dropped:
+            continue
+        for j in range(i + 1, len(alive)):
+            b = alive[j]
+            if id(b) in dropped or a.get("label") != b.get("label"):
+                continue
+            if _is_duplicate_pair(a["bbox"], b["bbox"]):
+                # 留置信度高的（同一物体两次识别，置信度高的那次通常更靠谱），
+                # 置信度一样再留面积小的（一般更贴）。
+                key_a = (float(a.get("confidence") or 0.0), -_bbox_area(a["bbox"]))
+                key_b = (float(b.get("confidence") or 0.0), -_bbox_area(b["bbox"]))
+                if key_a >= key_b:
+                    dropped.add(id(b))
+                    stats["by_overlap"] += 1
+                else:
+                    dropped.add(id(a))
+                    stats["by_overlap"] += 1
+                    break
+
+    # 5) 人工框之间的重复（默认不做，要调用方明确要求）
+    if clean_manual:
+        rest = [s for s in shapes if id(s) not in dropped and s.get("bbox")]
+        for i in range(len(rest)):
+            a = rest[i]
+            if id(a) in dropped:
+                continue
+            for j in range(i + 1, len(rest)):
+                b = rest[j]
+                if id(b) in dropped or a.get("label") != b.get("label"):
+                    continue
+                if not _is_duplicate_pair(a["bbox"], b["bbox"]):
+                    continue
+                # 留哪个：框里真读到过编号 > 置信度高 > 面积大
+                key_a = (bool(_has_read_name(a)), float(a.get("confidence") or 0.0),
+                         _bbox_area(a["bbox"]))
+                key_b = (bool(_has_read_name(b)), float(b.get("confidence") or 0.0),
+                         _bbox_area(b["bbox"]))
+                if key_a >= key_b:
+                    dropped.add(id(b))
+                    stats["manual_dup"] += 1
+                else:
+                    dropped.add(id(a))
+                    stats["manual_dup"] += 1
+                    break
+
+    # 锁定的框一律保留：用户锁上就是明确说"别动它"，清理也不许删
+    for s in shapes:
+        if s.get("locked"):
+            dropped.discard(id(s))
+
+    out = [s for s in shapes if id(s) not in dropped]
+    stats["removed"] = len(shapes) - len(out)
+    stats["kept"] = len(out)
+    stats["kept_manual"] = len(manual)
+    return out, stats
 
 
 def _pdf_rotate(page):
@@ -313,6 +504,25 @@ def read_sheet_width_in(items):
             if a > 1 and b > 1:
                 return max(a, b)
     return None
+
+
+def lbd_prefix_of(names):
+    """同一页几个 LBD 名字的公共前缀（去掉末尾数字）：`INV11A101-LBD-`。
+
+    给"读不到具体编号"的 LBD 填前缀用 —— 用户只要在后面补数字，不用整段重打。
+    """
+    from collections import Counter
+    pres = []
+    for nm in names or []:
+        s = str(nm or "").strip()
+        if not s:
+            continue
+        p = re.sub(r"\d+$", "", s)
+        if p and p != s:
+            pres.append(p)
+    if not pres:
+        return ""
+    return Counter(pres).most_common(1)[0][0]
 
 
 def _name_num(name):

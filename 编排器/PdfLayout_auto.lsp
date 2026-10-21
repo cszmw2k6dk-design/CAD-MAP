@@ -15,7 +15,43 @@
 (setq *PdfLayout_LbdAvoidOn* T)
 
 ;;; 进度写入(覆盖写，供外部轮询)
+;; ==== user stop gate ==================================================
+;; The orchestrator writes %TEMP%/vcad_stop.flag when the user clicks
+;; Stop. Every progress point checks that file; once it appears the run
+;; skips the remaining phases and reports STOPPED_DONE. ASCII only.
+(defun PdfLayout_StopWanted ( / p)
+  (setq p (strcat (getvar "TEMPPREFIX") "vcad_stop.flag"))
+  (if (and p (findfile p)) T nil)
+)
+
+(defun PdfLayout_StopNote (tag / f)
+  (if (not *PdfLayout_Stopped*)
+    (progn
+      (setq *PdfLayout_Stopped* T)
+      (if *PdfLayout_ProgPath*
+        (vl-catch-all-apply
+          '(lambda (/ f)
+            (setq f (open *PdfLayout_ProgPath* "a"))
+            (if f (progn (princ (strcat "STOPPED " tag) f) (princ "\n" f) (close f))))
+          nil))
+      (princ (strcat "\n[PDFAUTO] STOPPED: user asked to stop (" tag ").\n"))
+    )
+  )
+  *PdfLayout_Stopped*
+)
+
+;; returns T when stopped (use it inside heavy steps)
+(defun PdfLayout_StopGate (tag)
+  (if (PdfLayout_StopWanted)
+    (PdfLayout_StopNote tag)
+    *PdfLayout_Stopped*
+  )
+)
+
+(setq *PdfLayout_Stopped* nil)
+
 (defun PdfLayout_Prog (msg / _ar)
+  (PdfLayout_StopGate "prog")
   (if *PdfLayout_ProgPath*
     (vl-catch-all-apply
       '(lambda (/ f)
@@ -753,7 +789,7 @@
       (foreach nm names
         (setq tPg0 (PdfLayout_NowMs))
         (setq bb (nth i draws) r (nth i regs))
-        (if (and bb r (PdfLayout_GetLayoutObj nm))
+        (if (and (not (PdfLayout_StopGate "region-fit")) bb r (PdfLayout_GetLayoutObj nm))
           (progn
             (setq box (PdfLayout_AutoRegionBox bb r))
             (command ".-LAYOUT" "_S" nm "")
@@ -792,6 +828,7 @@
 
 (defun PdfLayout_AutoRun (iniPath progPath / cfg tmpl2 names2 xlsx2 pdf outdir newname base fname newpath py nUnder countVal bgc gapc)
   (setq *PdfLayout_ProgPath* progPath)
+  (setq *PdfLayout_Stopped* nil)
   (setq *PdfLayout_NoAlert* T)
   (vl-load-com)
   (setq cfg (PdfLayout_ReadAutoConfig iniPath))
@@ -840,6 +877,7 @@
         )
       )
       (vl-catch-all-apply 'PdfLayout_Execute nil)
+      (PdfLayout_StopGate "after-draw")
       ;; 布局建好后按识别到的 LBD 区域上下限再对准一次视口（不是按整页）
       (if (and names2 (= (PdfLayout_ACfg cfg "regionFit" "1") "1"))
         (vl-catch-all-apply 'PdfLayout_AutoRegionFit
@@ -851,12 +889,12 @@
   (setq bgc (atoi (PdfLayout_ACfg cfg "labelBgColor" "1")))
   (setq gapc (atof (PdfLayout_ACfg cfg "labelBgGap" "1.0")))
   (setq pdf (PdfLayout_ACfg cfg "pdf" ""))
-  (if (and pdf (/= pdf ""))
+  (if (and (not *PdfLayout_Stopped*) pdf (/= pdf ""))
     (PdfLayout_LbdAuto pdf (PdfLayout_ACfg cfg "xlsx" "") (PdfLayout_ACfg cfg "pageStart" "1") (if (> (atoi (PdfLayout_ACfg cfg "importPages" "0")) 0) (PdfLayout_ACfg cfg "importPages" "0") (PdfLayout_ACfg cfg "pageEnd" "0")) (atof (PdfLayout_ACfg cfg "textHeight" "0")) (PdfLayout_ACfg cfg "labelWhere" "M") (atoi (PdfLayout_ACfg cfg "labelBgColor" "1")) (atof (PdfLayout_ACfg cfg "labelBgGap" "1.0")) (atoi (PdfLayout_ACfg cfg "labelTextColor" "7")))
   )
   (setq outdir (PdfLayout_ACfg cfg "outputDir" ""))
   ;; Auto save off by default: the orchestrator saves from the UI after the run.
-  (if (and outdir (/= outdir "") (= (PdfLayout_ACfg cfg "autoSave" "0") "1"))
+  (if (and (not *PdfLayout_Stopped*) outdir (/= outdir "") (= (PdfLayout_ACfg cfg "autoSave" "0") "1"))
     (progn
       (PdfLayout_Prog "STEP_SAVE")
       (setq newname (PdfLayout_ACfg cfg "newName" ""))
@@ -868,7 +906,7 @@
       (PdfLayout_Prog (strcat "SAVED " newpath))
     )
   )
-  (PdfLayout_Prog "DONE")
+  (PdfLayout_Prog (if *PdfLayout_Stopped* "STOPPED_DONE" "DONE"))
   (princ "\n[PDFAUTO] OK.\n")
   (princ)
 )
