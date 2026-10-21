@@ -59,11 +59,11 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_parse_split = _lr_split_rows = _lr_expand_racks = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.57"
+APP_VERSION = "2.58"
 # 这一版先不带「导出 PDF」：按钮和入口藏起来，代码保留（改成 True 就接回来）。
 FEATURE_EXPORT_PDF = False
-# 这一版先不上线「项目树」：入口和联动一起藏起来，实现保留（改成 True 就接回来）。
-FEATURE_RECOG_PROJECT_TREE = False
+# 识别页「项目树」：没有编号的 LBD 也会以「（没编号）」保留在树里。
+FEATURE_RECOG_PROJECT_TREE = True
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
