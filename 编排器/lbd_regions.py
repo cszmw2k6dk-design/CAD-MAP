@@ -2207,6 +2207,23 @@ def page_region_bounds(json_path):
                 cur[2] = max(cur[2], x2)
                 cur[3] = max(cur[3], y2)
 
+    # 保留表格信息时，把底部表格也纳入视口范围，让图纸阵列和表格同时可见。
+    for p in doc.get("table_recognition_results") or []:
+        pg = p.get("page_number")
+        result = (p.get("data") or {}).get("result") or {}
+        b = result.get("bbox")
+        if pg not in box or not (isinstance(b, list) and len(b) == 4):
+            continue
+        try:
+            x1, y1, x2, y2 = (float(v) for v in b)
+        except Exception:
+            continue
+        cur = box[pg]
+        cur[0] = min(cur[0], x1)
+        cur[1] = min(cur[1], y1)
+        cur[2] = max(cur[2], x2)
+        cur[3] = max(cur[3], y2)
+
     rows = []
     for pg in sorted(p for p in box if isinstance(p, int)):
         W, H = page_size.get(pg, (0, 0))

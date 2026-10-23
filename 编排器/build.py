@@ -91,7 +91,7 @@ def build_env():
 
 
 def main():
-    for need in ("app.py", "app.ico", "app_icon.png", "logo_blue.png",
+    for need in ("app.py", "table_regions.py", "app.ico", "app_icon.png", "logo_blue.png",
                  "PdfLayout_auto.lsp", "PdfLayout_ai.lsp"):
         if not os.path.exists(os.path.join(HERE, need)):
             raise SystemExit("缺少文件：%s" % os.path.join(HERE, need))
@@ -153,6 +153,7 @@ def main():
             "--add-data", data(os.path.join(HERE, "PdfLayout_auto.lsp")),
             "--add-data", data(os.path.join(HERE, "PdfLayout_ai.lsp")),
             "--add-data", data(plugin_lsp),
+            "--add-data", data(os.path.join(ROOT, "更新日志_EN.md")),
             "--collect-binaries", "PySide6", "--collect-binaries", "shiboken6",
             "--add-data", os.path.join(PYSP, "platforms") + SEP +
             os.path.join("PySide6", "plugins", "platforms"),
@@ -167,9 +168,14 @@ def main():
     else:
         log("  提示：没找到 %s（识别模型），打出来的包不能用「识别」页" % models_dir)
     args += ["--hidden-import", "detect", "--hidden-import", "lbd_naming",
+             "--hidden-import", "table_regions",
              "--hidden-import", "onnxruntime", "--hidden-import", "numpy",
              "--hidden-import", "PIL.Image", "--hidden-import", "pypdfium2",
-             "--collect-binaries", "onnxruntime"]
+             "--collect-binaries", "onnxruntime",
+             "--exclude-module", "pandas", "--exclude-module", "openpyxl",
+             "--exclude-module", "matplotlib", "--exclude-module", "tensorflow",
+             "--exclude-module", "rapidocr",
+             "--exclude-module", "rapidocr_onnxruntime"]
     for dll in ("VCRUNTIME140.dll", "VCRUNTIME140_1.dll", "msvcp140.dll", "concrt140.dll"):
         p = find_dll(dll)
         if p:

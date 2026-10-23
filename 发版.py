@@ -38,6 +38,7 @@ APP_PY = os.path.join(ORCH, "app.py")
 BUILD_PY = os.path.join(ORCH, "build.py")
 DIST_DIR = os.path.join(ORCH, "dist")
 NOTES_MD = os.path.join(ROOT, "更新日志.md")
+NOTES_EN_MD = os.path.join(ROOT, "更新日志_EN.md")
 
 VER_RE = re.compile(r'^APP_VERSION\s*=\s*"([^"]+)"', re.M)
 REPO_RE = re.compile(r'^UPDATE_REPO\s*=\s*"([^"]+)"', re.M)
@@ -247,9 +248,14 @@ def release_notes(note):
     parts = []
     if os.path.exists(NOTES_MD):
         try:
-            parts.append(read_text(NOTES_MD).strip())
+            parts.append("<!-- MAP-CAD:ZH -->\n" + read_text(NOTES_MD).strip())
         except Exception as e:
             log("  读更新日志失败：%s" % e)
+    if os.path.exists(NOTES_EN_MD):
+        try:
+            parts.append("<!-- MAP-CAD:EN -->\n" + read_text(NOTES_EN_MD).strip())
+        except Exception as e:
+            log("  读英文更新日志失败：%s" % e)
     if note:
         parts.append(note.strip())
     return "\n\n".join([p for p in parts if p])

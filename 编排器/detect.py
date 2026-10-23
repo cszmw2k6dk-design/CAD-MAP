@@ -344,7 +344,8 @@ def debug_json(pdf_path, results, pages_meta=None):
                          "class_id": d["class_id"],
                          "bbox": {"x1": round(d["bbox"]["x1"], 2), "y1": round(d["bbox"]["y1"], 2),
                                   "x2": round(d["bbox"]["x2"], 2), "y2": round(d["bbox"]["y2"], 2)},
-                         "source": "v4c-onnx", "raw": {}})
+                         "source": d.get("source") or "v4c-onnx",
+                         "raw": dict(d.get("raw") or {})})
         trk.append({"page_number": pg,
                     "data": {"model_type": "tracker",
                              "coordinates": "original_page_pixels",
@@ -367,7 +368,8 @@ def _shapes_of(dets):
     for d in dets:
         b = d["bbox"]
         out.append({"label": d["label"], "bbox": [b["x1"], b["y1"], b["x2"], b["y2"]],
-                    "confidence": d.get("confidence"), "raw": dict(d.get("raw") or {})})
+                    "confidence": d.get("confidence"), "name": d.get("name") or "",
+                    "raw": dict(d.get("raw") or {})})
     return out
 
 
@@ -512,7 +514,8 @@ def rack_length_groups(per_page, text_items_of, dpi=RENDER_DPI, tol=0.10):
 
 def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=RENDER_DPI,
                     session=None, conf=CONF_THRES, iou=IOU_THRES, progress=None,
-                    log=None, rack_strings=None):
+                    log=None, rack_strings=None, keep_tables=False,
+                    filter_interference=False):
     """识别整册（或指定页）+ 配 LBD 编号 + 支架长度分档 -> (agent3-debug dict, 摘要)。
 
     sheets     : {分表名: {LBD编号: 名称长度}}（来自标签文件；没有就传 None）
@@ -543,6 +546,19 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
     todo = list(pages) if pages else list(range(1, total + 1))
 
     per_page, text_of = {}, {}
+    table_by_page = {}
+    table_engine = None
+    table_module = None
+    filtered_total = 0
+    if keep_tables or filter_interference:
+        try:
+            import table_regions as table_module
+            if keep_tables:
+                table_engine = table_module.RapidOCR()
+        except Exception as e:
+            if log:
+                log("表格 OCR 未启用：%s" % e)
+            table_module = None
     for n, pg in enumerate(todo):
         if log:
             log("第 %s 页：渲染 + 推理…" % pg)
@@ -557,7 +573,38 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
                     % (pg, _dd.get("by_overlap"), _dd.get("total", 0), len(dets)))
         # 离群框过滤先停用：实测删得太多（细节图/阵列边缘会被误删）。
         # drop_outliers() 留着，等判据调好再在这里接回来。
+        if filter_interference and table_module is not None:
+            dets, _filt, good_nodes = table_module.filter_primary_array(
+                dets, im.width, im.height)
+            filtered_total += int((_filt or {}).get("removed") or 0)
+            if _filt.get("removed") and log:
+                log("第 %s 页：过滤图例/表格干扰框 %d 个（Node %d、Tracker %d）"
+                    % (pg, _filt.get("removed"), _filt.get("Node", 0),
+                       _filt.get("Tracker", 0)))
+        else:
+            good_nodes = [d for d in dets if d.get("label") == "Node"]
         per_page[pg] = {"width": im.width, "height": im.height, "detections": dets}
+        if table_module is not None:
+            if log:
+                log("第 %s 页：读取底部表格（OCR）…" % pg)
+            tinfo = table_module.extract_table(im, pg, dets, ocr=table_engine)
+            if tinfo.get("rows"):
+                table_by_page[pg] = tinfo
+                if filter_interference:
+                    named = table_module.assign_names_from_table(good_nodes, tinfo)
+                    if named:
+                        # 名字写到检测框后，_shapes_of 会原样交给命名流程。
+                        for d in good_nodes:
+                            d["name"] = d.get("name") or ""
+                        if log:
+                            log("第 %s 页：按表格顺序补了 %d 个 LBD 名" % (pg, named))
+                if log:
+                    log("第 %s 页：表格 %d 行，可信度 %.2f"
+                        % (pg, tinfo.get("row_count") or 0,
+                           tinfo.get("confidence") or 0.0))
+            elif log:
+                log("第 %s 页：没读到表格 LBD 行（%s）"
+                    % (pg, tinfo.get("error") or "empty"))
         text_of[pg] = _text_of(pg) if pdf_path else []
         if progress:
             try:
@@ -583,6 +630,16 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
         num_set = set((sheets.get(sheet) or {}).keys()) if sheet else set()
         shapes = _shapes_of(r["detections"])
         st = N.autofill_shapes(shapes, ts, sheet, num_set, r["width"], r["height"])
+        # 表格补出的 LBD 名优先保留：autofill_shapes 在文字层读不到时会重置 name。
+        for d, s in zip(r["detections"], shapes):
+            if d.get("label") == "Node" and (d.get("name") or "").strip() \
+                    and not (s.get("name") or "").strip():
+                s["name"] = d.get("name")
+                if (d.get("raw") or {}).get("name_source") == "table":
+                    raw = dict(s.get("raw") or {})
+                    raw["name_source"] = "table"
+                    raw["table_confidence"] = (d.get("raw") or {}).get("table_confidence")
+                    s["raw"] = raw
         # 读不到具体编号的：先把同页公共前缀（如 INV11A101-LBD-）填上，
         # 用户只要补后面的数字（生成 L 行时前缀-only 的仍算"没名字"，不会画出半截标签）
         _pref = N.lbd_prefix_of([s.get("name") for s in shapes
@@ -591,6 +648,9 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
             for s in shapes:
                 if s.get("label") == "Node" and not (s.get("name") or "").strip():
                     s["name"] = _pref
+        table_info = table_by_page.get(pg)
+        if table_module is not None and table_info:
+            table_module.apply_hints(shapes, table_info)
         # 写回：名字 + 位置（label_pos / label_bbox）挂回检测框
         for d, s in zip(r["detections"], shapes):
             d["raw"] = s.get("raw") or {}
@@ -626,6 +686,8 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
         for pg, r in per_page.items():
             for d in r["detections"]:
                 if d["label"] != "Tracker":
+                    continue
+                if (d.get("raw") or {}).get("strings_source") == "table":
                     continue
                 b = d["bbox"]
                 L = max(b["x2"] - b["x1"], b["y2"] - b["y1"])
@@ -674,8 +736,27 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
             recs.append(rec)
         ocr.append({"page_number": pg, "data": recs})
     doc["ocr_node_name_results"] = ocr
+    if table_by_page:
+        doc["table_recognition_results"] = [
+            {"page_number": pg, "data": {"result": table_by_page[pg]}}
+            for pg in sorted(table_by_page)
+        ]
+        doc["page_regions"] = {
+            str(pg): {
+                "table_bbox": table_by_page[pg].get("bbox"),
+                "table_bbox_normalized": table_by_page[pg].get("bbox_normalized"),
+            }
+            for pg in sorted(table_by_page)
+        }
+    table_tagged = sum(
+        1
+        for _pg, _r in per_page.items()
+        for _d in _r.get("detections") or []
+        if ((_d.get("raw") or {}).get("strings_source") == "table")
+    )
     summary = {"stat": stat, "groups": groups, "note": gnote,
-               "drawing_pages": drawing}
+               "drawing_pages": drawing, "table_pages": len(table_by_page),
+               "filtered_frames": filtered_total, "table_tagged": table_tagged}
     return doc, summary
 
 
