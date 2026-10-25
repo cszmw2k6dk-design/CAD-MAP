@@ -92,7 +92,7 @@ def build_env():
 
 def main():
     for need in ("app.py", "table_regions.py", "app.ico", "app_icon.png", "logo_blue.png",
-                 "PdfLayout_auto.lsp", "PdfLayout_ai.lsp"):
+                 "PdfLayout_auto.lsp", "PdfLayout_ai.lsp", "PdfLayout_lynx.lsp"):
         if not os.path.exists(os.path.join(HERE, need)):
             raise SystemExit("缺少文件：%s" % os.path.join(HERE, need))
     plugin_lsp = os.path.join(ROOT, "PdfLayout插件包", "PdfLayout.lsp")
@@ -152,6 +152,7 @@ def main():
             "--add-data", data(os.path.join(HERE, "logo_blue.png")),
             "--add-data", data(os.path.join(HERE, "PdfLayout_auto.lsp")),
             "--add-data", data(os.path.join(HERE, "PdfLayout_ai.lsp")),
+            "--add-data", data(os.path.join(HERE, "PdfLayout_lynx.lsp")),
             "--add-data", data(plugin_lsp),
             "--add-data", data(os.path.join(ROOT, "更新日志_EN.md")),
             "--collect-binaries", "PySide6", "--collect-binaries", "shiboken6",
@@ -205,6 +206,8 @@ def main():
                         os.path.join(DIST, "PdfLayout_auto.lsp"))
         shutil.copyfile(os.path.join(HERE, "PdfLayout_ai.lsp"),
                         os.path.join(DIST, "PdfLayout_ai.lsp"))
+        shutil.copyfile(os.path.join(HERE, "PdfLayout_lynx.lsp"),
+                        os.path.join(DIST, "PdfLayout_lynx.lsp"))
     except Exception as e:
         log("  复制附属 lsp 失败（不影响 exe）：%s" % e)
     if old and ONEDIR and os.path.isdir(old):

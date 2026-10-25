@@ -728,6 +728,8 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
                    # 不然差 0.1 像素下游就按 bbox 找不到名字（LBD 标签会整行丢掉）
                    "node_bbox": {k: round(float(b[k]), 2) for k in ("x1", "y1", "x2", "y2")},
                    "final_node_name": d.get("name") or ""}
+            rec["recognized_text"] = (raw.get("recognized_text")
+                                      or raw.get("label_text") or d.get("name") or "")
             if raw.get("label_pos"):
                 rec["label_pos"] = list(raw["label_pos"])
                 rec["label_src"] = raw.get("label_src") or "text_layer"

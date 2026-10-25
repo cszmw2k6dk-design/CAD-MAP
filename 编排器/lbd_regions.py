@@ -86,6 +86,73 @@ def _rack_string_counts(doc):
     return out
 
 
+def _rack_types_by_length(doc, tol=0.10):
+    """按识别框长分档生成类型行；同串数但长度不同的档不合并。
+
+    旧逻辑只按串数聚合，识别里实际有 6 个长度档、但只有 3 种串数时，
+    「支架类型明细」会从 6 行缩成 3 行。这里保留每一档，长度和数量直接用识别结果。
+    只有每一档都已经写入 raw.strings 时才返回，未标串数时仍走原逻辑。
+    """
+    items = []
+    for page in doc.get("yolo_tracker_detection_results") or []:
+        pg = page.get("page_number")
+        for d in (page.get("data") or {}).get("detections") or []:
+            if not isinstance(d, dict):
+                continue
+            if (d.get("label") or "").strip().lower() not in ("tracker", "typical"):
+                continue
+            raw = d.get("raw") or {}
+            s = _first_num(raw, _RACK_STR_KEYS)
+            try:
+                if raw.get("len_px") is not None:
+                    length, px = float(raw["len_px"]), True
+                elif raw.get("len_ft") is not None:
+                    length, px = float(raw["len_ft"]), False
+                else:
+                    b = d.get("bbox") or {}
+                    length = max(float(b["x2"]) - float(b["x1"]),
+                                 float(b["y2"]) - float(b["y1"]))
+                    px = True
+                if length > 0:
+                    items.append((length, pg, s, px))
+            except Exception:
+                continue
+    if not items or not all(x[2] is not None for x in items):
+        return []
+    # 有像素长度时全部按像素；否则按英尺。两套口径不混在一张表里。
+    use_px = any(x[3] for x in items)
+    vals = [(x[0], x[1], x[2]) for x in items if x[3] == use_px] if use_px else items
+    if not vals:
+        return []
+    vals.sort(key=lambda x: x[0])
+    groups = []
+    for length, pg, strings in vals:
+        if groups:
+            mean = sum(x[0] for x in groups[-1]) / len(groups[-1])
+            if mean > 0 and abs(length - mean) <= tol * mean:
+                groups[-1].append((length, pg, strings))
+                continue
+        groups.append([(length, pg, strings)])
+    rows = []
+    for i, group in enumerate(groups):
+        lengths = sorted(x[0] for x in group)
+        counts = {}
+        for _length, _pg, strings in group:
+            key = _seq_key(strings)
+            counts[key] = counts.get(key, 0) + 1
+        strings = max(counts, key=lambda k: counts[k])
+        rows.append({
+            "strings": strings,
+            "code": None,
+            "length_ft": lengths[len(lengths) // 2],
+            "total_count": len(group),
+            "panel_label": None,
+            "source": "detections.raw.strings+length",
+            "index": i + 1,
+        })
+    return rows
+
+
 # 界面「支架」页明细行手填的「长度FT」（没填时编排器会拿串数当比例给一个替代值）：
 # 识别结果里没有长度时用它，把「框长分档」对到支架类型上（见 rack_type_indices）。
 # 形如 {串数: 长度FT}；只按比例用，绝对值不影响结果。默认空 = 只用识别结果里的长度。
@@ -186,6 +253,10 @@ def rack_types_from_doc(doc):
             by_str.append(key)
         elif not rec.get("total_count"):
             rec["total_count"] = cnt
+
+    grouped = _rack_types_by_length(doc)
+    if grouped:
+        return grouped
 
     rows = []
     for i, key in enumerate(sorted(by_str)):
@@ -1360,16 +1431,9 @@ def lbd_mark_boxes(json_path, page_map=None, thick_scale=1.3, adv=0.55, pad=0.35
 
     用途和老的 pdf_lbd_boxes()（读 PDF 文字层）一样：给 STR 号 / CAD 摆 LBD 标签当避让障碍。
     数据全部来自识别结果 JSON：
-      中心 = 每根 Node 检测自带的 raw.label_pos（标注工具从 PDF 文字层/OCR 抓到的标号位置，
-             页像素）。实测它就是印刷标号框的中心：37/37 落在框内，离框中心 dx≈2.5px、dy≈9px
-             （框本体 27x198 px 那种量级）。
-      大小 = 厚 thick_scale x STR 号字高、长 = 字高 x (adv x 名字字数 + pad)，方向跟区域长短边
-              一致（竖长区域里的标号是竖排的）。实测（37 个样本，对照渲染图上量出来的真标号框）：
-              1.0 倍字高只盖住 88%（几像素的定位偏差就漏），1.3 倍 + 0.55 字距盖住 100%，
-              框面积只有真标号的 1.5 倍 —— 比按「区域中带」估（5.9 倍）小得多，要挪的号也少得多。
-
-    没有 label_pos 的老 JSON：退回用 Node 区域中心，框放大到 fallback_ratio 倍区域长短边
-    （实测 35/35 盖住，但位置是估的、框也大）。
+      优先使用 PDF 文字层的实际 raw.label_bbox（页像素，紧贴标号文字）。
+    没有 label_bbox 时，才用 raw.label_pos 的中心 + 字高/字数估算；
+    连 label_pos 也没有的老 JSON，退回 Node 区域中心。
     查不到名字的 Node 不输出（CAD 那边也不画这个标签，不用避）。
     """
     out = {}
@@ -1424,8 +1488,16 @@ def lbd_mark_boxes(json_path, page_map=None, thick_scale=1.3, adv=0.55, pad=0.35
                 continue                       # 这个区域没有编号 -> CAD 也不画，不用避
             bw, bh = b["x2"] - b["x1"], b["y2"] - b["y1"]
             tr = (d.get("raw") or {}) if isinstance(d.get("raw"), dict) else {}
+            bb = tr.get("label_bbox") or rec.get("label_bbox")
             pos = tr.get("label_pos")
-            if (isinstance(pos, (list, tuple)) and len(pos) >= 2
+            exact_bbox = False
+            if (isinstance(bb, (list, tuple)) and len(bb) >= 4
+                    and all(isinstance(v, (int, float)) for v in bb[:4])):
+                margin = max(1.0, t_str * 0.15)
+                x1, y1, x2, y2 = (float(bb[0]) - margin, float(bb[1]) - margin,
+                                  float(bb[2]) + margin, float(bb[3]) + margin)
+                exact_bbox = True
+            elif (isinstance(pos, (list, tuple)) and len(pos) >= 2
                     and isinstance(pos[0], (int, float)) and isinstance(pos[1], (int, float))):
                 cx, cy = float(pos[0]), float(pos[1])          # 标号位置（页像素）
                 thin = t_str * thick_scale
@@ -1434,12 +1506,13 @@ def lbd_mark_boxes(json_path, page_map=None, thick_scale=1.3, adv=0.55, pad=0.35
                 cx, cy = _center(b)                            # 老 JSON：退回区域中心
                 thin = max(t_str, min(bw, bh) * fallback_ratio)
                 long_ = max(t_str, max(bw, bh) * fallback_ratio)
-            if bh > bw:                    # 竖长区域：标号竖排
-                x1, x2 = cx - thin / 2.0, cx + thin / 2.0
-                y1, y2 = cy - long_ / 2.0, cy + long_ / 2.0
-            else:                          # 扁宽区域：标号横排
-                x1, x2 = cx - long_ / 2.0, cx + long_ / 2.0
-                y1, y2 = cy - thin / 2.0, cy + thin / 2.0
+            if not exact_bbox:
+                if bh > bw:                # 竖长区域：标号竖排
+                    x1, x2 = cx - thin / 2.0, cx + thin / 2.0
+                    y1, y2 = cy - long_ / 2.0, cy + long_ / 2.0
+                else:                      # 扁宽区域：标号横排
+                    x1, x2 = cx - long_ / 2.0, cx + long_ / 2.0
+                    y1, y2 = cy - thin / 2.0, cy + thin / 2.0
             # 页像素(y 从上) -> 归一化(fy 从下)，和 L 行同一套
             boxes.append((min(max(x1 / float(W), 0.0), 1.0),
                           1.0 - min(max(y2 / float(H), 0.0), 1.0),

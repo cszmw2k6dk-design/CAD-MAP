@@ -370,7 +370,7 @@ BARE_NUM_RE = re.compile(r"^#?\s*0*(\d{1,3})\.?$")
 # 兜底：框里任何文字里的第一个数字（"1.C.1"、"LBD-07"、"07" 都行）
 
 
-INV_RE = re.compile(r"INV\s*0*(\d+)\s*([A-Za-z])\s*0*(\d+)", re.I)
+INV_RE = re.compile(r"INV\s*([0-9]+(?:\s*[A-Za-z]\s*[0-9]+)?)", re.I)
 
 
 SHEET_CLEAN_RE = re.compile(r"[^0-9A-Za-z.]")
@@ -393,7 +393,7 @@ def _clean_lbd_label(txt):
     'LBD 1.01.1.C.5'    -> '1.01.1.C.5'
     """
     t = re.sub(r"\s+", "", str(txt or ""))
-    t = re.sub(r"INV\s*\d+\s*[A-Za-z]\s*\d+", "", t, flags=re.I)
+    t = re.sub(r"INV\s*\d+(?:\s*[A-Za-z]\s*\d+)?", "", t, flags=re.I)
     m = re.search(r"LBD[\s_\-–—:]*([0-9][0-9A-Za-z._\-]*)", t, re.I)
     if m:
         t = m.group(1)
@@ -419,9 +419,10 @@ def ocr_text_to_name(txt):
     up = t.upper().replace(" ", "")
     if LBD_LABEL_RE.search(up):
         # 名字用原文（保留 1.01.1.C.5 这种整段），只砍掉尾巴上的 "(2)" 之类注解
-        return re.split(r"[()\[\]{}]", t)[0].strip().replace(" ", "").upper(), "ok"
+        return (re.split(r"[()\[\]{}]", t)[0].strip().replace(" ", "").upper()
+                .rstrip(".,;:"), "ok")
     if LBDISH_RE.search(up):
-        return t[:40], "check"
+        return t, "check"
     return "", "noise"
 
 
@@ -549,7 +550,19 @@ def _inv_in(text):
     m = INV_RE.search(str(text or ""))
     if not m:
         return None
-    return ("INV%s%s%s" % (m.group(1), m.group(2).upper(), m.group(3))).upper()
+    return ("INV" + re.sub(r"\s+", "", m.group(1))).upper()
+
+
+def page_inv_by_text(text_items):
+    """没有标签表时，从本页文字推断主导的 INV 前缀（兼容 INV1101 / INV11A101）。"""
+    counts = {}
+    for item in text_items or []:
+        inv = _inv_in(item[0])
+        if inv:
+            counts[inv] = counts.get(inv, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=lambda key: counts[key])
 
 
 def sheet_in_text(text, sheet_names):
@@ -790,7 +803,7 @@ def check_rows(shapes, text_items, sheet, num_set, width, height):
 
 
 def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
-                    tol_ratio=0.006):
+                    tol_ratio=0.006, force=False):
     """给一页的 Node 框补 LBD 名字。返回统计 dict。
 
     shapes: 这一页的框（就地改 name / _auto / _miss 标记，只动 label == "Node"）
@@ -803,12 +816,19 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
       3) 文字自带 INV 分表名、且和本页分表不一致 -> 当干扰丢掉
       4) 框里没有可用文字的，按标签表的号（还没被用掉的）按位置顺序补，标黄
       5) 连标签表的号都没有了 -> 标红，等人手填
+
+    force=True：已有名字也重新从文字层配一次（「重认整册编号」用）。
+    某个框重新配不到时恢复它原来的名字和编号位置，不会把原结果清空。
     """
     # 锁上的 Node **也补编号**：锁是防"误拖/误删/框选到"的，不是不让补号
     # （用户反馈：锁定 Node 之后跑「识别框内文字」编号写不进去 —— 就是这里被跳过了）
     locked_n = sum(1 for s in shapes
                    if s.get("label") == "Node" and s.get("locked"))
     nodes = [(i, s) for i, s in enumerate(shapes) if s.get("label") == "Node"]
+    if not sheet:
+        # PDF 文字层经常把 "INV1101" 和 "LBD-06" 分成两段；没有 Excel 时
+        # 仍从本页提取 INV 前缀，避免最后只生成 LBD-06。
+        sheet = page_inv_by_text(text_items)
     tol = max(6.0, float(tol_ratio) * max(width, height))
     stat = {"total": len(nodes), "filled": 0, "auto": 0, "missed": 0,
             "wrong_sheet": 0, "kept": 0, "locked": locked_n, "pos_added": 0}
@@ -870,10 +890,24 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
             s["raw"] = raw
             stat["pos_added"] = stat.get("pos_added", 0) + 1
 
-    # 已经有人写过的名字：不动（免得把手工改的冲掉）
+    old_names = {}
+    if force:
+        # 强制重认时先把旧号拿掉，后面才能按当前 PDF 文字层重新归属。
+        # 原名字和位置先留着，某个框没重新配到时再原样恢复。
+        for i, s in nodes:
+            raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
+            old_names[i] = ((s.get("name") or "").strip(), dict(raw))
+            for key in ("label_pos", "label_bbox", "label_src", "label_box_kind"):
+                raw.pop(key, None)
+            s["name"] = ""
+            s["_auto"] = False
+            s["_miss"] = False
+            s["_check"] = False
+
+    # 已经有人写过的名字：不动（免得把手工改的冲掉）；force=True 时全部重认
     todo = []
     for i, s in nodes:
-        if (s.get("name") or "").strip() and not s.get("_auto"):
+        if not force and (s.get("name") or "").strip() and not s.get("_auto"):
             stat["kept"] += 1
             s["_miss"] = False
         else:
@@ -942,12 +976,15 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
             # 编号整段带上（框里印的是 1.01.1.C.5 就写 1.01.1.C.5，不是只留 5）
             s["name"] = (full_name.get(i)
                          or _lbd_name(sheet, keep_lab.get(i, ""), keep[i]))
+            raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
+            raw["recognized_text"] = s["name"]
+            s["raw"] = raw
             # 把"这个编号印在图上的哪儿"一起记下来（主程序/核对都用得上）
             bb = pos_of.get(i)
             if bb:
-                raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
                 raw["label_pos"] = [int(round(bb[0])), int(round(bb[1]))]
                 raw["label_src"] = "text_layer"
+                raw["label_text"] = s["name"]
                 s["raw"] = raw
             s["_auto"] = False
             stat["filled"] += 1
@@ -983,6 +1020,10 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
             s["name"] = _lbd_name(sheet, "", val)
             s["_auto"] = False
             s["_check"] = False
+            raw = dict(s.get("raw") or {})
+            raw["recognized_text"] = str(_t or "").strip()
+            raw["label_text"] = s["name"]
+            s["raw"] = raw
             keep[i] = val
             used.add(val)
             stat["bare"] = stat.get("bare", 0) + 1
@@ -1044,6 +1085,8 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
             raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
             raw["label_pos"] = [int(round(pick_x)), int(round(pick_y))]
             raw["label_src"] = "text_layer"
+            raw["recognized_text"] = str(pick_txt or "").strip()
+            raw["label_text"] = s["name"]
             s["raw"] = raw
             s["_auto"] = False
             s["_check"] = False
@@ -1052,13 +1095,17 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
             stat["any"] = stat.get("any", 0) + 1
             stat["filled"] += 1
 
-    # 4) 框里没取到号的：按标签表的号顺序补（标黄，提示人工核）
+    # 4) 框里没取到号的：按标签表的号顺序补（标黄，提示人工核）。
+    #    强制重认时，原来已经有号的框不参与这一步：没读到新文字就保留旧号，
+    #    避免标签表按位置猜一个号把用户原来的结果覆盖掉。
     rest = [t for t in todo if t[0] not in keep]
-    if rest and sheet and num_set:
+    infer_rest = [t for t in rest
+                  if not (force and old_names.get(t[0], ("", {}))[0])]
+    if infer_rest and sheet and num_set:
         free = [n for n in sorted(num_set) if n not in used]
         # 位置顺序 = 一排排（先分行，行内从左到右）——和图纸上读的顺序一致
         pairs = [(round(_box_center(s["bbox"])[1], 3), round(_box_center(s["bbox"])[0], 3), i, s)
-                 for i, s in rest]
+                 for i, s in infer_rest]
         k = 0
         for row in _rows_of(pairs, _row_tol(shapes)):
             for _cy, _cx, i, s in row:
@@ -1070,8 +1117,16 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
                 k += 1
     for i, s in rest:
         if not (s.get("name") or "").strip():
-            s["_miss"] = True
-            stat["missed"] += 1
+            old = old_names.get(i)
+            if old and old[0]:
+                s["name"] = old[0]
+                s["raw"] = old[1]
+                s["_miss"] = False
+                stat["kept"] = stat.get("kept", 0) + 1
+                stat["kept_on_miss"] = stat.get("kept_on_miss", 0) + 1
+            else:
+                s["_miss"] = True
+                stat["missed"] += 1
     # 4b) 把"编号印在哪儿"补全：位置 + 小框（画在图上给人核对用）
     _mark_positions()
     # 5) 位置可疑：同一行里号码跳号 -> 标紫（紫 = 从框内取到号了，但和同排的号对不上，
@@ -1108,7 +1163,9 @@ def _kmeans_cuts(values, k, iters=80):
     return [(cent[i] + cent[i + 1]) / 2.0 for i in range(k - 1)]
 
 
-LBD_LABEL_RE = re.compile(r"INV\s*\d+\s*[A-Z]\s*\d+\s*[-_ ]?LBD[-_ ]?\s*\d+", re.I)
+LBD_LABEL_RE = re.compile(
+    r"INV\s*\d+(?:\s*[A-Z]\s*\d+)?\s*[-_ ]?LBD[-_ ]?\s*\d[0-9A-Za-z._-]*",
+    re.I)
 # "像编号"的：LBD 后面跟着数字（LBD-8 / LBD 1.01.1.C.5），或者只有 INV 前缀没 LBD 字样。
 # 注意不能写成"只要出现 LBD 就算" —— 图纸上到处都是 "LBD CLUSTER, TYP." 这种旁注。
 

@@ -59,7 +59,7 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_parse_split = _lr_split_rows = _lr_expand_racks = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.59"
+APP_VERSION = "2.68"
 # 这一版先不带「导出 PDF」：按钮和入口藏起来，代码保留（改成 True 就接回来）。
 FEATURE_EXPORT_PDF = False
 # 表格 OCR 暂不上线：源码保留，速度与准确率稳定后再打开并重新打包模型依赖。
@@ -297,6 +297,7 @@ TEXT_EN = {
         "When the switch is off none of the four dropdowns apply.",
     "支架类型明细": "Rack type detail",
     "从识别结果刷新支架类型": "Reload rack types from recognition",
+    "长度来自识别结果；这里只读": "Length comes from recognition and is read-only",
     "刷新 STR 顺序预览": "Refresh STR order preview",
     "支架类型": "Rack type",
     "串数": "Strings",
@@ -434,9 +435,9 @@ TEXT_EN = {
     "STR 号：第 %s%s 张图纸": "STR: sheet %s%s",
     "正在导出 LBD 区域 / 支架范围…": "Exporting LBD regions / rack bounds…",
     "正在生成 LBD / 支架标签…": "Generating LBD / rack labels…",
-    "正在连接 / 启动 ZWCAD…（可能需 10-30 秒，请切到 ZWCAD）":
-        "Connecting / starting ZWCAD… (10-30 s; switch to ZWCAD)",
-    "已连接 ZWCAD，正在打开 DWG…": "Connected to ZWCAD; opening the DWG…",
+    "正在连接 / 启动 CAD…（可能需 10-30 秒，请切到 CAD）":
+        "Connecting / starting CAD… (10-30 s; switch to CAD)",
+    "已连接 CAD，正在打开 DWG…": "Connected to CAD; opening the DWG…",
     "DWG 就绪，正在加载插件并执行…": "DWG ready; loading the plugin and running…",
     "开始执行…": "Starting…",
     "正在批量布局…": "Creating layouts…",
@@ -445,6 +446,8 @@ TEXT_EN = {
     "区域对准完成，接着写 LBD 标签…": "Viewport fit done; writing LBD labels…",
     "正在按 LBD 区域上下限对准视口 %s / %s": "Fitting viewport to LBD bounds %s / %s",
     "正在按 LBD 区域上下限对准视口…": "Fitting viewport to LBD bounds…",
+    "正在对齐 LYNX 标签并避让编号 / STR…":
+        "Aligning LYNX labels and avoiding printed numbers / STR…",
     # ---- 识别页补充（英文界面漏翻 / 显示不全的） ----
     "← 上一步": "← Back",
     "回到识别工作区（换 PDF / 重新识别 / 改框）":
@@ -469,9 +472,10 @@ TEXT_EN = {
     "重算分档": "Re-bucket",
     "按当前识别到的支架框重新统计「支架长度分档」（改过框 / 删过框之后马上想看新分档就点）":
         "Recompute rack-length buckets from the current boxes",
-    "重认编号": "Re-match",
-    "按 PDF 文字层重新读这一页的 LBD 编号（挪过 / 加过 LBD 框之后用；读不到时保留原来的名字）":
-        "Re-read LBD names from the PDF text layer (existing names kept if none found)",
+    "重认整册编号": "Re-match all",
+    "按 PDF 文字层重新核对整本图纸的 LBD 编号（已有旧号也会覆盖；某框读不到时保留它原来的名字）":
+        "Re-match LBD names across the whole PDF from its text layer "
+        "(overwrites old names; keeps a box's old name when none is found)",
     "检查": "Check",
     "扫一遍识别结果：没编号的 LBD、没落档的支架、不在任何 LBD 里的支架、重复编号":
         "Check for unnamed LBDs, unbucketed racks, racks outside every LBD, duplicate names",
@@ -537,11 +541,9 @@ SECTIONS = [
                ("labelBgColor", "标签背景色"),
                ("labelTextColor", "LBD 标签字色"),
                ("labelBgGap", "背景遮挡间隙(倍)")]),
-    # 支架标签：和 STR 有关的东西（前缀/类型明细/字高/编号顺序/四象限规律/背景/避让）
+    # 支架标签：和 STR 有关的东西（前缀/识别类型明细/字高/编号顺序/四象限规律/背景/避让）
+    # rackTypes / rackSplit / rackStringLen 只保留配置兼容，不再在界面手填。
     ("支架标签", [("rackPrefix", "命名前缀(支架号)"),
-              ("rackTypes", "支架类型(串数:长度)"),
-        ("rackSplit", "拆几行(0=不拆)"),
-              ("rackStringLen", "单串长度(FT,可空)"),
               ("strHeight", "STR 字高(typical宽倍数)"),
               ("strOrder", "STR 编号顺序(8 种)"),
               ("strQuadOn", "按汇流箱(Box)四象限规律命名"),
@@ -1333,6 +1335,26 @@ def ensure_ai_lsp():
     return tmp
 
 
+def ensure_lynx_lsp():
+    """解出 LYNX/LBD 标签的按行最终排布层。"""
+    cand = None
+    if getattr(sys, "frozen", False):
+        cand = os.path.join(getattr(sys, "_MEIPASS", ""), "PdfLayout_lynx.lsp")
+    if not cand or not os.path.exists(cand):
+        cand = os.path.join(app_dir(), "PdfLayout_lynx.lsp")
+    if not os.path.exists(cand):
+        return None
+    tmp = os.path.join(tempfile.gettempdir(), "PdfLayout_lynx.lsp")
+    try:
+        with open(cand, "rb") as f:
+            data = f.read()
+        with open(tmp, "wb") as f:
+            f.write(data)
+    except Exception:
+        return cand
+    return tmp
+
+
 def auto_worker(cfg, ini, prog, bus):
     try:
         # B2：标签文件在 exe 内就地生成（复用已打包的 pypdf / lbd_regions），不再外挂 Python。
@@ -1412,7 +1434,6 @@ def auto_worker(cfg, ini, prog, bus):
 
         try:
             import pythoncom
-            import win32com.client as win32
         except Exception as e:
             bus.err.emit("连接 CAD 需要 pywin32（pythoncom / win32com），这个 Python 里没有：%s\n"
                          "  源码运行：pip install pywin32\n"
@@ -1426,54 +1447,24 @@ def auto_worker(cfg, ini, prog, bus):
             t0 = time.time()
             while not conn_stop.is_set():
                 el = int(time.time() - t0)
-                bus.status.emit("正在连接 / 启动 ZWCAD… 已等待 %d 秒"
-                                "（冷启动通常 10-30 秒；若已打开 ZWCAD 可秒连）" % el)
+                bus.status.emit("正在连接 / 启动 CAD… 已等待 %d 秒"
+                                "（冷启动通常 10-30 秒；若已打开 CAD 可秒连）" % el)
                 conn_stop.wait(1.0)
 
         threading.Thread(target=_tick_conn_wait, daemon=True).start()
-        acad = None
-        for progid in ("ZWCAD.Application", "AutoCAD.Application"):
-            try:
-                acad = win32.GetActiveObject(progid)
-            except Exception:
-                acad = None
-            if not acad:
-                try:
-                    acad = win32.DispatchEx(progid)
-                except Exception:
-                    acad = None
-            if acad:
-                break
+        acad, conn_msg = cad_connect(create=True)
         conn_stop.set()
         if not acad:
-            bus.err.emit("连接 CAD 失败：请确认已安装 ZWCAD/AutoCAD 并注册 COM。")
+            bus.err.emit("连接 CAD 失败：%s" % (conn_msg or "请确认已安装 ZWCAD/AutoCAD 并注册 COM。"))
             return
         try:
             acad.Visible = True
         except Exception:
             pass
         bus.prog.emit("2/4 已连接，准备打开 DWG…")
-        doc = None
         dwg = (cfg.get("dwg") or "").strip()
         try:
-            cur = acad.ActiveDocument
-            cname = ""
-            try:
-                cname = cur.FullName or ""
-            except Exception:
-                cname = ""
-            if dwg and os.path.exists(dwg):
-                cur_match = cname and os.path.exists(cname) and \
-                    cname.replace("\\", "/").lower() == dwg.replace("\\", "/").lower()
-                if cur_match:
-                    doc = cur
-                else:
-                    try:
-                        doc = acad.Documents.Open(dwg)
-                    except Exception:
-                        doc = cur
-            else:
-                doc = getattr(acad, "ActiveDocument", None)
+            doc = cad_open_document(acad, dwg)
         except Exception:
             doc = None
         if not doc:
@@ -1495,6 +1486,10 @@ def auto_worker(cfg, ini, prog, bus):
         auto = ensure_auto_lsp()
         if not auto:
             bus.err.emit("找不到 PdfLayout_auto.lsp")
+            return
+        lynx = ensure_lynx_lsp()
+        if not lynx:
+            bus.err.emit("找不到 PdfLayout_lynx.lsp")
             return
 
         def L(p):
@@ -1567,17 +1562,20 @@ def auto_worker(cfg, ini, prog, bus):
                       "(setq *PdfLayout_AiStrColor* %s)\n"
                       "(setq *PdfLayout_AiLabelColor* %s)\n"
                       % (_sbg_on, _sbg_c, _sbg_g, _rp, _scale, _auto_h, _txt_h, _stc, _ltc))
-            cmd = ("(load %s)\n(load %s)\n(load %s)\n"
+            cmd = ("(load %s)\n(load %s)\n(load %s)\n(load %s)\n"
                    "%s"
                    "(setq *PdfLayout_GridAutoFile* %s)\n(setq *PdfLayout_AiPage* %s)\n"
                    "%s"
-                   "(PdfLayout_AutoRun %s %s)\n(c:pdfgridai)\n(PdfLayout_Prog \"RUN_DONE\")\n"
-                   % (L(lsp), L(auto), L(ai), _vinsnip, L(_lbdout), _pg, _strbg,
+                   "(PdfLayout_AutoRun %s %s)\n(c:pdfgridai)\n"
+                   "(PdfLayout_LynxPlace)\n(PdfLayout_Prog \"RUN_DONE\")\n"
+                   % (L(lsp), L(auto), L(ai), L(lynx), _vinsnip, L(_lbdout), _pg, _strbg,
                       L(ini), L(prog)))
         else:
-            cmd = ("(load %s)\n(load %s)\n%s(PdfLayout_AutoRun %s %s)\n(PdfLayout_Prog \"RUN_DONE\")\n"
-                   % (L(lsp), L(auto), _vinsnip, L(ini), L(prog)))
-        bus.prog.emit("发送命令给 ZWCAD：\n" + cmd.replace("\n", " "))
+            cmd = ("(load %s)\n(load %s)\n(load %s)\n%s"
+                   "(PdfLayout_AutoRun %s %s)\n(PdfLayout_LynxPlace)\n"
+                   "(PdfLayout_Prog \"RUN_DONE\")\n"
+                   % (L(lsp), L(auto), L(lynx), _vinsnip, L(ini), L(prog)))
+        bus.prog.emit("发送命令给 CAD：\n" + cmd.replace("\n", " "))
         doc.SendCommand(cmd)
         try:
             pythoncom.CoUninitialize()
@@ -2016,13 +2014,56 @@ def cad_connect(create=False):
         if acad:
             return acad, ""
     if not create:
-        return None, "连不上 CAD：请先打开 ZWCAD 和要导出的图纸。"
+        return None, "连不上 CAD：请先打开 ZWCAD 或 AutoCAD 和要导出的图纸。"
     for progid in CAD_PROGIDS:
         try:
-            return win32.DispatchEx(progid), ""
+            # Dispatch 会先复用已运行实例；只有它启动不了时才 DispatchEx。
+            # DispatchEx 每次都强制新进程，这是之前 CAD 被打开两个的直接原因。
+            try:
+                return win32.Dispatch(progid), ""
+            except Exception:
+                return win32.DispatchEx(progid), ""
         except Exception:
             continue
     return None, "连不上 CAD，也没有可启动的 ZWCAD / AutoCAD。"
+
+
+def cad_open_document(acad, dwg):
+    """打开 DWG；同一路径已经打开时只激活原文档，不再开第二个窗口。"""
+    want = os.path.normcase(os.path.abspath(dwg)) if dwg else ""
+
+    def _same(path):
+        try:
+            return bool(want and path and
+                        os.path.normcase(os.path.abspath(path)) == want)
+        except Exception:
+            return False
+
+    try:
+        docs = acad.Documents
+        n = int(docs.Count)
+    except Exception:
+        docs, n = None, 0
+    for i in range(n):
+        try:
+            d = docs.Item(i)
+            if _same(d.FullName):
+                try:
+                    d.Activate()
+                except Exception:
+                    pass
+                return d
+        except Exception:
+            continue
+    try:
+        active = acad.ActiveDocument
+        if _same(active.FullName):
+            return active
+    except Exception:
+        active = None
+    if dwg and os.path.exists(dwg):
+        return acad.Documents.Open(dwg)
+    return active
 
 
 def cad_doc_or_none(acad):
@@ -2781,7 +2822,9 @@ class RecogBoxItem(QGraphicsRectItem):
         pen.setWidth(2 if kind == "Node" else 1)
         pen.setCosmetic(True)          # 线宽不跟着缩放变：缩小看整页时框也看得见
         self.setPen(pen)
-        self.setBrush(Qt.NoBrush)
+        fill = QColor(col)
+        fill.setAlpha(30)              # 轻微加深框内区域，仍能看清底图
+        self.setBrush(fill)
         # 支架通常画在 LBD 区域内部，必须比 Node 高，否则点支架总会命中外层 LBD。
         self.setZValue(10 if kind == "Tracker" else (8 if kind == "Box" else 5))
 
@@ -2917,10 +2960,6 @@ class RecogCanvas(QGraphicsView):
             it = RecogBoxItem(self, i, kind, self._disp_rect(d.get("bbox") or {}))
             self.scene().addItem(it)
             self.box_items.append(it)
-            if kind == "Node" and (d.get("raw") or {}).get("lbd_locked"):
-                it.locked = True
-                it.setFlag(QGraphicsRectItem.ItemIsSelectable, False)
-                it.setFlag(QGraphicsRectItem.ItemIsMovable, False)
             if kind == "Node":
                 if k < len(recs):
                     self.ocr_of[i] = k
@@ -3181,10 +3220,8 @@ class RecogCanvas(QGraphicsView):
         # ESC：画到一半先丢掉这一笔；再按一次退回选择模式
         # （不这样的话 add_mode 一直挂着：鼠标一动就拖出虚线框、框也选不中）
         if e.key() == Qt.Key_Escape:
-            if self.cancel_draw():
-                e.accept()
-                return
-            if self.add_mode and self.on_escape:
+            self.cancel_draw()
+            if self.on_escape:
                 try:
                     self.on_escape()
                 except Exception:
@@ -3415,14 +3452,68 @@ class RecogCanvas(QGraphicsView):
                                   else Qt.CursorShape.ArrowCursor)
 
     def drawForeground(self, painter, rect):
-        """在视口坐标里画控制点：不管缩放到多少，屏幕上始终是同样大小的小方块。"""
+        """用矩形框标出全部 LBD 标号位置，不做文字叠加。"""
         super().drawForeground(painter, rect)
         box = self.selected_box()
+        # 标号文字已经印在 PDF 上，再叠加一遍会挡住图纸；这里只框出它的实际范围。
+        painter.save()
+        painter.resetTransform()                    # 切到视口坐标
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        try:
+            trk, ocr = self._page_data()
+            dets = ((trk or {}).get("data") or {}).get("detections") or []
+            recs = ((ocr or {}).get("data") or []) if ocr is not None else []
+            view_r = self.viewport().rect()
+            for item in self.box_items:
+                if item.kind != "Node":
+                    continue
+                j = self.ocr_of.get(item.det_index)
+                if j is None or j >= len(recs):
+                    continue
+                name = (recs[j].get("final_node_name")
+                        or recs[j].get("preliminary_node_name") or "").strip()
+                if not name:
+                    continue
+                raw = (dets[item.det_index].get("raw")
+                       if 0 <= item.det_index < len(dets) else {}) or {}
+                bb = raw.get("label_bbox") or recs[j].get("label_bbox")
+                if (isinstance(bb, (list, tuple)) and len(bb) >= 4):
+                    p1 = self.mapFromScene(QPointF(self._dx(float(bb[0])),
+                                                   self._dy(float(bb[1]))))
+                    p2 = self.mapFromScene(QPointF(self._dx(float(bb[2])),
+                                                   self._dy(float(bb[3]))))
+                    marker = QRectF(QPointF(p1), QPointF(p2)).normalized()
+                else:
+                    pos = raw.get("label_pos") or recs[j].get("label_pos")
+                    if (isinstance(pos, (list, tuple)) and len(pos) >= 2):
+                        p = self.mapFromScene(QPointF(self._dx(float(pos[0])),
+                                                     self._dy(float(pos[1]))))
+                        marker = QRectF(p.x() - 5, p.y() - 5, 10, 10)
+                    else:
+                        scene_pos = item.sceneBoundingRect().center()
+                        p = self.mapFromScene(scene_pos)
+                        marker = QRectF(p.x() - 5, p.y() - 5, 10, 10)
+                # 太小的真实框放大到屏幕至少 9px，缩小看整页时仍能找到位置。
+                if marker.width() < 9:
+                    marker.setWidth(9)
+                if marker.height() < 9:
+                    marker.setHeight(9)
+                if view_r.adjusted(-20, -20, 20, 20).contains(marker.toRect()):
+                    # 黑外描边 + 青色内描边 + 淡填充：在粉色、绿色、白色和黑色底图上都清楚。
+                    painter.setBrush(QColor(0, 230, 255, 48))
+                    painter.setPen(QPen(QColor(0, 0, 0, 230), 4.0))
+                    painter.drawRect(marker)
+                    painter.setBrush(Qt.NoBrush)
+                    painter.setPen(QPen(QColor(0, 235, 255), 2.0))
+                    painter.drawRect(marker)
+        except Exception:
+            pass
+        painter.restore()
         if box is None or self.add_mode:
             return
         hs = self.HANDLE_PX
         painter.save()
-        painter.resetTransform()                    # 切到视口坐标
+        painter.resetTransform()
         painter.setRenderHint(QPainter.Antialiasing, False)
         painter.setPen(QPen(QColor(20, 20, 20, 230), 1))
         painter.setBrush(QColor(255, 216, 0, 235))
@@ -3432,30 +3523,11 @@ class RecogCanvas(QGraphicsView):
         painter.restore()
 
     def _update_sel_label(self, box, sc=None):
-        """选中框的名字：贴在框上方，字号按缩放反算，屏幕上看始终是同一个大小。"""
+        """编号只保留在右栏/输入框里；画布只用矩形标出文字位置。"""
         lbl = getattr(self, "sel_label", None)
         if lbl is None:
             return
-        try:
-            trk, ocr = self._page_data()
-            recs = ((ocr or {}).get("data") or []) if ocr is not None else []
-            j = self.ocr_of.get(box.det_index)
-            name = (recs[j].get("final_node_name") or "").strip() if (j is not None and j < len(recs)) else ""
-        except Exception:
-            name = ""
-        if not name:
-            lbl.setVisible(False)
-            return
-        if sc is None:
-            sc = max(0.02, float(self.transform().m22() or 1.0))
-        f = lbl.font()
-        f.setPixelSize(max(9, int(round(13.0 / sc))))
-        lbl.setFont(f)
-        r = box.sceneBoundingRect()
-        lbl.setText(name)
-        lb = lbl.boundingRect()
-        lbl.setPos(r.left(), r.top() - lb.height() - 2.0 / sc)
-        lbl.setVisible(True)
+        lbl.setVisible(False)
 
     def _page_data(self):
         doc = self.doc or {}
@@ -4273,6 +4345,7 @@ class MainWindow(QMainWindow):
         self._step_t0 = None
         self._run_started = None
         self._paused = False
+        self._rack_generation = 0
         self._build_ui()
         self.set_cfg(load_config())
         # 打开就是「识别」这一屏（没有参数页/侧边栏）：选 PDF → 识别 → 改好 → 下一步才进画图流程
@@ -4296,6 +4369,10 @@ class MainWindow(QMainWindow):
                                 ("Ctrl+1", self.on_recog_fit)):
                 _sc = QShortcut(QKeySequence(_seq), self)
                 _sc.activated.connect(_slot)
+            # 焦点在编号输入框或工具栏时，ESC 也要能退出画框模式。
+            self._sc_escape = QShortcut(QKeySequence("Esc"), self)
+            self._sc_escape.setContext(Qt.WidgetWithChildrenShortcut)
+            self._sc_escape.activated.connect(self._on_global_escape)
         except Exception:
             pass
         # 窗口尺寸：默认开到能一眼看全（识别页三栏 + 支架表 + 日志），最小尺寸也放宽一点，
@@ -4419,14 +4496,7 @@ class MainWindow(QMainWindow):
         self.recog_next_btn.setVisible(False)
         actions.addWidget(self.recog_next_btn)
         actions.addStretch(1)
-        # 随时可停：执行旁边一个「暂停 / 继续」（执行中才可用）
-        self.pause_btn = self._reg(QPushButton(), "暂停")
-        self.pause_btn.setObjectName("WarnBtn")
-        self.pause_btn.setEnabled(False)
-        self._reg_tip(self.pause_btn, "暂停执行（随时可停）")
-        self.pause_btn.clicked.connect(self.on_pause)
-        actions.addWidget(self.pause_btn)
-        # 真·随时停止：写停止标记，CAD 侧的插件在每个检查点看到就收尾停下
+        # 执行中只保留「停止」：写停止标记，CAD 侧的插件在检查点看到就收尾停下。
         self.stop_btn = self._reg(QPushButton(), "停止")
         self.stop_btn.setObjectName("WarnBtn")
         self.stop_btn.setEnabled(False)
@@ -4472,6 +4542,7 @@ class MainWindow(QMainWindow):
         v.addSpacing(20)
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
+        self.nav_buttons = []
         for i, (sec_title, _) in enumerate(SECTIONS):
             b = QPushButton(T(sec_title))
             b.setObjectName("Nav")
@@ -4480,6 +4551,7 @@ class MainWindow(QMainWindow):
             b.clicked.connect(lambda _=False, idx=i: self.show_section(idx))
             self.nav_group.addButton(b, i)
             self._i18n_nav.append((b, sec_title))
+            self.nav_buttons.append(b)
             v.addWidget(b)
         if SECTIONS:
             self.nav_group.button(0).setChecked(True)
@@ -4740,14 +4812,6 @@ class MainWindow(QMainWindow):
         self.recog_issue_bar.clicked.connect(self._on_issue_bar_clicked)
         tb.addWidget(self.recog_issue_bar, 1, col)
         col += 1
-        # 锁定本页 LBD 区：改支架时别把 LBD 框碰歪（每页各记各的）
-        self.recog_lock_btn = self._reg(QPushButton(), "锁定 LBD")
-        self.recog_lock_btn.setCheckable(True)
-        self._reg_tip(self.recog_lock_btn,
-                      "锁住本页的 LBD 区：不能拖动 / 改大小 / 删除（支架、汇流箱照常编辑）；每页各记各的")
-        self.recog_lock_btn.toggled.connect(self.on_recog_lock_lbd)
-        tb.addWidget(self.recog_lock_btn, 1, col)
-        col += 1
         tb.addWidget(self._reg(QLabel(), "编号"), 1, col)
         col += 1
         self.recog_name_edit = QLineEdit()
@@ -4773,7 +4837,6 @@ class MainWindow(QMainWindow):
         self.recog_canvas.on_added = self.on_recog_box_added
         self.recog_canvas.on_deleted = self.on_recog_box_deleted
         self.recog_canvas.on_renamed = self.on_recog_renamed
-        self.recog_canvas.on_lock_changed = self._sync_lock_btn
         self.recog_canvas.on_escape = self.on_recog_escape
         self.recog_canvas.on_page_key = self.on_recog_page_step
         self.recog_canvas.on_rack_step = self.on_recog_rack_step
@@ -4831,6 +4894,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.recog_rack_table.cellClicked.connect(self.on_recog_rack_row)
+        self.recog_rack_table.itemChanged.connect(self._schedule_rack_apply)
         nv.addWidget(self.recog_rack_table)
         hb = QHBoxLayout()
         b = self._reg(QPushButton(), "应用到支架页")
@@ -4844,10 +4908,13 @@ class MainWindow(QMainWindow):
         self._reg_tip(b, "按当前识别到的支架框重新统计「支架长度分档」（改过框 / 删过框之后马上想看新分档就点）")
         b.clicked.connect(self.on_recog_regroup_now)
         hb2.addWidget(b)
-        b = self._reg(QPushButton(), "重认编号")
-        self._reg_tip(b, "按 PDF 文字层重新读这一页的 LBD 编号（挪过 / 加过 LBD 框之后用；读不到时保留原来的名字）")
-        b.clicked.connect(self.on_recog_relabel)
-        hb2.addWidget(b)
+        self.recog_relabel_btn = self._reg(QPushButton(), "重认整册编号")
+        self._reg_tip(
+            self.recog_relabel_btn,
+            "按 PDF 文字层重新核对整本图纸的 LBD 编号（已有旧号也会覆盖；"
+            "某框读不到时保留它原来的名字）")
+        self.recog_relabel_btn.clicked.connect(self.on_recog_relabel)
+        hb2.addWidget(self.recog_relabel_btn)
         hb2.addStretch(1)
         nv.addLayout(hb2)
         self.recog_names = None
@@ -4911,6 +4978,7 @@ class MainWindow(QMainWindow):
         if getattr(self, "_recog_running", False):
             self._recog_write("上一轮还在跑（running=True），这次点击忽略")
             return
+        self._clear_recog_rack_state()
         self._recog_running = True
         self._recog_t0 = time.time()      # 进度条上「已用 / 剩余」的起点
         self.recog_btn.setEnabled(False)
@@ -5001,6 +5069,7 @@ class MainWindow(QMainWindow):
         self._recog_doc = doc
         self._recog_tmp_path = path
         self._recog_dirty = False
+        self._clear_recog_rack_state()
         self.recog_keep_edit.clear()
         page_rows = self._recog_pages_of_doc()
         first_pg = page_rows[0][0] if page_rows else valid_pages[0]["page_number"]
@@ -5010,7 +5079,7 @@ class MainWindow(QMainWindow):
             self.recog_table.selectRow(0)
         groups = self._groups_from_doc(doc)
         self._recog_groups = groups
-        self._fill_rack_table_from_summary(groups)
+        self._fill_rack_table_from_summary(groups, preserve=False)
         self._recog_refresh_names()
         self._recog_update_page_info()
         if hasattr(self, "recog_export_btn"):
@@ -5175,7 +5244,7 @@ class MainWindow(QMainWindow):
         self._recog_tmp_path = path
         self._recog_dirty = False
         self._fill_recog_table()
-        self._fill_rack_table_from_summary(sm.get("groups") or [])
+        self._fill_rack_table_from_summary(sm.get("groups") or [], preserve=False)
         self._recog_groups = sm.get("groups") or []
         self._recog_refresh_names()
         if hasattr(self, "recog_export_btn"):
@@ -5242,17 +5311,8 @@ class MainWindow(QMainWindow):
             return
         try:
             self.recog_canvas._pdf = pdf
-            # 200dpi 渲染、允许更大像素：缩小看整页也行，放大看框里的字也清楚
-            self.recog_canvas.load(doc, pg, pdf, dpi=200, max_w=2600)
-            # 锁定状态记在识别结果的 raw.lbd_locked 里（和标注软件一样，重开还在）
-            dets_pg = ((next((p for p in doc.get("yolo_tracker_detection_results") or []
-                              if p.get("page_number") == pg), None) or {}).get("data") or {}
-                       ).get("detections") or []
-            nodes_pg = [x for x in dets_pg if (x.get("label") or "") == "Node"]
-            lock = bool(nodes_pg) and all(
-                (x.get("raw") or {}).get("lbd_locked") for x in nodes_pg)
-            self.recog_canvas.set_lbd_locked(lock, persist=False)
-            self._sync_lock_btn()
+            # 提高底图清晰度，方便放大核对编号；编辑后重载沿用这组参数。
+            self.recog_canvas.load(doc, pg, pdf, dpi=260, max_w=3200)
             self._recog_update_page_info(pg)
             self._recog_refresh_names()      # 右栏名字跟着这页一起换
         except Exception as e:
@@ -5542,7 +5602,24 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _fill_rack_table_from_summary(self, groups):
+    def _clear_recog_rack_state(self):
+        """新图纸/新识别从空白开始，不继承上一份图纸的串数和拆行。"""
+        t = getattr(self, "_rack_apply_timer", None)
+        if t is not None:
+            t.stop()
+        self._rack_generation = int(getattr(self, "_rack_generation", 0)) + 1
+        self._rack_len_pref = {}
+        self._rack_split_pref = {}
+        self._rack_types = []
+        self._recog_groups = []
+        self.refresh_rack_rows([], stash=False)
+        table = getattr(self, "recog_rack_table", None)
+        if table is not None:
+            table.blockSignals(True)
+            table.setRowCount(0)
+            table.blockSignals(False)
+
+    def _fill_rack_table_from_summary(self, groups, preserve=True):
         """把识别出来的支架长度分档填进小表格。
 
         已经有行的时候（删框 / 加框 / 过滤之后重算）按"长度最接近"把之前填的
@@ -5561,13 +5638,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         old = []
-        for i in range(t.rowCount()):
-            try:
-                old.append((float((t.item(i, 1).text() or "0").strip()),
-                            (t.item(i, 0).text() if t.item(i, 0) else "").strip(),
-                            (t.cellWidget(i, 3).text() if t.cellWidget(i, 3) else "")))
-            except Exception:
-                old.append((None, "", ""))
+        if preserve:
+            for i in range(t.rowCount()):
+                try:
+                    old.append((float((t.item(i, 1).text() or "0").strip()),
+                                (t.item(i, 0).text() if t.item(i, 0) else "").strip(),
+                                (t.cellWidget(i, 3).text() if t.cellWidget(i, 3) else "")))
+                except Exception:
+                    old.append((None, "", ""))
         t.setRowCount(len(groups))
         for i, g in enumerate(groups):
             L = float(g.get("length") or 0)
@@ -5591,12 +5669,88 @@ class MainWindow(QMainWindow):
             sp.setAlignment(Qt.AlignCenter)
             _m = re.search(r"\d+", str(keep_s or ""))
             sp.setText(_m.group(0) if _m else "")
+            sp.textChanged.connect(self._schedule_rack_apply)
             t.setCellWidget(i, 3, sp)
             t.setRowHeight(i, 24)
+        self._seed_recog_rack_strings()
         try:
             t.horizontalHeader().resizeSection(3, 80)
         except Exception:
             pass
+
+    def _schedule_rack_apply(self, *_args):
+        """识别页类型表填完整后自动同步到「支架」页，避免明细漏掉新出现的类型。"""
+        if not getattr(self, "_recog_doc", None):
+            return
+        t = getattr(self, "_rack_apply_timer", None)
+        if t is None:
+            t = self._rack_apply_timer = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._auto_apply_recog_racks)
+        t.start(350)
+
+    def _auto_apply_recog_racks(self):
+        if not getattr(self, "_recog_doc", None):
+            return
+        if self._recog_rack_rows() and self._recog_rack_all_filled():
+            self.on_apply_recog_racks()
+
+    def _seed_recog_rack_strings(self, types=None):
+        """识别页长度分档 -> 串数：用已识别类型按长度/数量回填，避免详情与识别表脱节。"""
+        t = getattr(self, "recog_rack_table", None)
+        if t is None:
+            return
+        types = list(types if types is not None else self._rack_types_current())
+        if not types:
+            return
+        for i in range(t.rowCount()):
+            cur = t.item(i, 0)
+            if cur is not None and cur.text().strip():
+                continue
+            try:
+                length = float((t.item(i, 1).text() if t.item(i, 1) else "").strip())
+            except Exception:
+                length = None
+            try:
+                count = int(float((t.item(i, 2).text() if t.item(i, 2) else "").strip()))
+            except Exception:
+                count = None
+            best, score = None, None
+            for tp in types:
+                try:
+                    tl = float(tp.get("length_ft"))
+                except Exception:
+                    tl = None
+                if length is not None and tl is not None and tl > 0:
+                    e = abs(length - tl) / max(length, tl, 1.0)
+                    if e <= 0.10 and (score is None or e < score):
+                        best, score = tp, e
+            if best is None and count is not None:
+                for tp in types:
+                    try:
+                        tc = int(float(tp.get("total_count")))
+                    except Exception:
+                        continue
+                    e = abs(count - tc) / float(max(count, tc, 1))
+                    if e <= 0.05 and (score is None or e < score):
+                        best, score = tp, e
+            if best is None and len(types) == t.rowCount():
+                ordered = sorted(
+                    types,
+                    key=lambda tp: (float(tp.get("length_ft") or 0),
+                                    int(tp.get("total_count") or 0)))
+                best = ordered[i]
+            if best is None or best.get("strings") in (None, ""):
+                continue
+            val = str(best.get("strings"))
+            if cur is None:
+                cur = QTableWidgetItem("")
+                cur.setTextAlignment(Qt.AlignCenter)
+                t.setItem(i, 0, cur)
+            cur.setText(val)
+            sp = t.cellWidget(i, 3)
+            if sp is not None and not sp.text().strip():
+                sp.setText(self._rack_split_pref.get(val, ""))
 
     def _recog_rack_all_filled(self):
         rows = self._recog_rack_rows()
@@ -5640,7 +5794,10 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._recog_write("重算支架长度分档失败：%s" % e)
         try:
-            if self._rack_types_current() and self._recog_rack_all_filled():
+            if self._recog_rack_all_filled():
+                t = getattr(self, "_rack_apply_timer", None)
+                if t is not None:
+                    t.stop()
                 if self.on_apply_recog_racks():
                     self._recog_write("支架页明细已按改后的结果重新应用")
         except Exception as e:
@@ -6579,48 +6736,38 @@ class MainWindow(QMainWindow):
         self._recog_write("识别结果检查：%d 页有问题（没编号的 LBD 可在画布选中后改名；"
                           "没落档的支架可在「整册支架长度」表补一档）" % len(iss))
 
-    def on_recog_relabel(self):
-        """按 PDF 文字层重新识别本页 LBD 编号（挪过 / 加过 LBD 框之后用）。
-
-        用和识别时同一套规则（框内最近的文字 + 标签表这个分表的号表）；读到就写回，
-        读不到的保留原来名字 —— 不会把手工改过的编号抹掉。
-        """
-        doc = getattr(self, "_recog_doc", None)
-        pdf = (self.get_text("pdf") or "").strip()
-        pg = getattr(self, "_recog_page", None)
-        if not (doc and pdf and os.path.exists(pdf) and pg):
-            self._recog_write("重新识别编号：先选 PDF、识别出一页再来")
-            return
+    def _recog_relabel_one_page(self, doc, pdf, pg, labels, sheet_names, sheet_hint=None):
+        """强制重配一页 LBD 编号；只改当前识别结果，不重跑 YOLO、不改框。"""
+        import detect as _d
+        import lbd_naming as _N
         trk = next((p for p in doc.get("yolo_tracker_detection_results") or []
                     if p.get("page_number") == pg), None)
         dets = ((trk or {}).get("data") or {}).get("detections") or []
         if not dets:
-            self._recog_write("这一页没有识别结果")
-            return
-        try:
-            import detect as _d
-            import lbd_naming as _N
-            ts = _d.pdf_text_runs(pdf, pg)
-            meta = next((p for p in (doc.get("input_data") or {}).get("pages") or []
-                         if p.get("page_number") == pg), {})
-            W, H = float(meta.get("width") or 0), float(meta.get("height") or 0)
-            xlsx = (self.get_text("xlsx") or "").strip()
-            sheet_names = read_xlsx_sheet_names(xlsx) if xlsx else []
-            labels = read_xlsx_lbd_labels(xlsx) if xlsx else {}
-            sheet, _c = _N.page_sheet_by_text(ts, sheet_names) if sheet_names else (None, 0)
-            num_set = set((labels.get(sheet) or {}).keys()) if sheet else set()
-            shapes = _d._shapes_of(dets)
-            _N.autofill_shapes(shapes, ts, sheet, num_set, W, H)
-        except Exception as e:
-            self._recog_write("重新识别编号失败：%s" % e)
-            return
+            return {"page": pg, "nodes": 0, "skipped": True}
+        meta = next((p for p in (doc.get("input_data") or {}).get("pages") or []
+                     if p.get("page_number") == pg), {})
+        W, H = float(meta.get("width") or 0), float(meta.get("height") or 0)
+        if W <= 0 or H <= 0:
+            raise ValueError("第 %s 页缺少页面宽高" % pg)
+        ts = _d.pdf_text_runs(pdf, pg)
+        sheet, _c = (_N.page_sheet_by_text(ts, sheet_names)
+                     if sheet_names else (None, 0))
+        sheet = sheet or sheet_hint
+        num_set = set((labels.get(sheet) or {}).keys()) if sheet else set()
+        shapes = _d._shapes_of(dets)
+        old_names = {i: (s.get("name") or "").strip()
+                     for i, s in enumerate(shapes) if (s.get("label") or "") == "Node"}
+        st = _N.autofill_shapes(
+            shapes, ts, sheet, num_set, W, H, force=True)
+
         ocr = next((p for p in doc.get("ocr_node_name_results") or []
                     if p.get("page_number") == pg), None)
         if ocr is None:
             ocr = {"page_number": pg, "data": []}
             doc.setdefault("ocr_node_name_results", []).append(ocr)
         recs = ocr.setdefault("data", [])
-        changed = kept = k = 0
+        rows, k = [], 0
         for i, s in enumerate(shapes):
             if (s.get("label") or "") != "Node":
                 continue
@@ -6629,41 +6776,145 @@ class MainWindow(QMainWindow):
                              "preliminary_node_name": "", "selected": {}})
             rec = recs[k]
             nm = (s.get("name") or "").strip()
-            if nm:
-                if (rec.get("final_node_name") or "") != nm:
-                    changed += 1
-                rec["final_node_name"] = nm
-                rec["preliminary_node_name"] = nm
-            else:
-                kept += 1
+            rec["final_node_name"] = nm
+            rec["preliminary_node_name"] = nm
             b = dets[i].get("bbox") or {}
             if all(t in b for t in ("x1", "y1", "x2", "y2")):
-                rec["node_bbox"] = {t: round(float(b[t]), 2) for t in ("x1", "y1", "x2", "y2")}
-            dets[i]["raw"] = dict(s.get("raw") or dets[i].get("raw") or {})
+                rec["node_bbox"] = {t: round(float(b[t]), 2)
+                                    for t in ("x1", "y1", "x2", "y2")}
+            raw = dict(s.get("raw") or dets[i].get("raw") or {})
+            dets[i]["raw"] = raw
+            rec["recognized_text"] = (raw.get("recognized_text")
+                                      or raw.get("label_text") or nm)
+            # 编号和位置必须一起写回，否则画布/下游会看到“有编号、没位置”。
+            for key in ("label_pos", "label_bbox", "label_src", "label_box_kind"):
+                if key in raw and raw.get(key) not in (None, ""):
+                    rec[key] = raw[key]
+                else:
+                    rec.pop(key, None)
+            dets[i]["_auto"] = bool(s.get("_auto"))
+            dets[i]["_miss"] = bool(s.get("_miss"))
+            dets[i]["_check"] = bool(s.get("_check"))
+            rows.append((i, rec, s))
             k += 1
-        # 读不到具体编号的：填上同页公共前缀（如 INV11A101-LBD-），用户只要补数字
-        pref, filled = "", 0
-        try:
-            import lbd_naming as _N2
-            pref = _N2.lbd_prefix_of([r.get("final_node_name") for r in recs[:k]])
-        except Exception:
-            pref = ""
+
+        # 读不到具体编号的：填同页公共前缀，方便手工补数字；旧编号在前面已兜底保留。
+        pref = _N.lbd_prefix_of([r.get("final_node_name") for r in recs[:k]])
+        pref_filled = 0
         if pref:
-            for r in recs[:k]:
-                if not (r.get("final_node_name") or "").strip():
-                    r["final_node_name"] = pref
-                    r["preliminary_node_name"] = pref
-                    filled += 1
+            for rec in recs[:k]:
+                if not (rec.get("final_node_name") or "").strip():
+                    rec["final_node_name"] = pref
+                    rec["preliminary_node_name"] = pref
+                    pref_filled += 1
+
+        changed = named = 0
+        for i, rec, s in rows:
+            nm = (rec.get("final_node_name") or "").strip()
+            dets[i]["name"] = nm
+            if nm != old_names.get(i, ""):
+                changed += 1
+            if nm:
+                named += 1
+        return {
+            "page": pg, "nodes": k, "named": named, "changed": changed,
+            "pos": sum(1 for _i, rec, _s in rows if rec.get("label_pos")),
+            "filled": int(st.get("filled") or 0),
+            "auto": int(st.get("auto") or 0),
+            "kept": int(st.get("kept_on_miss") or 0),
+            "missed": int(st.get("missed") or 0),
+            "pos_added": int(st.get("pos_added") or 0),
+            "pref": pref, "pref_filled": pref_filled,
+            "sheet": sheet or "",
+        }
+
+    def on_recog_relabel(self):
+        """按 PDF 文字层强制重认当前结果里的整册 LBD 编号。"""
+        if getattr(self, "_recog_running", False):
+            self._recog_write("编号重认：另一轮识别还在跑，稍后再试")
+            return
+        doc = getattr(self, "_recog_doc", None)
+        pdf = (self.get_text("pdf") or "").strip()
+        if not (doc and pdf and os.path.exists(pdf)):
+            self._recog_write("重认整册编号：先选 PDF 并识别或打开识别结果")
+            return
+        page_rows = self._recog_pages_of_doc()
+        drawing_pages = [r[0] for r in page_rows if r[1] > 0]
+        if not drawing_pages:
+            self._recog_write("重认整册编号：当前识别结果里没有 LBD 区")
+            return
+        try:
+            xlsx = (self.get_text("xlsx") or "").strip()
+            sheet_names = read_xlsx_sheet_names(xlsx) if xlsx else []
+            labels = read_xlsx_lbd_labels(xlsx) if xlsx else {}
+        except Exception as e:
+            sheet_names, labels = [], {}
+            self._recog_write("重认整册编号：标签文件读取失败，改为只按 PDF 文字层识别（%s）" % e)
+
+        # 和整册识别一致：页面文字认不出分表时，按有 LBD 的图纸页顺序对应标签分表。
+        sheet_by_order = {}
+        for i, pg in enumerate(drawing_pages):
+            if i < len(sheet_names):
+                sheet_by_order[pg] = sheet_names[i]
+
+        self._recog_running = True
+        self.setEnabled(False)
+        if hasattr(self, "recog_btn"):
+            self.recog_btn.setEnabled(False)
+        self.recog_relabel_btn.setEnabled(False)
+        self.recog_bar.setMaximum(len(drawing_pages))
+        self.recog_bar.setValue(0)
+        self.recog_prog_text.setText(T("0%%（0/%d）", len(drawing_pages)))
+        self.recog_status.setText("正在重认整册编号…")
+        self._recog_write("=== 重认整册编号：%d 个图纸页，强制按 PDF 文字层重新核对"
+                          % len(drawing_pages))
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        totals = {k: 0 for k in ("nodes", "named", "changed", "pos", "filled", "auto",
+                                 "kept", "missed", "pos_added", "pref_filled")}
+        failed = []
+        try:
+            for n, pg in enumerate(drawing_pages, 1):
+                try:
+                    st = self._recog_relabel_one_page(
+                        doc, pdf, pg, labels, sheet_names, sheet_by_order.get(pg))
+                except Exception as e:
+                    failed.append(pg)
+                    self._recog_write("第 %s 页编号重认失败：%s" % (pg, e))
+                    st = {}
+                for key in totals:
+                    totals[key] += int((st or {}).get(key) or 0)
+                self.recog_bar.setValue(n)
+                self.recog_status.setText(
+                    T("正在重认整册编号：第 %s 页（%d/%d）", pg, n, len(drawing_pages)))
+                if n == 1 or n == len(drawing_pages) or n % 5 == 0:
+                    self._recog_write("第 %s 页编号重认完（%d/%d）" % (pg, n, len(drawing_pages)))
+                QApplication.processEvents()
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.setEnabled(True)
+            if hasattr(self, "recog_btn"):
+                self.recog_btn.setEnabled(True)
+            self.recog_relabel_btn.setEnabled(True)
+            self._recog_running = False
+
         self._recog_dirty = True
         if hasattr(self, "recog_save_btn"):
             self.recog_save_btn.setEnabled(True)
         self._recog_mark_dirty()
+        cur = getattr(self, "_recog_page", None)
+        target = cur if cur in drawing_pages else drawing_pages[0]
+        self._recog_preview_page(target)
         self._recog_refresh_names()
-        self._recog_update_page_info(pg)
-        self._recog_write("重新识别 LBD 编号（第 %s 页）：改到 %d 个、%d 个没读到%s"
-                          % (pg, changed, kept,
-                             ("（%d 个填了前缀 %s，补数字即可）" % (filled, pref))
-                             if filled else "（保留原值）"))
+        self.recog_status.setText(
+            T("整册编号重认完成：%d 页、%d 个编号", len(drawing_pages) - len(failed),
+              totals["named"]))
+        self._recog_write(
+            "整册编号重认完成：处理 %d 页，LBD %d 个；编号位置 %d 个；改号 %d 个；按文字层配到 %d 个、"
+            "按标签表推 %d 个；读不到而保留旧号 %d 个、仍没号 %d 个；补前缀 %d 个%s"
+            % (len(drawing_pages) - len(failed), totals["nodes"], totals["pos"], totals["changed"],
+               totals["filled"], totals["auto"], totals["kept"], totals["missed"],
+               totals["pref_filled"],
+               ("；%d 页失败（看日志）" % len(failed)) if failed else ""))
 
     def on_recog_lock_lbd(self, on):
         """锁定 / 解锁本页的 LBD 区（写进识别结果，和标注软件同一套：点不中/拖不动/删不掉）。"""
@@ -6719,7 +6970,7 @@ class MainWindow(QMainWindow):
         """ESC：退出画框模式，回到选择模式。
 
         画框模式一直挂着的时候，鼠标一动就拖出虚线框、框也点不中 —— 这两个 bug
-        都是它引起的；标注软件里 ESC 也是这个语义（先丢这一笔，再退模式）。
+        都是它引起的；现在一次 ESC 同时丢掉未完成的一笔并退出模式。
         """
         for b in (getattr(self, "recog_draw_btns", {}) or {}).values():
             b.setChecked(False)
@@ -6730,6 +6981,14 @@ class MainWindow(QMainWindow):
             c.setDragMode(QGraphicsView.RubberBandDrag)
             c.setCursor(Qt.ArrowCursor)
         self._recog_write("已退出画框模式（回到选择模式）")
+
+    def _on_global_escape(self):
+        """窗口级 ESC：焦点在输入框或工具栏时也能退出画框模式。"""
+        c = getattr(self, "recog_canvas", None)
+        buttons = getattr(self, "recog_draw_btns", {}) or {}
+        active = bool(c and (c.add_mode or c._rubber))
+        if active or any(b.isChecked() for b in buttons.values()):
+            self.on_recog_escape()
 
     def on_recog_box_added(self, kind, det_index):
         self._recog_sync_all("加了一个%s框" % ("LBD 区" if kind == "Node" else "支架"))
@@ -6778,7 +7037,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "还没识别", "先点「开始识别」。")
             return
         # 先把当前识别页的选择应用到支架类型，再统一落盘一次。
-        self.on_apply_recog_racks()
+        if self._recog_rack_rows() and not self.on_apply_recog_racks():
+            QMessageBox.warning(
+                self, "支架类型不完整",
+                "识别页的支架长度分档还没全部填好串数，先补完整再进入下一步。")
+            return
         self.on_save_recog_edits()
         if getattr(self, "_recog_dirty", False):
             QMessageBox.warning(self, "保存失败", "识别结果没有保存成功，请检查 JSON 路径。")
@@ -6962,6 +7225,8 @@ class MainWindow(QMainWindow):
             le.setObjectName("Field")
             le.setMinimumWidth(110)
             le.setPlaceholderText(T("长度"))
+            le.setReadOnly(True)
+            le.setToolTip(T("长度来自识别结果；这里只读"))
             pref = self._rack_len_pref.get(key)
             if pref:
                 le.setText(pref)
@@ -6986,10 +7251,18 @@ class MainWindow(QMainWindow):
     def rack_row_values(self):
         return [(k, le.text().strip(), sp.text().strip()) for k, le, sp in self.rack_rows]
 
-    def on_rack_types(self, rows):
+    def on_rack_types(self, payload):
         """后台线程解析出支架类型后（bus.racks 信号）自动填进明细行。"""
         try:
+            generation = None
+            if isinstance(payload, dict):
+                generation, rows = payload.get("generation"), payload.get("rows") or []
+                if generation is not None and generation != self._rack_generation:
+                    return
+            else:
+                rows = payload or []
             self.refresh_rack_rows(rows or [])
+            self._seed_recog_rack_strings(rows or [])
             if rows:
                 txt = _lr_rack_text(rows) if _lr_rack_text else ""
                 self.log_msg("支架类型已自动填入 %d 类：%s（拆不拆请在「支架」页选）"
@@ -7001,9 +7274,12 @@ class MainWindow(QMainWindow):
         """手动刷新：从识别结果重新读支架类型。"""
         cfg = self.cfg()
         self.log_msg("正在从识别结果读取支架类型…")
-        threading.Thread(target=self._rack_fill_worker, args=(cfg, True), daemon=True).start()
+        threading.Thread(target=self._rack_fill_worker,
+                         args=(cfg, True, self._rack_generation), daemon=True).start()
 
-    def _rack_fill_worker(self, cfg, announce=True):
+    def _rack_fill_worker(self, cfg, announce=True, generation=None):
+        if generation is None:
+            generation = self._rack_generation
         if _lr_rack_types is None:
             if announce:
                 self.bus.prog.emit("支架类型读取失败：缺少 lbd_regions.py")
@@ -7017,19 +7293,23 @@ class MainWindow(QMainWindow):
             if r:
                 rows, src = r, cand
                 break
+        if generation != self._rack_generation:
+            return []
         if rows:
-            self.bus.racks.emit(rows)
+            self.bus.racks.emit({"generation": generation, "rows": rows})
             if announce:
                 self.bus.prog.emit("支架类型来自 %s" % os.path.basename(src))
         elif announce:
-            self.bus.prog.emit("未在识别结果里读到支架类型（支架页保持手填）。")
+            self.bus.prog.emit(
+                "未在识别结果里读到支架类型：请回识别页把「整册支架长度 → 串数」填完整。")
         return rows
 
     def auto_fill_rack_types_async(self, cfg, announce=True):
         """能自动填就自动填；解析放在后台线程，不卡界面。"""
         if _lr_rack_types is None or not cfg.get("rackAuto", True):
             return
-        threading.Thread(target=self._rack_fill_worker, args=(cfg, announce), daemon=True).start()
+        threading.Thread(target=self._rack_fill_worker,
+                         args=(cfg, announce, self._rack_generation), daemon=True).start()
         self.on_refresh_str_preview()
         self.on_refresh_quad_preview()
 
@@ -7191,7 +7471,9 @@ class MainWindow(QMainWindow):
         return page
 
     def show_section(self, idx):
-        self.run_active = False
+        if getattr(self, "run_active", False):
+            self.log_msg("执行中不能切换左侧页面；需要中止请点「停止」")
+            return
         self.section_stack.setCurrentIndex(idx)
         self.content_stack.setCurrentIndex(0)
         if hasattr(self, "sidebar"):
@@ -7207,7 +7489,9 @@ class MainWindow(QMainWindow):
 
     def show_recog_workspace(self):
         """整个窗口只留识别（和标注软件那样）：侧边栏收起来，识别填完点「下一步」再进流程。"""
-        self.run_active = False
+        if getattr(self, "run_active", False):
+            self.log_msg("执行中不能返回识别页；需要中止请点「停止」")
+            return
         self.content_stack.setCurrentIndex(2)
         if hasattr(self, "sidebar"):
             self.sidebar.setVisible(False)
@@ -7579,6 +7863,7 @@ class MainWindow(QMainWindow):
             self.log_msg("写入执行配置失败：" + str(e))
             return
         self.run_active = True
+        self._set_navigation_enabled(False)
         self.total = 0
         self.done_n = 0
         self.run_status = "开始执行：连接 CAD…"
@@ -7586,7 +7871,7 @@ class MainWindow(QMainWindow):
         self.count_label.setText(T("已绘制  0 / ？"))
         self.pbar.setValue(0)
         self.content_stack.setCurrentIndex(1)
-        self.log_msg("正在调用 ZWCAD 执行（请切到 ZWCAD 等待）…")
+        self.log_msg("正在调用 CAD 执行（请切到 CAD 等待）…")
         self._prog_path = prog
         self._prog_len = 0
         # 新一轮：各阶段的进度/计时全部清零（阶段在 _poll_prog 里只往前推进）
@@ -7604,9 +7889,6 @@ class MainWindow(QMainWindow):
         self._step_t0 = self._run_started
         self._paused = False
         self._stopped = False
-        if hasattr(self, "pause_btn"):
-            self.pause_btn.setEnabled(True)
-            self.pause_btn.setText(T("暂停"))
         if hasattr(self, "stop_btn"):
             self.stop_btn.setEnabled(True)
         for _p in (self._pause_flag_path(), self._stop_flag_path()):
@@ -7621,7 +7903,16 @@ class MainWindow(QMainWindow):
         self._poll_timer.start(150)
         threading.Thread(target=auto_worker, args=(cfg, ini, prog, self.bus), daemon=True).start()
 
-    # ---------------- 暂停 / 继续 ----------------
+    def _set_navigation_enabled(self, enabled):
+        """执行期间锁住左栏和返回识别，避免中途切页把运行状态清掉。"""
+        for b in list(getattr(self, "nav_buttons", []) or []):
+            b.setEnabled(bool(enabled))
+        for b in (getattr(self, "back_recog_btn", None),
+                  getattr(self, "recog_prev_btn", None)):
+            if b is not None:
+                b.setEnabled(bool(enabled))
+
+    # ---------------- 停止 ----------------
     def _pause_flag_path(self):
         return os.path.join(tempfile.gettempdir(), "vcad_pause.flag")
 
@@ -7642,47 +7933,12 @@ class MainWindow(QMainWindow):
         self.run_status = "已停止（等 CAD 侧收尾）"
         self.status_label.setText(self.run_status)
         self.log_msg("已请求停止：CAD 侧会在下一个检查点收尾（不再画剩下的布局 / 不再写标签）；"
-                     "要立刻中断当前命令，请在 ZWCAD 里按 ESC")
+                     "要立刻中断当前命令，请在 CAD 里按 ESC")
         if self._poll_timer:
             self._poll_timer.stop()
         if hasattr(self, "stop_btn"):
             self.stop_btn.setEnabled(False)
         self._log_run_times("执行已停止")
-
-    def on_pause(self):
-        """「暂停 / 继续」：冻结界面与进度（随时可停），并把暂停标记写出去。
-
-        真正落图的活儿在 ZWCAD 里跑，Python 这侧停不了 CAD 的当前命令；
-        这里做的是：停止推进进度、停止读进度文件、写下暂停标记（插件侧后续可接力），
-        想立刻停画图就在 CAD 里按 ESC。
-        """
-        if not self.run_active:
-            self.log_msg("现在没有在执行")
-            return
-        self._paused = not self._paused
-        if self._paused:
-            self.pause_btn.setText(T("继续"))
-            self._step_pause()
-            try:
-                with open(self._pause_flag_path(), "w", encoding="utf-8") as f:
-                    f.write("paused")
-            except Exception:
-                pass
-            self.log_msg("已暂停：进度停在当前这一步，点「继续」接着往下跑"
-                         "（CAD 侧正在执行的命令要立刻停，请在 ZWCAD 里按 ESC）")
-            if self._poll_timer:
-                self._poll_timer.stop()
-        else:
-            self.pause_btn.setText(T("暂停"))
-            try:
-                os.remove(self._pause_flag_path())
-            except Exception:
-                pass
-            self.log_msg("继续执行…")
-            self._step_t0 = time.time()
-            if self._poll_timer:
-                self._poll_timer.start(150)
-                self._poll_prog()
 
     def _step_pause(self):
         """把当前这一步的累计耗时记下来（暂停时也要把这一段的账结掉）。"""
@@ -7711,9 +7967,9 @@ class MainWindow(QMainWindow):
         elif "0/4" in msg:
             self.run_status = T("正在生成 LBD / 支架标签…")
         elif "1/4" in msg or "连接" in msg or "启动" in msg:
-            self.run_status = T("正在连接 / 启动 ZWCAD…（可能需 10-30 秒，请切到 ZWCAD）")
+            self.run_status = T("正在连接 / 启动 CAD…（可能需 10-30 秒，请切到 CAD）")
         elif "2/4" in msg:
-            self.run_status = T("已连接 ZWCAD，正在打开 DWG…")
+            self.run_status = T("已连接 CAD，正在打开 DWG…")
         elif "3/4" in msg:
             self.run_status = T("DWG 就绪，正在加载插件并执行…")
         elif "START" in up:
@@ -7741,6 +7997,8 @@ class MainWindow(QMainWindow):
                                if _m else T("正在按 LBD 区域上下限对准视口…"))
         elif "REGION_TOTAL" in up:
             self.run_status = T("正在按 LBD 区域上下限对准视口…")
+        elif "LYNX_PLACE" in up:
+            self.run_status = T("正在对齐 LYNX 标签并避让编号 / STR…")
         elif "STOPPED" in up:
             # 用户点了「停止」：插件在检查点收尾，这里跟着收摊（要排在 DONE 前面，
             # 因为收尾消息是 STOPPED_DONE，也含 DONE）
@@ -7775,7 +8033,8 @@ class MainWindow(QMainWindow):
         """把状态文字归成"哪一步"，用来计时（状态文字本身会一直变，不能直接当步名）。"""
         s = status or ""
         for k in ("连接 / 启动", "打开 DWG", "加载插件", "批量布局",
-                  "区域 / 支架范围", "LBD / 支架标签", "绘制", "打印 / 导出", "完成"):
+                  "区域 / 支架范围", "LBD / 支架标签", "绘制",
+                  "LYNX", "打印 / 导出", "完成"):
             if k in s:
                 return k
         return s or "执行"
@@ -7791,10 +8050,9 @@ class MainWindow(QMainWindow):
                                              ("（" + "、".join(parts) + "）") if parts else ""))
         self.log_msg("想调整识别结果（改框 / 改名 / 加框），点左下角「← 返回识别」或按 Ctrl+B，"
                      "改完再「下一步」回来；改过的地方都会保留。")
-        if hasattr(self, "pause_btn"):
-            self.pause_btn.setEnabled(False)
-            self.pause_btn.setText(T("暂停"))
         self._paused = False
+        self.run_active = False
+        self._set_navigation_enabled(True)
         try:
             os.remove(self._pause_flag_path())
         except Exception:
@@ -7972,7 +8230,7 @@ class MainWindow(QMainWindow):
         devices = cad_plot_devices(doc)
         if not devices:
             QMessageBox.warning(self, "导出 PDF",
-                                "没读到 PDF 类打印设备。\n请确认 ZWCAD 里有 PDF 打印配置"
+                                "没读到 PDF 类打印设备。\n请确认 CAD 里有 PDF 打印配置"
                                 "（例如 DWG to PDF.pc5 / ZWPLOT_PDF.pc5）。")
             return
         default_dev = self._print_prefs.get("device")
