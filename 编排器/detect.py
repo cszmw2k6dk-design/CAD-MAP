@@ -407,6 +407,77 @@ def dedup_dets(dets):
     return out, stats
 
 
+def filter_extra_rack_rows(dets, ratio=0.65):
+    """删除夹在两条正常 row 之间的多余 Tracker 行。
+
+    正常 row 距取本页相邻 row 距的中位数。若某行到上下两行的距离都异常小，
+    且两段距离之和约等于一个正常 row 距，就只删除中间这一行。
+    Node 和正常 Tracker 不受影响。
+    """
+    trackers = [(i, d) for i, d in enumerate(dets)
+                if (d.get("label") or "") in ("Tracker", "Typical")]
+    if len(trackers) < 3:
+        return dets, {"removed": 0}
+    shorts = []
+    for _i, d in trackers:
+        b = d.get("bbox") or {}
+        try:
+            shorts.append(min(float(b["x2"]) - float(b["x1"]),
+                              float(b["y2"]) - float(b["y1"])))
+        except Exception:
+            pass
+    if not shorts:
+        return dets, {"removed": 0}
+    shorts.sort()
+    tol = max(3.0, shorts[len(shorts) // 2] * 0.35)
+    pts = []
+    for i, d in trackers:
+        b = d.get("bbox") or {}
+        try:
+            cy = (float(b["y1"]) + float(b["y2"])) / 2.0
+        except Exception:
+            continue
+        pts.append((cy, i))
+    if len(pts) < 3:
+        return dets, {"removed": 0}
+    pts.sort()
+    rows, cur = [], [(pts[0][0], pts[0][1])]
+    for cy, i in pts[1:]:
+        mean = sum(v[0] for v in cur) / len(cur)
+        if abs(cy - mean) <= tol:
+            cur.append((cy, i))
+        else:
+            rows.append(cur)
+            cur = [(cy, i)]
+    rows.append(cur)
+    if len(rows) < 3:
+        return dets, {"removed": 0}
+    centers = [sum(v[0] for v in row) / len(row) for row in rows]
+    gaps = [centers[i + 1] - centers[i] for i in range(len(centers) - 1)]
+    positive = sorted(g for g in gaps if g > 0)
+    if len(positive) < 2:
+        return dets, {"removed": 0}
+    normal = positive[len(positive) // 2]
+    if normal <= 0:
+        return dets, {"removed": 0}
+    drop_rows = set()
+    for i in range(1, len(rows) - 1):
+        a, b = gaps[i - 1], gaps[i]
+        if (a < ratio * normal and b < ratio * normal
+                and 0.80 * normal <= a + b <= 1.20 * normal):
+            drop_rows.add(i)
+    if not drop_rows:
+        return dets, {"removed": 0}
+    drop_idx = {idx for i in drop_rows for _cy, idx in rows[i]}
+    kept = [d for i, d in enumerate(dets) if i not in drop_idx]
+    return kept, {
+        "removed": len(drop_idx),
+        "rows_removed": len(drop_rows),
+        "normal_gap": round(normal, 2),
+        "threshold": round(normal * ratio, 2),
+    }
+
+
 def drop_outliers(dets, width, height, min_count=8, gap_ratio=0.10):
     """【暂未启用】去掉离「主体」很远的框（同一张图上的细节图 / 角落误检）。
 
@@ -550,6 +621,7 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
     table_engine = None
     table_module = None
     filtered_total = 0
+    rack_row_filtered = 0
     if keep_tables or filter_interference:
         try:
             import table_regions as table_module
@@ -583,6 +655,13 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
                        _filt.get("Tracker", 0)))
         else:
             good_nodes = [d for d in dets if d.get("label") == "Node"]
+        dets, _rowf = filter_extra_rack_rows(dets)
+        rack_row_filtered += int(_rowf.get("removed") or 0)
+        if _rowf.get("removed") and log:
+            log("第 %s 页：过滤两条正常 row 之间的多余支架 %d 根"
+                "（正常 row 距 %.1f，判定阈值 %.1f）"
+                % (pg, _rowf.get("removed"), _rowf.get("normal_gap") or 0,
+                   _rowf.get("threshold") or 0))
         per_page[pg] = {"width": im.width, "height": im.height, "detections": dets}
         if table_module is not None:
             if log:
@@ -758,7 +837,9 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
     )
     summary = {"stat": stat, "groups": groups, "note": gnote,
                "drawing_pages": drawing, "table_pages": len(table_by_page),
-               "filtered_frames": filtered_total, "table_tagged": table_tagged}
+               "filtered_frames": filtered_total,
+               "rack_row_filtered": rack_row_filtered,
+               "table_tagged": table_tagged}
     return doc, summary
 
 

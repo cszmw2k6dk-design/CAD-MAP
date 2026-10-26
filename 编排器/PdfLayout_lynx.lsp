@@ -3,6 +3,155 @@
 (setq *PdfLayout_LynxMaxStep* 8)
 (setq *PdfLayout_LynxRowFactor* 4.0)
 
+(defun PdfLayout_LynxViewState (vpObj / ed c h)
+  (setq ed (vl-catch-all-apply
+             '(lambda ()
+                (entget (vlax-vla-object->ename vpObj)))))
+  (if (vl-catch-all-error-p ed)
+    nil
+    (progn
+      (setq c (cdr (assoc 12 ed)) h (cdr (assoc 40 ed)))
+      (if (and c h (numberp h) (> h 0.0))
+        (list (float (car c)) (float (cadr c)) (float h))
+        nil
+      )
+    )
+  )
+)
+
+(defun PdfLayout_LynxViewMatches (vpObj center viewH / st)
+  (setq st (PdfLayout_LynxViewState vpObj))
+  (and st
+       (< (abs (- (car st) (car center)))
+          (max 1e-6 (* 1e-5 viewH)))
+       (< (abs (- (cadr st) (cadr center)))
+          (max 1e-6 (* 1e-5 viewH)))
+       (< (abs (- (caddr st) viewH))
+          (max 1e-5 (* 1e-4 viewH)))
+  )
+)
+
+(defun PdfLayout_FitViewport (vpObj bbox lockVp
+                              / bb pmin pmax pw ph minPt maxPt center w h
+                                scale viewH inset oldCmdEcho oldExpert ok)
+  ;; Verified replacement for the plugin function. It returns T only when
+  ;; the viewport DXF data really matches the requested center and height.
+  (setq bb (PdfLayout_GetExtentsSafeObj vpObj))
+  (if (and bb bbox)
+    (progn
+      (setq pmin (car bb) pmax (cadr bb))
+      (setq inset (if (and *PdfLayout_ViewInset*
+                           (numberp *PdfLayout_ViewInset*)
+                           (> *PdfLayout_ViewInset* 0.05)
+                           (<= *PdfLayout_ViewInset* 1.0))
+                    *PdfLayout_ViewInset* 1.0))
+      (setq pw (- (car pmax) (car pmin))
+            ph (- (cadr pmax) (cadr pmin)))
+      (setq minPt (car bbox) maxPt (cadr bbox))
+      (setq center (list (* 0.5 (+ (car minPt) (car maxPt)))
+                         (* 0.5 (+ (cadr minPt) (cadr maxPt)))
+                         0.0))
+      (setq w (- (car maxPt) (car minPt))
+            h (- (cadr maxPt) (cadr minPt)))
+      (if (and (> pw 0.0) (> ph 0.0) (> w 0.0) (> h 0.0))
+        (progn
+          (setq scale (min (/ pw w) (/ ph h)))
+          (setq viewH (/ (/ ph scale) inset))
+          (setq oldCmdEcho (getvar "CMDECHO")
+                oldExpert (getvar "EXPERT"))
+          (setvar "CMDECHO" 0)
+          (setvar "EXPERT" 5)
+          (setq ok
+            (not (vl-catch-all-error-p
+                   (vl-catch-all-apply
+                     '(lambda ()
+                        (vla-put-ViewportOn vpObj :vlax-true)
+                        (vla-put-ViewCenter vpObj (vlax-3d-point center))
+                        (vla-put-ViewHeight vpObj viewH))
+                     nil))))
+          (setq ok (and ok (PdfLayout_LynxViewMatches vpObj center viewH)))
+          (if (not ok)
+            (progn
+              (vl-catch-all-apply 'vla-put-ViewportOn (list vpObj :vlax-true))
+              (command "._MSPACE")
+              (command "._ZOOM" "_C" center viewH)
+              (command "._PSPACE")
+              (setq ok (PdfLayout_LynxViewMatches vpObj center viewH))
+            )
+          )
+          (if lockVp
+            (vl-catch-all-apply 'vla-put-DisplayLocked (list vpObj :vlax-true))
+            (vl-catch-all-apply 'vla-put-DisplayLocked (list vpObj :vlax-false))
+          )
+          (setvar "CMDECHO" oldCmdEcho)
+          (setvar "EXPERT" oldExpert)
+          ok
+        )
+        nil
+      )
+    )
+    nil
+  )
+)
+
+(defun PdfLayout_AutoRegionFit (cfg names lockVp
+                                / regs draws i nTot k nFail nm bb r box
+                                  vps vpObj fitOk tPg0 msPg)
+  ;; Verified region fit. Counts only viewports whose DXF view really changed.
+  (setq regs (PdfLayout_AutoReadRegions (PdfLayout_ACfg cfg "regionFile" "")))
+  (setq draws (PdfLayout_ScanMarkerDrawings (PdfLayout_ACfg cfg "filter" "pdf")))
+  (setq nTot (min (length regs) (length draws) (length names)))
+  (if (> nTot 0)
+    (progn
+      (setq i 0 k 0 nFail 0)
+      (PdfLayout_Prog (strcat "REGION_TOTAL " (itoa nTot)))
+      (while (< i nTot)
+        (setq tPg0 (PdfLayout_NowMs))
+        (setq nm (nth i names)
+              bb (nth i draws)
+              r (nth i regs))
+        (setq fitOk nil)
+        (if (and (not (PdfLayout_StopGate "region-fit"))
+                 bb r (PdfLayout_GetLayoutObj nm))
+          (progn
+            (setq box (PdfLayout_AutoRegionBox bb r))
+            (command ".-LAYOUT" "_S" nm "")
+            (setq vps (PdfLayout_GetLayoutViewports nm))
+            (if vps
+              (progn
+                (setq vpObj (car (car (PdfLayout_StableSort
+                                        vps 'PdfLayout_CmpVpArea))))
+                (vl-catch-all-apply
+                  'vla-put-DisplayLocked (list vpObj :vlax-false))
+                (setq fitOk
+                  (vl-catch-all-apply
+                    'PdfLayout_FitViewport (list vpObj box lockVp)))
+                (if (vl-catch-all-error-p fitOk) (setq fitOk nil))
+              )
+            )
+          )
+        )
+        (if fitOk (setq k (1+ k)) (setq nFail (1+ nFail)))
+        (setq msPg (max 0 (- (PdfLayout_NowMs) (if tPg0 tPg0 0))))
+        (PdfLayout_Prog
+          (strcat "REGION_FIT " (itoa (1+ i)) " " (itoa nTot)
+                  " " (itoa k) " ms=" (itoa msPg)
+                  " failed=" (itoa nFail)))
+        (setq i (1+ i))
+      )
+      (if (car names) (command ".-LAYOUT" "_S" (car names) ""))
+      (PdfLayout_Prog
+        (strcat "REGION_DONE " (itoa k) " " (itoa nTot)
+                " failed=" (itoa nFail)))
+      (princ (strcat "\n[REGION-FIT] ok=" (itoa k)
+                     " failed=" (itoa nFail)
+                     " total=" (itoa nTot) "."))
+    )
+    (PdfLayout_Prog "REGION_NONE")
+  )
+  (princ)
+)
+
 (defun PdfLayout_LynxCenterY (r)
   (* 0.5 (+ (cadr r) (nth 3 r)))
 )

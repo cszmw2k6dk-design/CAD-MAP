@@ -59,7 +59,7 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_parse_split = _lr_split_rows = _lr_expand_racks = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.68"
+APP_VERSION = "2.71"
 # 这一版先不带「导出 PDF」：按钮和入口藏起来，代码保留（改成 True 就接回来）。
 FEATURE_EXPORT_PDF = False
 # 表格 OCR 暂不上线：源码保留，速度与准确率稳定后再打开并重新打包模型依赖。
@@ -124,8 +124,8 @@ DEFAULTS = {
     "strBgOn": "1", "strBgColor": "2", "strTextColor": "7", "strBgGap": "1.0",
     "overwrite": False, "labelWhere": "M",
     "regionFit": True,
-    "filterInterference": True,
-    "autoJump": True,
+    "filterInterference": False,
+    "autoJump": False,
 }
 # STR 编号顺序（8 种，和插件 PDFGRID 一致；值 = 界面上的序号）
 STR_ORDER_CHOICES = _LR_ORDER_LABELS or [
@@ -446,6 +446,7 @@ TEXT_EN = {
     "区域对准完成，接着写 LBD 标签…": "Viewport fit done; writing LBD labels…",
     "正在按 LBD 区域上下限对准视口 %s / %s": "Fitting viewport to LBD bounds %s / %s",
     "正在按 LBD 区域上下限对准视口…": "Fitting viewport to LBD bounds…",
+    "区域对准完成，%d 个视口未生效": "Region fit finished; %d viewport(s) did not update",
     "正在对齐 LYNX 标签并避让编号 / STR…":
         "Aligning LYNX labels and avoiding printed numbers / STR…",
     # ---- 识别页补充（英文界面漏翻 / 显示不全的） ----
@@ -1099,11 +1100,13 @@ def prepare_region_file(cfg, extra_dirs=()):
                         "/".join(str(p) for p in _order[:3]))
             except Exception:
                 pass
-            return out, ("区域对准：用 %s；按分表顺序 %d 个布局，%d 个匹配到 LBD 区域%s"
+            return out, ("区域对准：用 %s；按分表顺序 %d 个布局，%d 个匹配到 LBD 区域%s%s"
                          " → 生成布局后按区域上下限调视口大小%s"
                          % (os.path.basename(jp), r["pages"], r["with_region"],
                             ("（%d 个分表没匹配到，按整页对准）" % len(r.get("miss") or []))
-                            if r.get("miss") else "", _tip))
+                            if r.get("miss") else "",
+                            ("（其中 %d 个按图纸页序兜底对准）" % r.get("fallback"))
+                            if r.get("fallback") else "", _tip))
         last_err = r.get("error") or last_err
     return "", "区域对准：%s（视口按整页对准）" % (last_err or "读取失败")
 
@@ -4574,9 +4577,7 @@ class MainWindow(QMainWindow):
         if sec_title == "选项":
             r = 0
             for key, txt, init in [
-                    ("regionFit", "生成布局后按 LBD 区域上下限对准视口", True),
-                    ("filterInterference", "自动过滤 LBD 主体阵列外的图例、表格干扰框", True),
-                    ("autoJump", "模型空间标签画完后自动跳到布局", True)]:
+                    ("regionFit", "生成布局后按 LBD 区域上下限对准视口", True)]:
                 cb = self._reg(QCheckBox(), txt)
                 cb.setChecked(init)
                 self.checkbox[key] = cb
@@ -5151,7 +5152,7 @@ class MainWindow(QMainWindow):
                 pdf, pages=pages, sheets=sheets, sheet_names=list(sheets),
                 progress=_prog, log=lambda m: self.bus.recog_log.emit(m),
                 keep_tables=FEATURE_TABLE_OCR,
-                filter_interference=bool(cfg.get("filterInterference", True)))
+                filter_interference=False)
         except Exception as e:
             self._recog_write("识别失败：%s\n%s" % (e, traceback.format_exc()))
             self.bus.recog_done.emit({"ok": False})
@@ -5240,6 +5241,9 @@ class MainWindow(QMainWindow):
                               % (sm.get("table_pages"), sm.get("table_tagged", 0)))
         if sm.get("filtered_frames"):
             self.on_recog_log("已过滤图例 / 表格干扰框：%d 个" % sm.get("filtered_frames"))
+        if sm.get("rack_row_filtered"):
+            self.on_recog_log("已过滤两条正常 row 之间的多余支架：%d 根"
+                              % sm.get("rack_row_filtered"))
         self._recog_doc = info.get("doc") or None
         self._recog_tmp_path = path
         self._recog_dirty = False
@@ -7671,8 +7675,8 @@ class MainWindow(QMainWindow):
         c["filter"] = DEFAULTS["filter"]
         c["overwrite"] = False                 # 永远生成新布局，不再覆盖同名布局
         c["regionFit"] = self.checkbox["regionFit"].isChecked()
-        c["filterInterference"] = self.checkbox["filterInterference"].isChecked()
-        c["autoJump"] = self.checkbox["autoJump"].isChecked()
+        c["filterInterference"] = False
+        c["autoJump"] = False
         c["rackAuto"] = True                   # 识别结果里有支架类型就自动读，没有就手填
         c["labelWhere"] = "M"          # 固定模型空间（界面不再给「当前布局」选项）
         # 四个象限的顺序合并成一行存进配置（下游只认这一行，见 quad_map_spec）
@@ -7716,9 +7720,6 @@ class MainWindow(QMainWindow):
             else:
                 self.set_text(k, c.get(k, DEFAULTS.get(k, "")))
         self.checkbox["regionFit"].setChecked(bool(c.get("regionFit", True)))
-        self.checkbox["filterInterference"].setChecked(
-            bool(c.get("filterInterference", True)))
-        self.checkbox["autoJump"].setChecked(bool(c.get("autoJump", True)))
         # 老配置里「拆不拆」存的是 不拆 / 2行 / 3行：统一折成数字，填在「拆几行」输入框里
         if "rackSplit" in getattr(self, "edits", {}):
             _v = str(c.get("rackSplit") or "").strip()
@@ -7834,7 +7835,6 @@ class MainWindow(QMainWindow):
         self.log_msg("  " + "  ".join(_names[:20]) + ("  …" if len(_names) > 20 else ""))
         # 保存交给界面：CAD 侧不再自动 SAVEAS（autoSave=0）
         cfg["autoSave"] = "0"
-        self._auto_jump = bool(cfg.get("autoJump", True))
         self._ai_step = ensure_ai_lsp() is not None
         self._finish_ready = False
         self._phase = ""
@@ -7989,7 +7989,11 @@ class MainWindow(QMainWindow):
         elif "STEP_LBD" in up or "LBD_" in up:
             self.run_status = T("识别 LBD 标签…")
         elif "REGION_DONE" in up:
-            self.run_status = T("区域对准完成，接着写 LBD 标签…")
+            _m = re.search(r"REGION_DONE\s+(\d+)\s+(\d+)(?:\s+failed=(\d+))?", msg)
+            _failed = int(_m.group(3) or 0) if _m else 0
+            self.run_status = ((T("区域对准完成，%d 个视口未生效", _failed))
+                               if _failed else
+                               T("区域对准完成，接着写 LBD 标签…"))
         elif "REGION_FIT" in up:
             _m = re.search(r"REGION_FIT\s*(\d+)\s*(\d+)", msg)
             self.run_status = (T("正在按 LBD 区域上下限对准视口 %s / %s",
@@ -8506,6 +8510,11 @@ class MainWindow(QMainWindow):
             if _rt:
                 self.log_msg("区域对准用时：共 %d 个布局、合计 %.1f 秒（平均 %.2f 秒/个）"
                              % (len(_rt), sum(_rt), sum(_rt) / len(_rt)))
+            _rm = re.search(r"REGION_DONE\s+(\d+)\s+(\d+)(?:\s+failed=(\d+))?", txt)
+            if _rm and int(_rm.group(3) or 0):
+                self.log_msg("区域对准警告：%d / %s 个视口未通过数值校验，"
+                             "这些布局保持原视口；请检查区域范围和 CAD 视口状态。"
+                             % (int(_rm.group(3)), _rm.group(2)))
         # 3) LBD 标签 / 4) STR 号
         if "STEP_LBD" in up:
             _advance("LBD")
@@ -8619,8 +8628,6 @@ class MainWindow(QMainWindow):
                 self.save_btn.setText("下载")
                 if hasattr(self, "jump_btn"):
                     self.jump_btn.setEnabled(True)
-                if getattr(self, "_auto_jump", False):
-                    QTimer.singleShot(700, self.on_jump_layout_first)
                 self.pdf_btn.setEnabled(True)
                 self.pdf_btn.setText("导出 PDF")
                 self.finish_title.setText("执行完成，共 %d 个布局 —— 请选择保存位置"

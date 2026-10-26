@@ -2677,9 +2677,12 @@ def write_region_file_for_sheets(json_path, out_path, sheets):
     except Exception as e:
         return {"ok": False, "error": "读取识别结果失败：%s" % e}
     sheet_page = {}
+    sheet_page_norm = {}
+    drawing_pages = []
     try:
         with open(json_path, encoding="utf-8") as f:
             doc = json.load(f)
+        drawing_pages = sorted(pg for pg in by_page if isinstance(pg, int))
         for p in doc.get("ocr_node_name_results") or []:
             pg = p.get("page_number")
             if pg not in by_page:
@@ -2688,13 +2691,25 @@ def write_region_file_for_sheets(json_path, out_path, sheets):
                 nm = (r.get("final_node_name") or r.get("preliminary_node_name") or "").strip().upper()
                 i = nm.find("-LBD-")
                 if i > 0:
-                    sheet_page.setdefault(nm[:i], pg)
+                    sheet = nm[:i].strip().upper()
+                    sheet_page.setdefault(sheet, pg)
+                    sheet_page_norm.setdefault(
+                        re.sub(r"[^0-9A-Z]", "", sheet), pg)
     except Exception:
         pass
 
-    lines, hit, miss = [], 0, []
+    # 分表顺序与图纸页顺序一一对应时，对 OCR 名称暂时没配上的分表按页序兜底。
+    # 这样不会因为某页编号缺失就从“区域对准”退化成整页对准。
+    use_order = bool(drawing_pages) and len(sheets or []) == len(drawing_pages)
+    lines, hit, miss, fallback = [], 0, [], 0
     for i, name in enumerate(sheets or [], 1):
-        pg = sheet_page.get(str(name or "").strip().upper())
+        key = str(name or "").strip().upper()
+        pg = sheet_page.get(key)
+        if pg is None:
+            pg = sheet_page_norm.get(re.sub(r"[^0-9A-Z]", "", key))
+        if pg is None and use_order:
+            pg = drawing_pages[i - 1]
+            fallback += 1
         v = by_page.get(pg) if pg is not None else None
         if v is None:
             miss.append(str(name))
@@ -2708,4 +2723,4 @@ def write_region_file_for_sheets(json_path, out_path, sheets):
     except Exception as e:
         return {"ok": False, "error": "写区域文件失败：%s" % e}
     return {"ok": True, "path": out_path, "pages": len(sheets or []),
-            "with_region": hit, "miss": miss}
+            "with_region": hit, "miss": miss, "fallback": fallback}

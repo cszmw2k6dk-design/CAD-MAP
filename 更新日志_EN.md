@@ -1,3 +1,15 @@
+v2.71
+1 Removed the "switch to layout after drawing model-space labels" option; automatic layout switching is now permanently disabled.
+2 Removed automatic filtering of legends and table interference outside the main LBD array. Recognition now keeps Node/Tracker boxes outside the main array, and legacy enabled values are ignored.
+
+v2.70
+1 Fixed possible LBD region-fit failures: when a sheet name is temporarily unmatched, the sheet is now mapped by drawing-page order instead of silently falling back to the whole page.
+2 Region fitting is now verified: viewport DXF view-center and view-height values must match the requested target. Failed layouts are counted and reported instead of being marked as successfully fitted.
+3 Only layouts, drawings and region rows that actually exist are processed, preventing mismatches and false completion counts.
+
+v2.69
+1 Added rack-row spacing filtering. The median gap between normal rows is used as the per-page reference; a spurious Tracker row squeezed between two normal rows is removed only when both gaps are unusually small and their sum is about one normal row gap. Node detections are untouched.
+
 v2.68
 1 Added a final LYNX layout pass. Labels are grouped by their original LBD row and aligned by default; only labels whose real widths collide move to a stable second lane instead of shifting all following labels unpredictably.
 2 The order is now fixed: place STR numbers using the real text-box exclusions, then place LYNX labels while avoiding printed numbers, STR numbers and previously placed LYNX labels.
