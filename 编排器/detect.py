@@ -407,37 +407,42 @@ def dedup_dets(dets):
     return out, stats
 
 
-def filter_extra_rack_rows(dets, ratio=0.65):
+def filter_extra_rack_rows(dets):
     """删除夹在两条正常 row 之间的多余 Tracker 行。
 
     正常 row 距取本页相邻 row 距的中位数。若某行到上下两行的距离都异常小，
     且两段距离之和约等于一个正常 row 距，就只删除中间这一行。
     Node 和正常 Tracker 不受影响。
+
+    行先用中心 X 聚类（每个竖列算一条 row）；确认中间小 row 后，
+    再比较它与左右两条正常 row 的 Tracker Y 中心。
+    只有 Y 位置能对上一行的重复误检 row 才删除。
     """
     trackers = [(i, d) for i, d in enumerate(dets)
                 if (d.get("label") or "") in ("Tracker", "Typical")]
     if len(trackers) < 3:
         return dets, {"removed": 0}
-    shorts = []
+    widths = []
     for _i, d in trackers:
         b = d.get("bbox") or {}
         try:
-            shorts.append(min(float(b["x2"]) - float(b["x1"]),
-                              float(b["y2"]) - float(b["y1"])))
+            widths.append(float(b["x2"]) - float(b["x1"]))
         except Exception:
             pass
-    if not shorts:
+    if not widths:
         return dets, {"removed": 0}
-    shorts.sort()
-    tol = max(3.0, shorts[len(shorts) // 2] * 0.35)
+    widths.sort()
+    med_width = widths[len(widths) // 2]
+    # Same row means the same vertical column: group by centre X.
+    tol = max(4.0, med_width * 0.75)
     pts = []
     for i, d in trackers:
         b = d.get("bbox") or {}
         try:
-            cy = (float(b["y1"]) + float(b["y2"])) / 2.0
+            cx = (float(b["x1"]) + float(b["x2"])) / 2.0
         except Exception:
             continue
-        pts.append((cy, i))
+        pts.append((cx, i))
     if len(pts) < 3:
         return dets, {"removed": 0}
     pts.sort()
@@ -453,6 +458,8 @@ def filter_extra_rack_rows(dets, ratio=0.65):
     if len(rows) < 3:
         return dets, {"removed": 0}
     centers = [sum(v[0] for v in row) / len(row) for row in rows]
+    if len(rows) < 3:
+        return dets, {"removed": 0}
     gaps = [centers[i + 1] - centers[i] for i in range(len(centers) - 1)]
     positive = sorted(g for g in gaps if g > 0)
     if len(positive) < 2:
@@ -461,10 +468,29 @@ def filter_extra_rack_rows(dets, ratio=0.65):
     if normal <= 0:
         return dets, {"removed": 0}
     drop_rows = set()
+    # A false row splits one normal X gap into two smaller gaps. Confirm it
+    # by matching its Y centres to the row on either side.
     for i in range(1, len(rows) - 1):
         a, b = gaps[i - 1], gaps[i]
-        if (a < ratio * normal and b < ratio * normal
+        if not (a < 0.80 * normal and b < 0.80 * normal
                 and 0.80 * normal <= a + b <= 1.20 * normal):
+            continue
+
+        def _ys(k):
+            return sorted((dets[idx]["bbox"]["y1"] +
+                           dets[idx]["bbox"]["y2"]) / 2.0
+                          for _cx, idx in rows[k])
+
+        def _ymatch(src, dst):
+            if not src or not dst:
+                return 0.0
+            yt = max(8.0, med_width * 2.0)
+            return sum(1 for v in src
+                       if min(abs(v - q) for q in dst) <= yt) / float(len(src))
+
+        my1 = _ymatch(_ys(i), _ys(i - 1))
+        my2 = _ymatch(_ys(i), _ys(i + 1))
+        if max(my1, my2) >= 0.80:
             drop_rows.add(i)
     if not drop_rows:
         return dets, {"removed": 0}
@@ -474,7 +500,7 @@ def filter_extra_rack_rows(dets, ratio=0.65):
         "removed": len(drop_idx),
         "rows_removed": len(drop_rows),
         "normal_gap": round(normal, 2),
-        "threshold": round(normal * ratio, 2),
+        "y_match_required": 0.80,
     }
 
 
@@ -659,9 +685,8 @@ def detect_and_name(pdf_path, pages=None, sheets=None, sheet_names=None, dpi=REN
         rack_row_filtered += int(_rowf.get("removed") or 0)
         if _rowf.get("removed") and log:
             log("第 %s 页：过滤两条正常 row 之间的多余支架 %d 根"
-                "（正常 row 距 %.1f，判定阈值 %.1f）"
-                % (pg, _rowf.get("removed"), _rowf.get("normal_gap") or 0,
-                   _rowf.get("threshold") or 0))
+                "（正常 row 距 %.1f，Y 对左右行匹配 ≥80%%）"
+                % (pg, _rowf.get("removed"), _rowf.get("normal_gap") or 0))
         per_page[pg] = {"width": im.width, "height": im.height, "detections": dets}
         if table_module is not None:
             if log:

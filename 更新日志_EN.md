@@ -1,3 +1,22 @@
+v2.75
+1 Rack rows are grouped by Tracker centre X: only boxes with the same or nearly the same X belong to one vertical row.
+2 The normal row-to-row distance is the median adjacent X-centre gap. A candidate row that splits this gap into two smaller gaps is checked against the Y centres of the rows on its left and right; it is removed only when Y matching reaches 80%.
+3 Verified with a four-box false column (removed), normal columns (kept), a sparse Y-independent column (kept), and whole-page X translation (unchanged result).
+
+v2.74
+1 Rack rows now use Tracker centre-Y clustering with a tolerance of 2x box width, avoiding false rows caused by height variation.
+2 The normal row gap comes from the median distance between large rows. For a sparse row inserted between them, its Tracker X centres are compared with the previous and next rows; it is removed only when X matching is at least 80%, so legitimate sparse rows with different X positions are kept.
+3 Whole-page X translation does not change the result. The current 86-page result removes 43 false boxes across 16 pages instead of deleting by count alone.
+
+v2.73
+1 Fixed correct boxes being removed by rack-row filtering. The same-row top-edge tolerance is now 2x the Tracker short side instead of about 0.35x, so varying rack heights no longer split a valid row.
+2 Row filtering uses only top-edge Y coordinates and Tracker counts, never X-coordinate distances. The current 86-page result removes only 26 sparse false boxes across 10 pages.
+
+v2.72
+1 Fixed rack-row filtering not taking effect. Rows now use the common top edge of Tracker boxes instead of their varying centres, preventing one physical row from being split into false rows.
+2 A small row is removed only when it lies between two large rows, has far fewer Tracker boxes, and the two large rows are still about one normal row-gap apart. Normal equally populated rows are kept.
+3 In the current 86-page result, the filter detects 348 such extra boxes across 74 pages.
+
 v2.71
 1 Removed the "switch to layout after drawing model-space labels" option; automatic layout switching is now permanently disabled.
 2 Removed automatic filtering of legends and table interference outside the main LBD array. Recognition now keeps Node/Tracker boxes outside the main array, and legacy enabled values are ignored.

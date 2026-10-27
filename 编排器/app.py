@@ -59,7 +59,7 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_parse_split = _lr_split_rows = _lr_expand_racks = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.71"
+APP_VERSION = "2.75"
 # 这一版先不带「导出 PDF」：按钮和入口藏起来，代码保留（改成 True 就接回来）。
 FEATURE_EXPORT_PDF = False
 # 表格 OCR 暂不上线：源码保留，速度与准确率稳定后再打开并重新打包模型依赖。
