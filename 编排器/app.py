@@ -59,7 +59,7 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_parse_split = _lr_split_rows = _lr_expand_racks = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.75"
+APP_VERSION = "2.59"
 # 这一版先不带「导出 PDF」：按钮和入口藏起来，代码保留（改成 True 就接回来）。
 FEATURE_EXPORT_PDF = False
 # 表格 OCR 暂不上线：源码保留，速度与准确率稳定后再打开并重新打包模型依赖。
@@ -361,6 +361,10 @@ TEXT_EN = {
     "打开识别结果 JSON": "Open recognition JSON",
     "打开已有的识别结果 JSON，恢复表格、画布和项目树，可继续编辑并保存":
         "Open an existing recognition JSON to restore the table, canvas and tree for further editing",
+    "这份 JSON 没有记录源 PDF；点「上传 PDF」选择对应图纸后会自动显示底图":
+        "This JSON has no source PDF. Choose the matching PDF with Upload PDF to show the drawing.",
+    "已上传 PDF，底图和标注已刷新":
+        "PDF loaded; the drawing and annotations have been refreshed.",
     "识别页": "Pages",
     "全部 / 3,5-8": "All / 3,5-8",
     "只识别填写范围内的页；留空识别全部，例如 23-108":
@@ -5311,7 +5315,12 @@ class MainWindow(QMainWindow):
         """把这一页载进画布（可缩放 / 可编辑；蓝=LBD 区 / 红=支架 / 橙=编号位置）。"""
         doc = getattr(self, "_recog_doc", None)
         pdf = (self.get_text("pdf") or "").strip()
-        if not doc or not pdf or not os.path.exists(pdf) or not hasattr(self, "recog_canvas"):
+        if not doc or not hasattr(self, "recog_canvas"):
+            return
+        if not pdf or not os.path.exists(pdf):
+            if hasattr(self, "recog_preview_info"):
+                self.recog_preview_info.setText(
+                    T("这份 JSON 没有记录源 PDF；点「上传 PDF」选择对应图纸后会自动显示底图"))
             return
         try:
             self.recog_canvas._pdf = pdf
@@ -5566,6 +5575,19 @@ class MainWindow(QMainWindow):
             return
         self.set_text(key, path)
         self._recog_sync_inputs()
+        # 标注结果 JSON 可能没有 source_pdf，画布会等用户上传 PDF。
+        # 上传后必须主动刷新当前页，否则这里只是记住路径，画布仍停在空白或旧图。
+        if key == "pdf" and getattr(self, "_recog_doc", None):
+            pg = getattr(self, "_recog_page", None)
+            rows = self._recog_pages_of_doc()
+            if pg is None and rows:
+                pg = rows[0][0]
+            if pg is not None:
+                self._recog_preview_page(pg)
+            msg = T("已上传 PDF，底图和标注已刷新")
+            if hasattr(self, "recog_status"):
+                self.recog_status.setText(msg)
+            self._recog_write("%s：%s" % (msg, path))
 
     def _recog_sync_inputs(self, to_cfg=False):
         """识别页上的 PDF 与「文件与输出」页共用一份数据。
