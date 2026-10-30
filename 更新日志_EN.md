@@ -1,3 +1,8 @@
+v2.60
+1 Fixed the long unresponsive final stage after STR drawing. Final LYNX label placement now checks only nearby STR text instead of recalculating collisions against every STR item in the whole model.
+2 Added live scan and row-by-row placement progress for the final stage, so the UI no longer remains at "Drawing STR 100 / 121".
+3 If final label placement fails, the error is reported and the completion marker is still written instead of leaving the run permanently blocked.
+
 v2.75
 1 Rack rows are grouped by Tracker centre X: only boxes with the same or nearly the same X belong to one vertical row.
 2 The normal row-to-row distance is the median adjacent X-centre gap. A candidate row that splits this gap into two smaller gaps is checked against the Y centres of the rows on its left and right; it is removed only when Y matching reaches 80%.

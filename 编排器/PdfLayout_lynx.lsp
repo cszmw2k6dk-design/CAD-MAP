@@ -198,6 +198,20 @@
   out
 )
 
+(defun PdfLayout_LynxRowBox (row margin / r x1 y1 x2 y2)
+  ;; Return one rectangle covering all labels in a row.  Collision tests
+  ;; are then limited to nearby STR objects instead of all 7k+ texts.
+  (setq x1 1.0e30 y1 1.0e30 x2 -1.0e30 y2 -1.0e30)
+  (foreach it row
+    (setq r (nth 3 it))
+    (setq x1 (min x1 (car r)))
+    (setq y1 (min y1 (cadr r)))
+    (setq x2 (max x2 (nth 2 r)))
+    (setq y2 (max y2 (nth 3 r)))
+  )
+  (list (- x1 margin) (- y1 margin) (+ x2 margin) (+ y2 margin))
+)
+
 (defun PdfLayout_LynxAssignLanes (row base step / sorted out placed it en r rect
                                   lane hit p)
   ;; Align by default. Only a label whose actual width collides with an
@@ -228,7 +242,8 @@
 (defun PdfLayout_LynxPlace (/ doc ms strLay labs obj bb r en h rng
                              items ctr ctr0 lo hi sorted rows rowNames base step strRects
                              signs s target dy cand hc obc lbc hard score key
-                             best bestKey nMoved nRows nThis ok lanes lane)
+                             best bestKey nMoved nRows nThis ok lanes lane
+                             rowBox rowStrRects otherLabs rowIdx nRowsAll)
   (vl-load-com)
   (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
   (setq ms (vla-get-ModelSpace doc))
@@ -259,7 +274,12 @@
   (if (not labs)
     (progn (princ "\n[LYNX-PLACE] no labels.") (princ))
     (progn
-      (setq strRects (PdfLayout_TextRects strLay))
+      (PdfLayout_Prog (strcat "LYNX_SCAN start labels=" (itoa (length labs))))
+      (if (PdfLayout_StopGate "lynx-scan")
+        (setq strRects nil)
+        (setq strRects (PdfLayout_TextRects strLay))
+      )
+      (PdfLayout_Prog (strcat "LYNX_SCAN text=" (itoa (length strRects))))
       (setq items nil)
       (foreach lab labs
         (setq en (car lab) obj (cadr lab) r (caddr lab))
@@ -284,9 +304,12 @@
         (PdfLayout_AutoStableSort items
           '(lambda (a b) (> (car a) (car b)))))
       (setq rows (PdfLayout_LynxMakeRows sorted))
-      (setq nMoved 0 nRows 0)
+      (setq nMoved 0 nRows 0 rowIdx 0 nRowsAll (length rows))
       (foreach row rows
         (setq nRows (1+ nRows))
+        (setq rowIdx (1+ rowIdx))
+        (PdfLayout_Prog (strcat "LYNX_PLACE_PROGRESS "
+                                (itoa rowIdx) " " (itoa nRowsAll)))
         (setq rowNames (mapcar 'car row))
         (setq base
           (* 0.5 (+ (apply 'min (mapcar 'car row))
@@ -298,6 +321,21 @@
         (while (<= s *PdfLayout_LynxMaxStep*)
           (setq signs (append signs (list (float s) (- 0.0 (float s)))))
           (setq s (1+ s))
+        )
+        (setq rowBox
+          (PdfLayout_LynxRowBox
+            row (* step (+ *PdfLayout_LynxMaxStep* 1.0))))
+        (setq rowStrRects nil)
+        (foreach sr strRects
+          (if (PdfLayout_RectOver rowBox (cdr sr))
+            (setq rowStrRects (cons sr rowStrRects))
+          )
+        )
+        (setq otherLabs nil)
+        (foreach ol labs
+          (if (not (member (car ol) rowNames))
+            (setq otherLabs (cons (caddr ol) otherLabs))
+          )
         )
         (setq lanes (PdfLayout_LynxAssignLanes row base step))
         (setq best nil bestKey nil)
@@ -321,15 +359,9 @@
                 (setq target (+ base (* sv step) (* (if lane lane 0) step)))
                 (setq dy (- target (PdfLayout_LynxCenterY r)))
                 (setq cand (PdfLayout_RectShiftY r dy))
-                (setq hc (+ hc (PdfLayout_RectHitsEx cand strRects en)))
+                (setq hc (+ hc (PdfLayout_RectHitsEx cand rowStrRects en)))
                 (setq obc (+ obc (PdfLayout_RectHits cand *PdfLayout_ObsRects*)))
-                (foreach lab labs
-                  (if (not (member (car lab) rowNames))
-                    (if (PdfLayout_RectOver cand (caddr lab))
-                      (setq lbc (1+ lbc))
-                    )
-                  )
-                )
+                (setq lbc (+ lbc (PdfLayout_RectHits cand otherLabs)))
               )
               (setq hard (+ hc obc))
               (setq score (+ hard lbc))

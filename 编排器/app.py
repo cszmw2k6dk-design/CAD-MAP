@@ -59,7 +59,7 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_parse_split = _lr_split_rows = _lr_expand_racks = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.59"
+APP_VERSION = "2.60"
 # 这一版先不带「导出 PDF」：按钮和入口藏起来，代码保留（改成 True 就接回来）。
 FEATURE_EXPORT_PDF = False
 # 表格 OCR 暂不上线：源码保留，速度与准确率稳定后再打开并重新打包模型依赖。
@@ -420,6 +420,7 @@ TEXT_EN = {
     "正在连接 / 启动 CAD…": "Connecting / starting CAD…",
     "已绘制  %d / %d": "Drawn  %d / %d",
     "已对准  %d / %d": "Fitted  %d / %d",
+    "已整理  %d / %d": "Arranged  %d / %d",
     "已绘制  ? / ?": "Drawn  ? / ?",
     "已对准  ? / ?": "Fitted  ? / ?",
     "完成": "Done",
@@ -453,6 +454,10 @@ TEXT_EN = {
     "区域对准完成，%d 个视口未生效": "Region fit finished; %d viewport(s) did not update",
     "正在对齐 LYNX 标签并避让编号 / STR…":
         "Aligning LYNX labels and avoiding printed numbers / STR…",
+    "正在扫描 STR 文字碰撞位置…":
+        "Scanning STR text collisions…",
+    "正在整理标签位置 %d / %d":
+        "Arranging label positions %d / %d",
     # ---- 识别页补充（英文界面漏翻 / 显示不全的） ----
     "← 上一步": "← Back",
     "回到识别工作区（换 PDF / 重新识别 / 改框）":
@@ -1574,12 +1579,16 @@ def auto_worker(cfg, ini, prog, bus):
                    "(setq *PdfLayout_GridAutoFile* %s)\n(setq *PdfLayout_AiPage* %s)\n"
                    "%s"
                    "(PdfLayout_AutoRun %s %s)\n(c:pdfgridai)\n"
-                   "(PdfLayout_LynxPlace)\n(PdfLayout_Prog \"RUN_DONE\")\n"
+                   "(setq *PdfLayout_LynxResult* (vl-catch-all-apply 'PdfLayout_LynxPlace nil))\n"
+                   "(if (vl-catch-all-error-p *PdfLayout_LynxResult*) (PdfLayout_Prog \"LYNX_ERROR\"))\n"
+                   "(PdfLayout_Prog \"RUN_DONE\")\n"
                    % (L(lsp), L(auto), L(ai), L(lynx), _vinsnip, L(_lbdout), _pg, _strbg,
                       L(ini), L(prog)))
         else:
             cmd = ("(load %s)\n(load %s)\n(load %s)\n%s"
-                   "(PdfLayout_AutoRun %s %s)\n(PdfLayout_LynxPlace)\n"
+                   "(PdfLayout_AutoRun %s %s)\n"
+                   "(setq *PdfLayout_LynxResult* (vl-catch-all-apply 'PdfLayout_LynxPlace nil))\n"
+                   "(if (vl-catch-all-error-p *PdfLayout_LynxResult*) (PdfLayout_Prog \"LYNX_ERROR\"))\n"
                    "(PdfLayout_Prog \"RUN_DONE\")\n"
                    % (L(lsp), L(auto), L(lynx), _vinsnip, L(ini), L(prog)))
         bus.prog.emit("发送命令给 CAD：\n" + cmd.replace("\n", " "))
@@ -8624,6 +8633,27 @@ class MainWindow(QMainWindow):
                 if hasattr(self, "count_label"):
                     self.count_label.setText(T("已对准  ? / ?") if _ph == "REGION"
                                              else T("已绘制  ? / ?"))
+        # LYNX 是 STR 之后的最终标签位置整理。它现在会持续写逐行进度，
+        # 不能再让界面继续显示“正在画 STR 100 / 121”而看起来卡死。
+        lynx_now = False
+        lynx_rows = re.findall(r"LYNX_PLACE_PROGRESS\s+(\d+)\s+(\d+)", txt)
+        if lynx_rows and "RUN_DONE" not in up:
+            lynx_now = True
+            lynx_done, lynx_total = (int(lynx_rows[-1][0]), int(lynx_rows[-1][1]))
+            self.run_status = T("正在整理标签位置 %d / %d", lynx_done, lynx_total)
+            if hasattr(self, "count_label"):
+                self.count_label.setText(T("已整理  %d / %d", lynx_done, lynx_total))
+            if hasattr(self, "pbar") and lynx_total > 0:
+                self.pbar.setValue(int(round(100.0 * lynx_done / lynx_total)))
+        elif "LYNX_SCAN" in up and "RUN_DONE" not in up:
+            lynx_now = True
+            self.run_status = T("正在扫描 STR 文字碰撞位置…")
+            if hasattr(self, "count_label"):
+                self.count_label.setText(self.run_status)
+        if "LYNX_ERROR" in up and not getattr(self, "_lynx_error_logged", False):
+            self._lynx_error_logged = True
+            self.log_msg("标签最终整理失败，已跳过重排并继续写入完成标记；"
+                         "请检查 CAD 是否仍正常响应。")
         if "STEP_SAVE" in up:
             self.run_status = "打印 / 导出…"
         finished = False
@@ -8661,7 +8691,7 @@ class MainWindow(QMainWindow):
             self.run_status = "出错：" + (txt.strip()[-200:])
             finished = True
         self.status_label.setText(self.run_status)
-        if self.total > 0:
+        if self.total > 0 and not lynx_now:
             if self._phase == "REGION":
                 self.count_label.setText(T("已对准  %d / %d", self.done_n, self.total))
             else:
