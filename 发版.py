@@ -385,6 +385,15 @@ def do_release_api(repo, tag, exe, manifest, notes, token):
         st, js = api(token, "POST", "%s/releases" % api_root,
                      data={"tag_name": tag, "name": tag, "body": notes,
                            "draft": False, "prerelease": False})
+    elif st == 200 and js.get("id"):
+        # 附件会被覆盖，但 Release 正文不会自动更新；这里同步正文，
+        # 避免客户端看到的更新说明和 manifest 内的说明不一致。
+        st2, js2 = api(
+            token, "PATCH", "%s/releases/%s" % (api_root, js.get("id")),
+            data={"name": tag, "body": notes, "draft": False, "prerelease": False})
+        if st2 in (200, 201):
+            js = js2
+            st = st2
     if st not in (200, 201):
         log("[Release] 建 Release 失败（HTTP %s）：%s" % (st, js.get("message")))
         return False
