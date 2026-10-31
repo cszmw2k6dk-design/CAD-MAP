@@ -59,17 +59,24 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_parse_split = _lr_split_rows = _lr_expand_racks = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.79"
+APP_VERSION = "2.80"
 # 这一版先不带「导出 PDF」：按钮和入口藏起来，代码保留（改成 True 就接回来）。
 FEATURE_EXPORT_PDF = False
 # 表格 OCR 暂不上线：源码保留，速度与准确率稳定后再打开并重新打包模型依赖。
 FEATURE_TABLE_OCR = False
 # 识别页「项目树」：没有编号的 LBD 也会以「（没编号）」保留在树里。
 FEATURE_RECOG_PROJECT_TREE = True
-UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"
+# Only this repository must be public. Point it at a public binary-only release
+# repository when the source repository is made private.
+UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP-releases"
 UPDATE_ASSET = "Voltage-CAD MAP.exe"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_PAGE = "https://github.com/%s/releases" % UPDATE_REPO
+UPDATE_MANIFEST_URL = (
+    os.environ.get("VCAD_UPDATE_MANIFEST_URL")
+    or "https://github.com/%s/releases/latest/download/update_manifest.json" % UPDATE_REPO
+).strip()
+UPDATE_MANIFEST_SCHEMA = 1
 FIELDS = [
     ("dwg", "模板 DWG 文件"),
     ("pdf", "PDF 文件"), ("xlsx", "标签文件"), ("jsonPath", "识别结果 JSON文件"),
@@ -1649,6 +1656,62 @@ def http_get(url, timeout=15):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+def _secure_update_url(url):
+    """更新清单和安装包只允许 HTTPS；本机测试地址可例外。"""
+    try:
+        p = urllib.parse.urlsplit(str(url or "").strip())
+    except Exception:
+        return False
+    if p.scheme == "https" and p.netloc:
+        return True
+    return p.scheme == "http" and (p.hostname or "") in ("127.0.0.1", "localhost", "::1")
+
+
+def parse_update_manifest(data, manifest_url):
+    """校验公开更新清单，返回统一的 release info；格式错误直接拒绝。"""
+    if not isinstance(data, dict):
+        raise ValueError("更新清单不是 JSON 对象")
+    try:
+        schema = int(data.get("schema") or 0)
+    except Exception:
+        schema = 0
+    if schema != UPDATE_MANIFEST_SCHEMA:
+        raise ValueError("更新清单版本不支持：%s" % (data.get("schema"),))
+    version = str(data.get("version") or "").strip()
+    if not re.match(r"^v?\d+(?:\.\d+){1,3}$", version, re.I):
+        raise ValueError("更新清单 version 无效")
+    asset = data.get("asset") if isinstance(data.get("asset"), dict) else {}
+    asset_url = str(asset.get("url") or data.get("url") or "").strip()
+    asset_url = urllib.parse.urljoin(str(manifest_url or ""), asset_url)
+    if not _secure_update_url(asset_url):
+        raise ValueError("更新包地址必须使用 HTTPS")
+    digest = str(asset.get("sha256") or data.get("sha256") or "").strip().lower()
+    if not re.match(r"^[0-9a-f]{64}$", digest):
+        raise ValueError("更新清单缺少有效的 SHA-256")
+    try:
+        size = int(asset.get("size") or data.get("size") or 0)
+    except Exception:
+        size = 0
+    if size <= 0:
+        raise ValueError("更新清单缺少文件大小")
+    name = str(asset.get("name") or data.get("asset_name") or "").strip()
+    if name and asset_key(name) != asset_key(UPDATE_ASSET):
+        raise ValueError("更新清单附件名不匹配：%s" % name)
+    page = str(data.get("page") or UPDATE_PAGE).strip()
+    if not _secure_update_url(page):
+        page = UPDATE_PAGE
+    return {
+        "version": version,
+        "notes": str(data.get("notes") or "").strip(),
+        "url": asset_url,
+        "published": fmt_time(data.get("published") or data.get("published_at") or ""),
+        "page": page,
+        "sha256": digest,
+        "size": size,
+        "source": "manifest",
+    }
+
+
 # ---- 更新包下载：GitHub 直连在国内常年几十 KB/s 甚至被重置，这里先测速再挑源 ----
 # 顺序只是备选清单，真正用哪个由测速决定；最后一项 "" 是直连。
 DOWNLOAD_MIRRORS = (
@@ -1709,7 +1772,11 @@ def pick_sources(url, log=None):
 
     几个源同时测，不然串行等慢源会很久。
     """
-    cands = [(url if not p else p + url) for p in DOWNLOAD_MIRRORS]
+    # gh-proxy 类镜像只能处理 github.com 地址；对象存储/R2/CDN 不能加前缀。
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    github_url = host == "github.com" or host.endswith(".githubusercontent.com")
+    cands = ([(url if not p else p + url) for p in DOWNLOAD_MIRRORS]
+             if github_url else [url])
     result = {}
 
     def worker(u):
@@ -1836,31 +1903,42 @@ def fmt_time(iso):
         return s
 
 
-def fetch_release():
-    """查 GitHub 最新 release。返回 (info, 错误)；info=None 表示查不到。
-    info = {version, notes, url, published, page}；version 为空表示仓库还没发过版本。"""
+def _fetch_github_release():
+    """旧的公开 GitHub Release 兼容通道。"""
     try:
         with http_get(UPDATE_API) as r:
             data = json.loads(r.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
         if e.code == 404:
             # 还没发布过任何版本：视作“已是最新”，不报错
-            return {"version": "", "notes": "", "url": "", "published": "", "page": UPDATE_PAGE}, ""
+            return {"version": "", "notes": "", "url": "", "published": "",
+                    "page": UPDATE_PAGE, "sha256": "", "size": 0,
+                    "source": "github"}, ""
         return None, "检查更新失败：HTTP %s" % e.code
     except Exception as e:
         return None, "检查更新失败（网络或仓库不可达）：%s" % e
     tag = (data.get("tag_name") or "").strip()
     notes = (data.get("body") or "").strip()
     url = ""
+    size = 0
+    digest = ""
     want = asset_key(UPDATE_ASSET)
     for a in (data.get("assets") or []):
         if asset_key(a.get("name")) == want:
             url = a.get("browser_download_url") or ""
+            size = int(a.get("size") or 0)
+            dg = str(a.get("digest") or "").strip().lower()
+            if dg.startswith("sha256:"):
+                digest = dg.split(":", 1)[1]
             break
     if not url:
         for a in (data.get("assets") or []):
             if (a.get("name") or "").lower().endswith(".exe"):
                 url = a.get("browser_download_url") or ""
+                size = int(a.get("size") or 0)
+                dg = str(a.get("digest") or "").strip().lower()
+                if dg.startswith("sha256:"):
+                    digest = dg.split(":", 1)[1]
                 break
     return ({
         "version": tag,
@@ -1868,7 +1946,29 @@ def fetch_release():
         "url": url,
         "published": fmt_time(data.get("published_at")),
         "page": (data.get("html_url") or UPDATE_PAGE),
+        "sha256": digest,
+        "size": size,
+        "source": "github",
     }, "")
+
+
+def fetch_release():
+    """读取公开更新清单；旧版没有清单时才回退 GitHub Release API。"""
+    if not UPDATE_MANIFEST_URL:
+        return _fetch_github_release()
+    try:
+        with http_get(UPDATE_MANIFEST_URL, timeout=12) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        return parse_update_manifest(data, UPDATE_MANIFEST_URL), ""
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            # 首次发清单或 Release 还在上传：视为暂无更新，不访问可能私有的源码仓库。
+            return {"version": "", "notes": "", "url": "", "published": "",
+                    "page": UPDATE_PAGE, "sha256": "", "size": 0,
+                    "source": "manifest"}, ""
+        return None, "读取公开更新清单失败：HTTP %s" % e.code
+    except Exception as e:
+        return None, "读取公开更新清单失败：%s" % e
 
 
 def _english_notes_section(version=""):
@@ -1916,7 +2016,8 @@ def update_check_worker(bus):
     tag = info.get("version") or ""
     if tag and ver_tuple(tag) > ver_tuple(APP_VERSION):
         bus.upd_found.emit(tag, info.get("notes") or "", info.get("url") or "",
-                           info.get("published") or "")
+                           info.get("published") or "",
+                           info.get("sha256") or "", int(info.get("size") or 0))
     else:
         bus.upd_none.emit(tag or ("v" + APP_VERSION), info.get("notes") or "",
                           info.get("published") or "")
@@ -1933,7 +2034,29 @@ def update_notes_worker(bus):
                        bool(tag) and ver_tuple(tag) > ver_tuple(APP_VERSION))
 
 
-def update_download_worker(url, bus):
+def verify_update_file(path, expected_sha256="", expected_size=0):
+    """下载完成后校验大小和 SHA-256；不匹配的 exe 绝不进入替换步骤。"""
+    path = str(path or "")
+    if not os.path.isfile(path):
+        return False, "更新包不存在"
+    size = os.path.getsize(path)
+    if expected_size and size != int(expected_size):
+        return False, "更新包大小不符：%d / %d" % (size, int(expected_size))
+    want = str(expected_sha256 or "").strip().lower()
+    if want:
+        if not re.match(r"^[0-9a-f]{64}$", want):
+            return False, "更新清单的 SHA-256 格式无效"
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        got = h.hexdigest()
+        if got.lower() != want:
+            return False, "更新包 SHA-256 校验失败"
+    return True, ""
+
+
+def update_download_worker(url, bus, expected_sha256="", expected_size=0):
     try:
         d = os.path.join(tempfile.gettempdir(), "VCADMAP_update")
         os.makedirs(d, exist_ok=True)
@@ -1945,6 +2068,15 @@ def update_download_worker(url, bus):
                       detail=lambda t: bus.upd_detail.emit(t),
                       log=lambda m: bus.upd_log.emit(m),
                       key=key)
+        ok, why = verify_update_file(dest, expected_sha256, expected_size)
+        if not ok:
+            try:
+                os.remove(dest)
+            except Exception:
+                pass
+            raise RuntimeError(why)
+        if expected_sha256:
+            bus.upd_log.emit("SHA-256 校验通过：%s" % expected_sha256.lower())
         bus.upd_ready.emit(dest)
     except Exception as e:
         bus.upd_error.emit("下载更新失败：%s" % e)
@@ -2832,7 +2964,7 @@ class Bus(QObject):
     save_result = Signal(bool, str)
     plot_prog = Signal(int, int)          # 导出 PDF：已完成 / 总数
     plot_result = Signal(bool, str)       # 导出 PDF：成功?, 路径或错误
-    upd_found = Signal(str, str, str, str)
+    upd_found = Signal(str, str, str, str, str, int)
     upd_none = Signal(str, str, str)
     upd_notes = Signal(str, str, str, bool)
     upd_error = Signal(str)
@@ -8384,10 +8516,12 @@ class MainWindow(QMainWindow):
         self.notes_btn.setEnabled(False)
         threading.Thread(target=update_notes_worker, args=(self.bus,), daemon=True).start()
 
-    def on_upd_found(self, tag, notes, url, published):
+    def on_upd_found(self, tag, notes, url, published, sha256="", size=0):
         self.upd_btn.setEnabled(True)
         self._upd_url = url
         self._upd_tag = tag
+        self._upd_sha256 = str(sha256 or "")
+        self._upd_size = int(size or 0)
         self._upd_install = True
         self.upd_btn.setToolTip("下载并安装 %s" % tag)
         self.upd_label.setText("发现新版 %s" % tag)
@@ -8456,7 +8590,10 @@ class MainWindow(QMainWindow):
         self._render_upd_progress()
         self.log_msg("开始下载更新 %s…" % self._upd_tag)
         threading.Thread(target=update_download_worker,
-                         args=(self._upd_url, self.bus), daemon=True).start()
+                         args=(self._upd_url, self.bus,
+                               getattr(self, "_upd_sha256", ""),
+                               getattr(self, "_upd_size", 0)),
+                         daemon=True).start()
 
     def on_upd_progress(self, pct):
         self._upd_pct = pct

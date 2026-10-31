@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 r"""MAP-CAD 一键发版。
 
-版本号 +1 -> 用 PyInstaller 打包 -> 提交推送 -> 建 GitHub Release 并传附件。
+版本号 +1 -> 用 PyInstaller 打包 -> 提交推送 -> 在公开发布仓库建 Release，
+同时上传 exe 和 update_manifest.json。源码仓库可以保持私有；UPDATE_REPO 只指向
+客户端可匿名读取的公开二进制发布仓库。
 
 用法（一般直接双击 发版.bat 就行，参数会原样传进来）：
     python 发版.py                     正常发版
@@ -11,6 +13,8 @@ r"""MAP-CAD 一键发版。
     python 发版.py --no-push           不提交推送
     python 发版.py --no-release        不建 Release
     python 发版.py --note "补充说明"    追加到 Release 说明末尾
+    python 发版.py --release-repo owner/public-releases
+                                         发到独立公开仓库（源码仓库可私有）
 
 为什么逻辑放 .py 不写在 .bat 里：中文路径、代码页、JSON / HTTP 在 cmd 里很容易被代码页
 搞乱（见 编排器/build.py 里的说明），放 Python 里稳。
@@ -21,6 +25,8 @@ r"""MAP-CAD 一键发版。
 两者都没有时会跳过建 Release，并把手动发的手顺打出来。
 """
 import argparse
+import datetime
+import hashlib
 import json
 import os
 import re
@@ -39,6 +45,7 @@ BUILD_PY = os.path.join(ORCH, "build.py")
 DIST_DIR = os.path.join(ORCH, "dist")
 NOTES_MD = os.path.join(ROOT, "更新日志.md")
 NOTES_EN_MD = os.path.join(ROOT, "更新日志_EN.md")
+MANIFEST_NAME = "update_manifest.json"
 
 VER_RE = re.compile(r'^APP_VERSION\s*=\s*"([^"]+)"', re.M)
 REPO_RE = re.compile(r'^UPDATE_REPO\s*=\s*"([^"]+)"', re.M)
@@ -100,6 +107,48 @@ def read_app_consts():
 
 def set_app_version(txt, new_ver):
     return VER_RE.sub('APP_VERSION = "%s"' % new_ver, txt, count=1)
+
+
+def set_app_repo(txt, repo):
+    return REPO_RE.sub('UPDATE_REPO = "%s"' % repo, txt, count=1)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def manifest_asset_name(name):
+    """GitHub Release 会把附件名中的空白规范成点。"""
+    return re.sub(r"[^0-9A-Za-z._-]+", ".", os.path.basename(name)).strip(".")
+
+
+def make_update_manifest(repo, tag, exe, notes):
+    """生成客户端匿名读取的更新清单，并返回本地文件路径。"""
+    asset_name = manifest_asset_name(os.path.basename(exe))
+    asset_url = "https://github.com/%s/releases/download/%s/%s" % (
+        repo, urllib.parse.quote(tag), urllib.parse.quote(asset_name))
+    data = {
+        "schema": 1,
+        "version": tag,
+        "published": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"),
+        "page": "https://github.com/%s/releases/tag/%s" % (
+            repo, urllib.parse.quote(tag)),
+        "notes": notes or "",
+        "asset": {
+            "name": os.path.basename(exe),
+            "url": asset_url,
+            "size": os.path.getsize(exe),
+            "sha256": sha256_file(exe),
+        },
+    }
+    path = os.path.join(DIST_DIR, MANIFEST_NAME)
+    write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    return path, data
 
 
 # ---------------- 找 Python / git ----------------
@@ -261,19 +310,21 @@ def release_notes(note):
     return "\n\n".join([p for p in parts if p])
 
 
-def do_release_gh(gh_exe, repo, tag, exe, notes):
+def do_release_gh(gh_exe, repo, tag, exe, manifest, notes):
     tmp = os.path.join(os.environ.get("TEMP") or ".", "mapcad_release_notes.md")
     write_text(tmp, notes)
-    args = ["release", "create", tag, exe, "--repo", repo, "--title", tag, "--notes-file", tmp]
+    args = ["release", "create", tag, exe, manifest, "--repo", repo,
+            "--title", tag, "--notes-file", tmp]
     r = subprocess.run([gh_exe] + args, cwd=ROOT, capture_output=True, timeout=1800,
                        text=True, encoding="utf-8", errors="replace")
     if r.returncode == 0:
-        log("[Release] 已用 gh 建好 %s 并传上 %s" % (tag, os.path.basename(exe)))
+        log("[Release] 已用 gh 建好 %s 并传上 exe + 更新清单" % tag)
         return True
     err = (r.stderr or r.stdout or "").strip()
     if "already exists" in err.lower():
         log("[Release] %s 已存在，改成覆盖附件。" % tag)
-        up = subprocess.run([gh_exe, "release", "upload", tag, exe, "--repo", repo, "--clobber"],
+        up = subprocess.run([gh_exe, "release", "upload", tag, exe, manifest,
+                             "--repo", repo, "--clobber"],
                             cwd=ROOT, capture_output=True, timeout=1800,
                             text=True, encoding="utf-8", errors="replace")
         if up.returncode == 0:
@@ -310,7 +361,23 @@ def api(token, method, url, data=None, headers=None, raw=None):
             return e.code, {"message": txt}
 
 
-def do_release_api(repo, tag, exe, notes, token):
+def _upload_release_asset(api_root, rid, path, token):
+    name = os.path.basename(path)
+    up = "https://uploads.github.com/repos/%s/releases/%s/assets?name=%s" % (
+        api_root.split("/repos/", 1)[1], rid, urllib.parse.quote(name))
+    with open(path, "rb") as f:
+        blob = f.read()
+    st, js = api(token, "POST", up, raw=blob)
+    if st == 422:
+        st2, js2 = api(token, "GET", "%s/releases/%s" % (api_root, rid))
+        for a in (js2.get("assets") or []):
+            if asset_key(a.get("name")) == asset_key(name):
+                api(token, "DELETE", "%s/releases/assets/%s" % (api_root, a.get("id")))
+        st, js = api(token, "POST", up, raw=blob)
+    return st in (200, 201), st, js
+
+
+def do_release_api(repo, tag, exe, manifest, notes, token):
     api_root = "https://api.github.com/repos/%s" % repo
     log("[Release] 用 GitHub API 建 %s …" % tag)
     st, js = api(token, "GET", "%s/releases/tags/%s" % (api_root, urllib.parse.quote(tag)))
@@ -322,50 +389,65 @@ def do_release_api(repo, tag, exe, notes, token):
         log("[Release] 建 Release 失败（HTTP %s）：%s" % (st, js.get("message")))
         return False
     rid = js.get("id")
-    name = os.path.basename(exe)
-    # GitHub 会把附件名里的空格换成点（"Voltage-CAD MAP.exe" -> "Voltage-CAD.MAP.exe"），
-    # 按原名比会漏掉旧附件，再传同名就 422 Validation Failed，所以按归一化后的名字比。
-    for a in js.get("assets") or []:
-        if asset_key(a.get("name")) == asset_key(name):
-            api(token, "DELETE", "%s/releases/assets/%s" % (api_root, a.get("id")))
-    with open(exe, "rb") as f:
-        blob = f.read()
-    up = "https://uploads.github.com/repos/%s/releases/%s/assets?name=%s" % (
-        repo, rid, urllib.parse.quote(name))
-    st, js = api(token, "POST", up, raw=blob)
-    if st == 422:                          # 可能还有残留同名附件，再清一次重试
-        st2, js2 = api(token, "GET", "%s/releases/%s" % (api_root, rid))
-        for a in (js2.get("assets") or []):
+    # 先传 exe，最后传清单。客户端只有看到清单才会开始更新。
+    for path in (exe, manifest):
+        name = os.path.basename(path)
+        for a in js.get("assets") or []:
             if asset_key(a.get("name")) == asset_key(name):
                 api(token, "DELETE", "%s/releases/assets/%s" % (api_root, a.get("id")))
-        st, js = api(token, "POST", up, raw=blob)
-    if st in (200, 201):
-        log("[Release] 已建 %s 并传上 %s" % (tag, name))
-        return True
-    log("[Release] 传附件失败（HTTP %s）：%s" % (st, js.get("message")))
-    return False
+        ok, st, out = _upload_release_asset(api_root, rid, path, token)
+        if not ok:
+            log("[Release] 传附件失败 %s（HTTP %s）：%s" %
+                (name, st, out.get("message")))
+            return False
+        log("[Release] 已上传 %s" % name)
+    log("[Release] 已建 %s 并传上 exe + 更新清单" % tag)
+    return True
 
 
-def do_release(repo, tag, exe, notes):
+def credential_token():
+    """从本机 git credential 取 GitHub 凭据，避免必须再装 gh 或设置环境变量。"""
+    g = find_git()
+    if not g:
+        return ""
+    try:
+        r = subprocess.run(
+            [g, "credential", "fill"],
+            input="protocol=https\nhost=github.com\n\n",
+            cwd=ROOT, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            env=git_env(g), timeout=60)
+    except Exception:
+        return ""
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("password="):
+            return line[len("password="):].strip()
+    return ""
+
+
+def do_release(repo, tag, exe, manifest, notes):
     if not repo:
         log("[Release] 读不到 UPDATE_REPO，跳过。")
         return False
-    if not exe:
-        log("[Release] 没有 exe（没打包），跳过。")
+    if not exe or not manifest:
+        log("[Release] 没有 exe / 更新清单，跳过。")
         return False
     token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+    if not token:
+        token = credential_token()
     gh_exe = shutil.which("gh")
     if gh_exe:
-        return do_release_gh(gh_exe, repo, tag, exe, notes)
+        return do_release_gh(gh_exe, repo, tag, exe, manifest, notes)
     if token:
         try:
-            return do_release_api(repo, tag, exe, notes, token)
+            return do_release_api(repo, tag, exe, manifest, notes, token)
         except Exception as e:
             log("[Release] API 出错：%s" % e)
             return False
-    log("[Release] 没装 gh、也没有 GITHUB_TOKEN / GH_TOKEN，跳过建 Release。")
+    log("[Release] 没装 gh、也没取到 GitHub 凭据，跳过建 Release。")
     log("          手动发：https://github.com/%s/releases/new?tag=%s" % (repo, tag))
-    log("          附件名要叫「%s」（程序里的检查更新按这个名字找）。" % os.path.basename(exe))
+    log("          需要同时上传「%s」和「%s」。" %
+        (os.path.basename(exe), os.path.basename(manifest)))
     return False
 
 
@@ -378,6 +460,8 @@ def main(argv=None):
     ap.add_argument("--skip-build", action="store_true", help="跳过打包")
     ap.add_argument("--no-push", action="store_true", help="跳过提交推送")
     ap.add_argument("--no-release", action="store_true", help="跳过建 Release")
+    ap.add_argument("--release-repo", default=os.environ.get("MAPCAD_RELEASE_REPO", ""),
+                    help="公开二进制发布仓库 owner/repo；源码仓库可以私有")
     a = ap.parse_args(argv)
 
     log("============================================")
@@ -391,9 +475,16 @@ def main(argv=None):
             return 1
 
     txt, cur, repo, asset = read_app_consts()
+    release_repo = (a.release_repo or "").strip() or repo
+    if release_repo != repo:
+        if not re.match(r"^[^/\s]+/[^/\s]+$", release_repo):
+            log("[错误] --release-repo 必须是 owner/repo：%s" % release_repo)
+            return 1
+        txt = set_app_repo(txt, release_repo)
+        repo = release_repo
     new = a.version.strip() or bump_ver(cur)
     log("版本：v%s  ->  v%s" % (cur, new))
-    log("仓库：%s（附件名 %s）" % (repo or "（读不到）", asset))
+    log("公开发布仓库：%s（附件名 %s）" % (repo or "（读不到）", asset))
 
     py, tried = find_pack_python()
     if py:
@@ -407,16 +498,21 @@ def main(argv=None):
         log("")
         log("预演：接下来会做的事")
         log("  1. 把 编排器/app.py 的 APP_VERSION 改成 %s" % new)
+        log("     把 UPDATE_REPO 改成公开发布仓库 %s" % repo)
         log("  2. %s" % ("跳过打包" if a.skip_build else "跑 编排器/build.py 打包出 编排器/dist/%s" % asset))
         log("  3. %s" % ("跳过提交推送" if a.no_push else "git add/commit/push（不在 git 仓库里会自动跳过）"))
-        log("  4. %s" % ("跳过建 Release" if a.no_release else "建 GitHub Release %s 并把 %s 当附件传上去" % ("v" + new, asset)))
+        log("  4. %s" % ("跳过建 Release" if a.no_release else
+                          "在公开仓库建 Release %s，传 %s + %s" %
+                          ("v" + new, asset, MANIFEST_NAME)))
         log("  预演结束，什么都没改。")
         return 0
 
     # 1. 版本号
-    if new != cur:
-        write_text(APP_PY, set_app_version(txt, new))
-        log("[1/4] 版本号已写入 编排器/app.py：%s" % new)
+    txt2 = set_app_version(txt, new)
+    if txt2 != read_text(APP_PY):
+        write_text(APP_PY, txt2)
+        log("[1/4] 版本号 / 公开发布仓库已写入 编排器/app.py：v%s | %s"
+            % (new, repo))
     else:
         log("[1/4] 版本号没变（%s）" % cur)
 
@@ -450,18 +546,27 @@ def main(argv=None):
         else:
             pushed = do_git(g, new)
 
+    manifest = None
+    if exe:
+        manifest, mdata = make_update_manifest(repo, "v" + new, exe,
+                                               release_notes(a.note))
+        log("[2/4] 更新清单：%s（SHA-256 %s）"
+            % (manifest, mdata["asset"]["sha256"]))
+
     # 4. Release
     if a.no_release:
         log("[4/4] 跳过建 Release。")
         ok = False
     else:
-        ok = do_release(repo, "v" + new, exe, release_notes(a.note))
+        ok = do_release(repo, "v" + new, exe, manifest, release_notes(a.note))
 
     log("")
     log("============================================")
-    log("  版本 %s | 打包 %s | 推送 %s | Release %s" % (
-        new, "OK" if exe else "跳过", "OK" if pushed else "跳过/失败", "OK" if ok else "跳过/失败"))
+    log("  版本 %s | 打包 %s | 推送 %s | Release %s | 清单 %s" % (
+        new, "OK" if exe else "跳过", "OK" if pushed else "跳过/失败",
+        "OK" if ok else "跳过/失败", "OK" if manifest else "跳过"))
     log("  exe：%s" % (exe or "（没产出）"))
+    log("  manifest：%s" % (manifest or "（没产出）"))
     log("============================================")
     return 0
 

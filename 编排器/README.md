@@ -205,16 +205,20 @@ CAD 插件本身仍保留 `labelWhere=L` 的分支，手工改 ini 还能用，�
 
 ## 发版 / 同步（都在仓库根目录）
 
-- `发版.bat`：一键发版 —— 版本号 +1 → PyInstaller 打包 → 提交推送 → 建 GitHub Release 并传附件。
+- `发版.bat`：一键发版 —— 版本号 +1 → PyInstaller 打包 → 提交推送 → 建公开 GitHub Release，
+  同时上传 exe 和 `update_manifest.json`。
   逻辑写在根目录 `发版.py` 里（中文路径 / 代码页 / HTTP 放 Python 里稳，见 `build.py` 的说明）。
   - 预演（一个文件都不改）：命令行执行 `发版.bat --dry`
   - 其它参数：`--version 2.18.0`、`--skip-build`、`--no-push`、`--no-release`、`--note "补充说明"`
+  - 源码仓库要设为私有时，用独立的公开二进制仓库发布：
+    `发版.bat --release-repo 用户名/CAD-MAP-releases`
   - 打包用的 Python 按这个顺序找：`C:\pybuild\python` → 仓库里 `_pyinstaller_tool` → 上一级 `.build-venv` → PATH 里的 python，
     要求能 `import PyInstaller, PySide6`
   - 打包用的 Python **还必须装 pywin32**（`pip install pywin32`）：连 CAD 走 COM，少了它打出来的 exe
     一点「执行输出」就报 `No module named 'pythoncom'`（`pywin32-ctypes` 是 PyInstaller 的依赖，不算）。
     `build.py` 打包前会检查并给出警告。
-  - 建 Release 二选一：装了 GitHub CLI（`gh auth login` 过）或设了 `GITHUB_TOKEN` / `GH_TOKEN`；
+  - 建 Release 可用 GitHub CLI（`gh auth login`）、`GITHUB_TOKEN` / `GH_TOKEN`，或本机已保存的
+    GitHub 登录凭据。客户端只读取公开 Release，不会携带任何 Token。
     都没有时只打包 + 提示手动发布的步骤
 - `同步.bat`：只提交推送，不打包不发版
 

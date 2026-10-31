@@ -1,3 +1,9 @@
+v2.80
+1 Split online updates into a private source repository plus a public binary-release repository. Clients read only the public Release and `update_manifest.json` at `UPDATE_REPO`; no GitHub token is embedded in the client.
+2 The release tool now accepts `--release-repo owner/repo`, allowing the exe and update manifest to be published to a separate public repository while source is still pushed to the current `origin`.
+3 The manifest contains the version, download URL, file size and SHA-256. The client verifies size and hash before closing and replacing itself, and deletes a mismatched package.
+4 HTTPS update URLs on object storage, R2 or a CDN are supported. GitHub mirror prefixes are no longer incorrectly added to non-GitHub download hosts.
+
 v2.79
 1 Reduced automatic LBD text height from 40% to 30% of the median LBD box width so the automatic size is no longer too large.
 2 Restored geometric centring for LBD labels by removing the forced two-lane stagger. Every label now starts at the centre of its own LBD region instead of being shifted down merely because neighbouring label bounds are close.
