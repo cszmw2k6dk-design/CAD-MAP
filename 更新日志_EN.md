@@ -1,8 +1,10 @@
-v2.80
-1 Split online updates into a private source repository plus a public binary-release repository. Clients read only the public Release and `update_manifest.json` at `UPDATE_REPO`; no GitHub token is embedded in the client.
-2 The release tool now accepts `--release-repo owner/repo`, allowing the exe and update manifest to be published to a separate public repository while source is still pushed to the current `origin`.
-3 The manifest contains the version, download URL, file size and SHA-256. The client verifies size and hash before closing and replacing itself, and deletes a mismatched package.
-4 HTTPS update URLs on object storage, R2 or a CDN are supported. GitHub mirror prefixes are no longer incorrectly added to non-GitHub download hosts.
+v2.61
+1 Automatic LBD text height now uses 30% of the median LBD box width on each page instead of producing oversized text.
+2 LBD labels return to the geometric centre of their regions; the forced two-lane vertical stagger was removed.
+3 Improved filtering of interference inside LBD boxes so a valid identifier is no longer discarded.
+4 Added support for dotted LBD identifiers such as `1.1.C.1`.
+5 Navigation is locked during execution; only pause and stop remain. CAD reuse now activates an already-open DWG instead of opening a second instance.
+6 HTTPS update URLs on object storage, R2 or a CDN are supported. GitHub mirror prefixes are no longer incorrectly added to non-GitHub download hosts.
 
 v2.79
 1 Reduced automatic LBD text height from 40% to 30% of the median LBD box width so the automatic size is no longer too large.
@@ -87,12 +89,6 @@ v2.63
 v2.62
 1 Fixed "Re-match all" updating only LBD names but not label positions. Re-matching now writes label_pos, label_bbox and their source back to the OCR records so STR numbering can avoid printed LBD marks.
 2 The recognition canvas now shows every LBD name, preferring its original PDF text position instead of showing only the selected box.
-
-v2.61
-1 Navigation and "Back to recognition" are locked during execution so switching pages cannot reset the run; only Stop remains.
-2 Removed the legacy manual rack type, split and single-string-length fields. Rack type detail is generated from recognition, lengths are read-only, and the detail refreshes automatically when recognized buckets or counts change.
-3 Fixed duplicate CAD instances: reuse the running CAD application and activate an already-open DWG instead of opening it again.
-4 CAD status text is now vendor-neutral; both ZWCAD and AutoCAD 2018+ remain supported.
 
 v2.60
 1 Added "Re-match all" on the recognition page. It rechecks LBD numbers on every drawing page in the current result from the PDF text layer.
