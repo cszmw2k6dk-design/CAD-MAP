@@ -387,6 +387,14 @@ def _center(b):
     return (b["x1"] + b["x2"]) / 2.0, (b["y1"] + b["y2"]) / 2.0
 
 
+def _median(values):
+    vals = sorted(float(v) for v in values if v is not None)
+    if not vals:
+        return 0.0
+    mid = len(vals) // 2
+    return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+
+
 def _norm_box(b, W, H):
     return [b["x1"] / W, b["y1"] / H, b["x2"] / W, b["y2"] / H]
 
@@ -2140,6 +2148,12 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
             continue
         n_pages += 1
 
+        # 本页所有 LBD 框共用同一个字高基准：框宽中位数 / 页高。
+        # 不能逐框取宽，否则同一张图里的超窄框会把字缩得很小。
+        lbd_width_med = _median(
+            max(1.0, n["bbox"]["x2"] - n["bbox"]["x1"]) / float(H)
+            for n in nodes)
+
         # Node 名称：OCR 结果按 node_bbox 对上（坐标一致，做了 0.1 像素取整）
         rec_by_key, recs_pg = {}, ocr.get(pg) or []
         for r in ocr.get(pg) or []:
@@ -2160,11 +2174,12 @@ def extract_lines_from_debug(json_path, out_path, prefix="STR", digits=2, page_m
                 unnamed.append((pg_out, ni))
                 continue
             cx, cy = _center(b)
-            # 第 7 列 = LBD 区域(Node)宽 / 页高：CAD 端字高 = 该比例 x 底图高 x 倍数(1.4)
+            # 第 7 列 = 本页 LBD 框宽中位数 / 页高：
+            # CAD 自动字高 = 该比例 x 底图高 x 自动比例(默认 0.30)
             # 第 8/9 列 = 这个区域的上下限(fy，y 从下往上)：CAD 侧摆标签时不许出这个范围
             lines.append("L\t%d\t%.6f\t%.6f\t%s\t0\t%.6f\t%.6f\t%.6f"
                          % (pg_out, cx / float(W), 1.0 - cy / float(H), n["name"],
-                            max(1.0, b["x2"] - b["x1"]) / float(H),
+                            lbd_width_med or max(1.0, b["x2"] - b["x1"]) / float(H),
                             1.0 - b["y2"] / float(H), 1.0 - b["y1"] / float(H)))
             n_lbd += 1
 

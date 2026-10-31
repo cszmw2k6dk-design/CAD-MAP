@@ -1,12 +1,31 @@
-v2.60
-1 Fixed the long unresponsive final stage after STR drawing. Final LYNX label placement now checks only nearby STR text instead of recalculating collisions against every STR item in the whole model.
-2 Added live scan and row-by-row placement progress for the final stage, so the UI no longer remains at "Drawing STR 100 / 121".
-3 If final label placement fails, the error is reported and the completion marker is still written instead of leaving the run permanently blocked.
+v2.79
+1 Reduced automatic LBD text height from 40% to 30% of the median LBD box width so the automatic size is no longer too large.
+2 Restored geometric centring for LBD labels by removing the forced two-lane stagger. Every label now starts at the centre of its own LBD region instead of being shifted down merely because neighbouring label bounds are close.
+
+v2.78
+1 Fixed automatic LBD text sizing. Instead of estimating from the whole page, the app now takes the median width of all LBD (Node) boxes on each page and uses 40% of that median for the page's LBD label height. This prevents unusually narrow or wide boxes from changing the text size within one page.
+2 Entering 0 in Label height enables the automatic mode. A positive value still forces the exact model-unit height entered by the user.
+3 Both the annotation JSON and debug recognition JSON paths now use the same per-page median box width.
+
+v2.77
+1 Fixed an LBD de-duplication collision where an identifier number such as 4 was incorrectly compared with the index of the fourth detected box. A valid full label could therefore be discarded and replaced by a positional guess.
+2 Added filtering for dense label lists at the bottom or side of a drawing. Runs of at least four closely spaced full INV...-LBD labels in the same column are now removed as interference, preventing list entries from stealing the real label inside a rack box.
+3 Verified with page 24 of the HIGHLAND PDF: all 16 boxes were named from the text layer, including the correct `INV11A102-LBD-04` and its label position. Spot checks on Steel River horizontal labels showed no regression.
+
+v2.76
+1 Improved LBD text selection when a box contains interference. Multiple candidates are ranked by full INV...-LBD name, then strict format such as 1.1.C.1, then standard LBD-xx; ties choose the text nearest the box centre.
+2 Added the strict dotted identifier format `number.number.letter.number`. The whole text must match, so `1.1.C.1` is recognized without treating dimensions or coordinates as IDs.
+3 Tested with four interfering texts in one LBD box; the correct full identifier is still selected.
 
 v2.75
 1 Rack rows are grouped by Tracker centre X: only boxes with the same or nearly the same X belong to one vertical row.
 2 The normal row-to-row distance is the median adjacent X-centre gap. A candidate row that splits this gap into two smaller gaps is checked against the Y centres of the rows on its left and right; it is removed only when Y matching reaches 80%.
 3 Verified with a four-box false column (removed), normal columns (kept), a sparse Y-independent column (kept), and whole-page X translation (unchanged result).
+
+v2.60
+1 Fixed the long unresponsive final stage after STR drawing. Final LYNX label placement now checks only nearby STR text instead of recalculating collisions against every STR item in the whole model.
+2 Added live scan and row-by-row placement progress for the final stage, so the UI no longer remains at "Drawing STR 100 / 121".
+3 If final label placement fails, the error is reported and the completion marker is still written instead of leaving the run permanently blocked.
 
 v2.74
 1 Rack rows now use Tracker centre-Y clustering with a tolerance of 2x box width, avoiding false rows caused by height variation.

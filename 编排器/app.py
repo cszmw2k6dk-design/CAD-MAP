@@ -59,7 +59,7 @@ except Exception:                    # 模块缺失时不阻塞主程序
     _lr_parse_split = _lr_split_rows = _lr_expand_racks = None
 
 APP_TITLE = "Voltage-CAD MAP"
-APP_VERSION = "2.60"
+APP_VERSION = "2.79"
 # 这一版先不带「导出 PDF」：按钮和入口藏起来，代码保留（改成 True 就接回来）。
 FEATURE_EXPORT_PDF = False
 # 表格 OCR 暂不上线：源码保留，速度与准确率稳定后再打开并重新打包模型依赖。
@@ -76,7 +76,7 @@ FIELDS = [
     ("newName", "新文件名(可空)"), ("pageStart", "起始页"), ("pageEnd", "结束页(0=全部)"),
     ("importPages", "导入页码(0=全部)"),
     ("count", "复制数量(0=按识别)"),
-    ("textHeight", "标签高度(模型单位, 0=自动)"), ("labelBgColor", "标签背景色"),
+    ("textHeight", "标签高度(模型单位, 0=按本页LBD宽中位数)"), ("labelBgColor", "标签背景色"),
     ("labelTextColor", "LBD 标签字色"),
     ("labelBgGap", "背景遮挡间隙(倍)"),
     ("rackPrefix", "支架命名前缀"),
@@ -105,7 +105,7 @@ DEFAULTS = {
     "pageStart": "1", "pageEnd": "0", "templateLayout": "", "count": "0", "filter": "pdf",
     "margin": "5",
     "regionInset": "90",
-    "textHeight": "0.25", "labelBgColor": "1", "labelTextColor": "7", "labelBgGap": "1.0",
+    "textHeight": "0", "labelBgColor": "1", "labelTextColor": "7", "labelBgGap": "1.0",
     "rackPrefix": "STR",
     "strHeight": "1.4",           # STR 号字高 = typical 条带宽(支架框短边)的倍数
     "strOrder": "2",
@@ -260,7 +260,8 @@ TEXT_EN = {
     "视口边距(mm)": "Viewport margin (mm)",
     "区域对准留白(%)": "Region fit inset (%)",
     # ---- LBD 标签页 ----
-    "标签高度(模型单位, 0=自动)": "Label height (0 = auto)",
+    "标签高度(模型单位, 0=按本页LBD宽中位数)":
+        "Label height (0 = median LBD width on this page)",
     "标签背景色": "Label background colour",
     "LBD 标签字色": "LBD label text colour",
     "背景遮挡间隙(倍)": "Background mask gap (x)",
@@ -547,7 +548,7 @@ SECTIONS = [
              ("margin", "视口边距(mm)"),
              ("regionInset", "区域对准留白(%)")]),
     # LBD标签：只管 LBD 标签自己长什么样（字高/底色/字色/遮挡间隙）
-    ("LBD标签", [("textHeight", "标签高度(模型单位, 0=自动)"),
+    ("LBD标签", [("textHeight", "标签高度(模型单位, 0=按本页LBD宽中位数)"),
                ("labelBgColor", "标签背景色"),
                ("labelTextColor", "LBD 标签字色"),
                ("labelBgGap", "背景遮挡间隙(倍)")]),
@@ -829,7 +830,24 @@ def json_to_extract(json_path, out_path, prefix="STR"):
     page = int(m.group(1)) if m else 1
     lines = []
     nodes = typs = 0
-    for s in d.get("shapes", []):
+    shapes = d.get("shapes", [])
+    lbd_widths = []
+    for s in shapes:
+        lab = (s.get("label") or "").strip()
+        pts = s.get("points") or []
+        if "-LBD-" not in lab.upper() or len(pts) < 2:
+            continue
+        xs = [p[0] for p in pts]
+        lbd_widths.append(max(1.0, max(xs) - min(xs)) / float(H))
+    lbd_widths.sort()
+    if not lbd_widths:
+        lbd_width_med = 0.0
+    elif len(lbd_widths) % 2:
+        lbd_width_med = lbd_widths[(len(lbd_widths) - 1) // 2]
+    else:
+        lbd_width_med = ((lbd_widths[len(lbd_widths) // 2 - 1]
+                          + lbd_widths[len(lbd_widths) // 2]) / 2.0)
+    for s in shapes:
         lab = (s.get("label") or "").strip()
         pts = s.get("points") or []
         if not lab or len(pts) < 2:
@@ -854,7 +872,9 @@ def json_to_extract(json_path, out_path, prefix="STR"):
             hgt = min(bw, bh) / float(H)
         elif "-LBD-" in up:
             ang = 0
-            hgt = max(1.0, bw) / float(H)          # LBD 标签：按 LBD 区域宽算字高
+            # 自动字高使用本页所有 LBD 框宽的同一中位数，避免个别超窄/超宽框
+            # 让同一张图的文字大小忽大忽小。
+            hgt = lbd_width_med or max(1.0, bw) / float(H)
         else:
             ang = 0
             hgt = 0.0
@@ -1519,14 +1539,19 @@ def auto_worker(cfg, ini, prog, bus):
         _vinsnip = "(setq *PdfLayout_ViewInset* %.4f)\n" % _vins
         bus.prog.emit("区域对准留白：%.1f%%（发给 CAD 的 *PdfLayout_ViewInset* = %.3f；"
                       "100%% = 铺满视口，越小图纸越小、四周留白越多）" % (_vins * 100.0, _vins))
-        # LBD 标签字高统一用「PDF 与标签」页的「标签高度」那格（默认 0.25 模型单位，可调）；
-        # 插件里按区域宽算字高的那套（*PdfLayout_LbdRegionScale*）保持关闭(0)。
+        # 「标签高度」> 0：严格使用手填模型单位字高。
+        # 「标签高度」= 0：自动取本页所有 LBD 框宽的中位数，再乘固定比例 0.30。
+        # 提取文件每个 LBD 行写的就是本页中位宽比例，LSP 再乘底图高度。
         try:
-            _thv = float(str(cfg.get("textHeight", "0.25")).strip() or 0)
+            _thv = float(str(cfg.get("textHeight", "0")).strip() or 0)
         except Exception:
-            _thv = 0.25
-        bus.prog.emit("LBD 标签字高：按「标签高度」那格（%s）"
-                      % ("自动" if _thv <= 0 else "%.3g 模型单位" % _thv))
+            _thv = 0.0
+        _lbd_region_scale = 0.30 if _thv <= 0 else 0.0
+        _lbdh_nip = "(setq *PdfLayout_LbdRegionScale* %.6g)\n" % _lbd_region_scale
+        if _thv <= 0:
+            bus.prog.emit("LBD 标签字高：自动（本页 LBD 框宽中位数 × 0.30）")
+        else:
+            bus.prog.emit("LBD 标签字高：固定 %.3g 模型单位" % _thv)
         # *PdfLayout_AiPage* = 0 → CAD 侧逐页画 STR 号（第 i 张底图配第 i 页）；
         # 以前这里传的是起始页，结果只有一页会画上支架号。
         _pg = "0"
@@ -1575,22 +1600,24 @@ def auto_worker(cfg, ini, prog, bus):
                       "(setq *PdfLayout_AiLabelColor* %s)\n"
                       % (_sbg_on, _sbg_c, _sbg_g, _rp, _scale, _auto_h, _txt_h, _stc, _ltc))
             cmd = ("(load %s)\n(load %s)\n(load %s)\n(load %s)\n"
-                   "%s"
+                   "%s%s"
                    "(setq *PdfLayout_GridAutoFile* %s)\n(setq *PdfLayout_AiPage* %s)\n"
                    "%s"
                    "(PdfLayout_AutoRun %s %s)\n(c:pdfgridai)\n"
                    "(setq *PdfLayout_LynxResult* (vl-catch-all-apply 'PdfLayout_LynxPlace nil))\n"
                    "(if (vl-catch-all-error-p *PdfLayout_LynxResult*) (PdfLayout_Prog \"LYNX_ERROR\"))\n"
                    "(PdfLayout_Prog \"RUN_DONE\")\n"
-                   % (L(lsp), L(auto), L(ai), L(lynx), _vinsnip, L(_lbdout), _pg, _strbg,
+                   % (L(lsp), L(auto), L(ai), L(lynx), _vinsnip, _lbdh_nip,
+                      L(_lbdout), _pg, _strbg,
                       L(ini), L(prog)))
         else:
-            cmd = ("(load %s)\n(load %s)\n(load %s)\n%s"
+            cmd = ("(load %s)\n(load %s)\n(load %s)\n%s%s"
                    "(PdfLayout_AutoRun %s %s)\n"
                    "(setq *PdfLayout_LynxResult* (vl-catch-all-apply 'PdfLayout_LynxPlace nil))\n"
                    "(if (vl-catch-all-error-p *PdfLayout_LynxResult*) (PdfLayout_Prog \"LYNX_ERROR\"))\n"
                    "(PdfLayout_Prog \"RUN_DONE\")\n"
-                   % (L(lsp), L(auto), L(lynx), _vinsnip, L(ini), L(prog)))
+                   % (L(lsp), L(auto), L(lynx), _vinsnip, _lbdh_nip,
+                      L(ini), L(prog)))
         bus.prog.emit("发送命令给 CAD：\n" + cmd.replace("\n", " "))
         doc.SendCommand(cmd)
         try:

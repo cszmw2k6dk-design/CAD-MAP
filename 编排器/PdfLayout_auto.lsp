@@ -612,7 +612,6 @@
               )
             )
             (setq pgIt (PdfLayout_LbdRowSort pgIt (/ (* 4.0 txtH) (if (> bh 0.0) bh 1.0))))
-            (setq curRowFy nil curLane 0 lastRight nil)
 
             (foreach it pgIt
               (if (= (car it) pgnum)
@@ -643,21 +642,11 @@
                       ;; LBD 标签只认 Excel 映射: 查不到就不画, 不用 PDF 原文兜底, 也不编造 "LBD-xx"
                       (if labels
                         (progn
-                          ;; 上下两档错行：第1个落在区域中心线上，第2个往下错一行，第3个回中心线…
+                          ;; 始终从各自 LBD 区域的几何中心起画。
+                          ;; 不再因为相邻标签估算宽度相碰就强制错到第二行：
+                          ;; 那会把本应居中的标签整体往下挪，即使实际并没有障碍。
                           (setq natW (* txtHi (+ (* 0.8 (strlen labels)) 0.2)))
-                          (setq lft (- mx (* natW 0.5)) rgt (+ mx (* natW 0.5)))
-                          (if (or (not curRowFy)
-                                  (> (abs (- fy curRowFy)) (/ (* 4.0 txtH) (if (> bh 0.0) bh 1.0))))
-                            (progn (setq curRowFy fy curLane 0 lastRight nil))
-                          )
-                          (if (and lastRight (< lft lastRight))
-                            (setq curLane (if (= curLane 1) 0 1))
-                            (setq curLane 0)
-                          )
-                          ;; 错开量：1.5 倍字高(且不小于字高+0.10) —— 下错一行后与上一个标签不再重叠
-                          (setq step (max (* txtHi 1.5) (+ txtHi 0.10)))
-                          (setq laneOff (if (= curLane 0) 0.0 step))
-                          (setq ptIns (list mx (- my laneOff) 0.0))
+                          (setq ptIns (list mx my 0.0))
                           (setq ptUse (if (and (= labelWhere "L") vp) (PdfLayout_ModelToPaper vp ptIns) ptIns))
                           (setq mObj (vl-catch-all-apply
                                 'vla-AddMText
@@ -690,9 +679,8 @@
                                                 (+ (cadr pmin) (* (nth 3 _rng) bh))
                                                 (+ (cadr pmin) (* (nth 4 _rng) bh))))))
                               )
-                              (setq nDone (1+ nDone))
-                              (setq nPgDone (1+ nPgDone))
-                               (setq lastRight rgt)
+                                (setq nDone (1+ nDone))
+                                (setq nPgDone (1+ nPgDone))
                             )
                           )
                         )

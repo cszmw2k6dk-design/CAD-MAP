@@ -362,6 +362,9 @@ class PdfText:
 
 
 LBD_NUM_RE = re.compile(r"LBD\s*[_\-–—]?\s*0*(\d+)", re.I)
+# 严格裸编号：1.1.C.1 / 2.10.A.15。必须整条匹配，避免把尺寸/坐标当编号。
+DOTTED_LBD_RE = re.compile(
+    r"^(\d+(?:\.\d+)+\.[A-Z])\.(\d{1,4})$", re.I)
 # 有些图里框内只印一个裸编号（"07" / "#7"），文字层里并没有 "LBD" 三个字母。
 # 只认"整条就是数字"的，别把 3.5、1:100 这种尺寸/比例当编号。
 
@@ -382,7 +385,10 @@ def _clean_key(s):
 
 def _lbd_num_in(text):
     m = LBD_NUM_RE.search(str(text or ""))
-    return int(m.group(1)) if m else None
+    if m:
+        return int(m.group(1))
+    m = DOTTED_LBD_RE.match(str(text or "").strip())
+    return int(m.group(2)) if m else None
 
 
 def _clean_lbd_label(txt):
@@ -421,6 +427,8 @@ def ocr_text_to_name(txt):
         # 名字用原文（保留 1.01.1.C.5 这种整段），只砍掉尾巴上的 "(2)" 之类注解
         return (re.split(r"[()\[\]{}]", t)[0].strip().replace(" ", "").upper()
                 .rstrip(".,;:"), "ok")
+    if DOTTED_LBD_RE.match(t):
+        return t, "check"
     if LBDISH_RE.search(up):
         return t, "check"
     return "", "noise"
@@ -664,8 +672,8 @@ def _rows_of(items, tol):
 def _page_candidates(text_items, sheet, num_set, width, height):
     """这一页可用的编号文字 -> (强候选, 裸数字候选, 分表名对不上的条数)。
 
-    强候选：文字里有 LBD+数字（如 INV31B102_LBD_07），且号码在本分表号码表里，
-            再把"图例/引线名单"（同列密排）滤掉。
+    强候选：文字里有 LBD+数字（如 INV31B102_LBD_07），且号码在本分表号码表里；
+            短号和完整编号都会把"图例/引线名单"（同列密排）滤掉。
     裸数字候选：整条文字就是个号（"07"），有些图框里只印这个，没有 "LBD" 字样 —
             这条通道以前没有，所以"每个框里都有号、有的却取不到"。
     """
@@ -692,6 +700,10 @@ def _page_candidates(text_items, sheet, num_set, width, height):
             m = BARE_NUM_RE.match(it[0].strip())
             if m:
                 bare.append((px, py, int(m.group(1)), it[0]))
+    # 完整编号也可能在图纸底部排成一列密集清单。它们不能像单个区号那样直接
+    # 相信，否则同一框里同时出现真编号和清单时会被清单抢号。
+    full = _drop_dense_label_columns(full, width, height)
+    bare = _drop_dense_label_columns(bare, width, height)
     return full + _drop_legend(raw, height), bare, wrong
 
 
@@ -739,6 +751,42 @@ def _drop_legend(cands, page_h):
         if n < 3:
             out.append((px, py, num, txt))
     return out
+
+
+def _drop_dense_label_columns(cands, page_w, page_h):
+    """滤掉同一列连续密排的编号清单，保留图纸各支架内的单独编号。
+
+    HIGHLAND 的图纸底部会列出一整列 INV...-LBD-01～08，而其中几行又恰好落在
+    中间那个较高的 Node 框里。只按“文字是否在框内”会给真编号找一个错误邻居。
+    这里按 X 聚成列，再按 Y 找连续且间距很小的文字段；一列至少 4 条才视为清单。
+    正常支架编号即使同列，也会随上、下排支架隔开很远，不会被清掉。
+    """
+    if len(cands) < 4:
+        return list(cands)
+    gx = max(4.0, float(page_w) * 0.004)
+    gy = max(8.0, float(page_h) * 0.02)
+    by_x = sorted(cands, key=lambda t: (t[0], t[1]))
+    columns = []
+    for cand in by_x:
+        # 固定用列首的 X 做锚点，不能拿“上一条”链式比较和放大容差：
+        # 那样会把一整排横向相邻的编号串成假的竖列，把正常支架编号误删。
+        if not columns or abs(cand[0] - columns[-1][0][0]) > gx:
+            columns.append([cand])
+        else:
+            columns[-1].append(cand)
+    drop = set()
+    for col in columns:
+        col = sorted(col, key=lambda t: t[1])
+        run = []
+        for cand in col:
+            if run and cand[1] - run[-1][1] > gy:
+                if len(run) >= 4:
+                    drop.update(id(t) for t in run)
+                run = []
+            run.append(cand)
+        if len(run) >= 4:
+            drop.update(id(t) for t in run)
+    return [c for c in cands if id(c) not in drop]
 
 
 def check_rows(shapes, text_items, sheet, num_set, width, height):
@@ -930,6 +978,21 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
     got = {}
     left_c = []
     pos_of = {}                       # 框下标 -> 那条编号文字的中心（页面像素）
+
+    def _text_priority(txt):
+        if _full_lbd_name(txt):
+            return 0                  # 完整 INV...-LBD-...
+        if DOTTED_LBD_RE.match(str(txt or "").strip()):
+            return 1                  # 严格 1.1.C.1
+        if _lbd_num_in(txt) is not None:
+            return 2                  # 标准 LBD-xx
+        return 3
+
+    def _inside_score(b, px, py, txt):
+        cx, cy = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
+        return (_text_priority(txt),
+                ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5)
+
     for px, py, num, _txt in cands:
         inside = None
         for i, s in todo:
@@ -941,28 +1004,33 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
             left_c.append((px, py, num, _txt))   # 文字带上，别丢
             continue
         old = got.get(inside)
-        if old is None or 0.0 < old[0]:
-            got[inside] = (0.0, num, _txt)
+        sc = _inside_score(s["bbox"], px, py, _txt)
+        if old is None or sc < old[0]:
+            got[inside] = (sc, num, _txt)
             pos_of[inside] = (px, py)
     for px, py, num, _ltxt in left_c:
-        best, bd = None, None
+        best, best_score = None, None
         for i, s in todo:
             if i in got:                 # 已经有字了，别再抢
                 continue
             d = _box_dist(s["bbox"], px, py)
-            if bd is None or d < bd:
-                best, bd = i, d
-        if best is None or bd is None or bd > tol:
+            sc = (_text_priority(_ltxt), d)
+            if best_score is None or sc < best_score:
+                best, best_score = i, sc
+        if best is None or best_score is None or best_score[1] > tol:
             continue
         # 这里原来用的是外层循环残留的 txt（早就不在作用域了）——一走到这条路就崩
-        got[best] = (bd, num, _ltxt)
+        got[best] = (best_score, num, _ltxt)
         pos_of[best] = (px, py)
 
     # 3) 抢号：同一个号只留最近的那个框
     keep, keep_lab, full_name = {}, {}, {}
+    kept_numbers = set()
     for i, (d, num, txt) in sorted(got.items(), key=lambda kv: kv[1][0]):
-        if num in keep:
+        # keep 的 key 是框下标，不能拿 num in keep 判重：编号 4 会误撞下标 4。
+        if num in kept_numbers:
             continue
+        kept_numbers.add(num)
         keep[i] = num
         keep_lab[i] = _clean_lbd_label(txt)
         nm = _full_lbd_name(txt)          # 整段编号（INV01A01-LBD-01）就原样用
