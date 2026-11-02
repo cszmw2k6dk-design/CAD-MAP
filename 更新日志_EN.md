@@ -1,3 +1,7 @@
+v2.62
+1 This is the update-migration bridge release. After installing it, updates use the public CAD-MAP-releases repository and its public update manifest instead of the old repository's GitHub API.
+2 Includes all v2.61 recognition, label-height, geometric-centre and CAD execution fixes.
+
 v2.61
 1 Automatic LBD text height now uses 30% of the median LBD box width on each page instead of producing oversized text.
 2 LBD labels return to the geometric centre of their regions; the forced two-lane vertical stagger was removed.
