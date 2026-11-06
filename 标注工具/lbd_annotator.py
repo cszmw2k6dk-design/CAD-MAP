@@ -627,12 +627,19 @@ def xlsx_lbd_rows(path, sheet_name):
 
 # ------------------------------------------------------- 框内取标签 / 编号
 LBD_NUM_RE = re.compile(r"LBD\s*[_\-–—]?\s*0*(\d+)", re.I)
+# Complete equipment identifiers such as INV-1201-CBX-01.
+CBX_LABEL_RE = re.compile(
+    r"^INV\s*[-_ ]?\s*\d+(?:\s*[-_ ]?[A-Z]\s*\d+)?\s*[-_ ]+\s*CBX"
+    r"\s*[-_ ]*\s*0*(\d{1,4})(?:[._-][A-Za-z0-9]+)*$",
+    re.I)
 # 有些图里框内只印一个裸编号（"07" / "#7"），文字层里并没有 "LBD" 三个字母。
 # 只认"整条就是数字"的，别把 3.5、1:100 这种尺寸/比例当编号。
 BARE_NUM_RE = re.compile(r"^#?\s*0*(\d{1,3})\.?$")
 # 兜底：框里任何文字里的第一个数字（"1.C.1"、"LBD-07"、"07" 都行）
 ANY_NUM_RE = re.compile(r"(\d{1,3})")
-INV_RE = re.compile(r"INV\s*0*(\d+)\s*([A-Za-z])\s*0*(\d+)", re.I)
+INV_RE = re.compile(
+    r"INV\s*[-_ ]?\s*0*(\d+)(?:\s*[-_ ]?([A-Za-z])\s*0*(\d+))?",
+    re.I)
 SHEET_CLEAN_RE = re.compile(r"[^0-9A-Za-z.]")
 
 
@@ -641,8 +648,19 @@ def _clean_key(s):
 
 
 def _lbd_num_in(text):
-    m = LBD_NUM_RE.search(str(text or ""))
+    t = str(text or "").strip()
+    m = LBD_NUM_RE.search(t)
+    if m:
+        return int(m.group(1))
+    m = CBX_LABEL_RE.match(t)
     return int(m.group(1)) if m else None
+
+
+def _full_cbx_name(text):
+    t = str(text or "").strip()
+    if not CBX_LABEL_RE.match(t):
+        return None
+    return re.sub(r"\s+", "", t).upper().rstrip(".,;:")
 
 
 def _inv_in(text):
@@ -650,7 +668,10 @@ def _inv_in(text):
     m = INV_RE.search(str(text or ""))
     if not m:
         return None
-    return ("INV%s%s%s" % (m.group(1), m.group(2).upper(), m.group(3))).upper()
+    out = "INV%s" % m.group(1)
+    if m.group(2) and m.group(3):
+        out += "%s%s" % (m.group(2).upper(), m.group(3))
+    return out.upper()
 
 
 def norm_sheet(s):
@@ -953,6 +974,7 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
     #      结果本该拿到它的框就空了 —— 表现就是"4 个框只读到 2 个"。）
     got = {}
     left_c = []
+    full_names = {}
     for px, py, num, _txt in cands:
         inside = None
         for i, s in todo:
@@ -961,12 +983,15 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
                 inside = i
                 break
         if inside is None:
-            left_c.append((px, py, num))
+            left_c.append((px, py, num, _txt))
             continue
         old = got.get(inside)
         if old is None or 0.0 < old[0]:
             got[inside] = (0.0, num)
-    for px, py, num in left_c:
+            cbx_name = _full_cbx_name(_txt)
+            if cbx_name:
+                full_names[inside] = cbx_name
+    for px, py, num, txt in left_c:
         best, bd = None, None
         for i, s in todo:
             if i in got:                 # 已经有字了，别再抢
@@ -977,6 +1002,9 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
         if best is None or bd is None or bd > tol:
             continue
         got[best] = (bd, num)
+        cbx_name = _full_cbx_name(txt)
+        if cbx_name:
+            full_names[best] = cbx_name
 
     # 3) 抢号：同一个号只留最近的那个框
     keep = {}
@@ -984,11 +1012,14 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
         if num in keep:
             continue
         keep[i] = num
+    full_names = {i: name for i, name in full_names.items() if i in keep}
 
     used = set(keep.values())
     for i, s in todo:
         if i in keep:
-            s["name"] = "%s-LBD-%02d" % (sheet, keep[i]) if sheet else "LBD-%02d" % keep[i]
+            s["name"] = (full_names.get(i)
+                         or ("%s-LBD-%02d" % (sheet, keep[i])
+                             if sheet else "LBD-%02d" % keep[i]))
             s["_auto"] = False
             stat["filled"] += 1
 

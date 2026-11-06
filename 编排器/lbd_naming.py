@@ -362,6 +362,13 @@ class PdfText:
 
 
 LBD_NUM_RE = re.compile(r"LBD\s*[_\-–—]?\s*0*(\d+)", re.I)
+# Some drawing sets use INV-<sheet>-CBX-<number> as the complete label name
+# instead of an LBD marker. Keep this strict and whole-line so CBX route notes
+# are not mistaken for equipment names.
+CBX_LABEL_RE = re.compile(
+    r"^INV\s*[-_ ]?\s*\d+(?:\s*[-_ ]?[A-Z]\s*\d+)?\s*[-_ ]+\s*CBX"
+    r"\s*[-_ ]*\s*0*(\d{1,4})(?:[._-][A-Za-z0-9]+)*$",
+    re.I)
 # 严格裸编号：1.1.C.1 / 2.10.A.15。必须整条匹配，避免把尺寸/坐标当编号。
 DOTTED_LBD_RE = re.compile(
     r"^(\d+(?:\.\d+)+\.[A-Z])\.(\d{1,4})$", re.I)
@@ -387,7 +394,11 @@ def _lbd_num_in(text):
     m = LBD_NUM_RE.search(str(text or ""))
     if m:
         return int(m.group(1))
-    m = DOTTED_LBD_RE.match(str(text or "").strip())
+    t = str(text or "").strip()
+    m = CBX_LABEL_RE.match(t)
+    if m:
+        return int(m.group(1))
+    m = DOTTED_LBD_RE.match(t)
     return int(m.group(2)) if m else None
 
 
@@ -423,6 +434,8 @@ def ocr_text_to_name(txt):
     if not t:
         return "", "miss"
     up = t.upper().replace(" ", "")
+    if CBX_LABEL_RE.match(t):
+        return (re.sub(r"\s+", "", t).upper().rstrip(".,;:"), "ok")
     if LBD_LABEL_RE.search(up):
         # 名字用原文（保留 1.01.1.C.5 这种整段），只砍掉尾巴上的 "(2)" 之类注解
         return (re.split(r"[()\[\]{}]", t)[0].strip().replace(" ", "").upper()
@@ -1238,4 +1251,7 @@ LBD_LABEL_RE = re.compile(
 # 注意不能写成"只要出现 LBD 就算" —— 图纸上到处都是 "LBD CLUSTER, TYP." 这种旁注。
 
 
-LBDISH_RE = re.compile(r"LBD\s*[-_.#]?\s*\d|INV\s*\d+\s*[A-Z]\s*\d+", re.I)
+LBDISH_RE = re.compile(
+    r"LBD\s*[-_.#]?\s*\d|INV\s*[-_ ]?\s*\d+\s*[-_ ]?CBX\s*[-_ ]*\d"
+    r"|INV\s*\d+\s*[A-Z]\s*\d+",
+    re.I)

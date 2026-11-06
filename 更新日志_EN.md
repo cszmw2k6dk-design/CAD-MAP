@@ -1,3 +1,7 @@
+v2.63
+1 Added support for complete CBX equipment identifiers such as `INV-1201-CBX-01`. The original format is preserved, and the text no longer needs to be centred in the LBD box; being inside the box or within the distance tolerance is sufficient.
+2 Synchronized CBX naming support between recognition and the annotation tool's fill-from-text function.
+
 v2.62
 1 This is the update-migration bridge release. After installing it, updates use the public CAD-MAP-releases repository and its public update manifest instead of the old repository's GitHub API.
 2 Includes all v2.61 recognition, label-height, geometric-centre and CAD execution fixes.

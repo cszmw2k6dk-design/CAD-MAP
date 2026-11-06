@@ -420,9 +420,17 @@ def credential_token():
     if not g:
         return ""
     try:
+        remote = subprocess.run(
+            [g, "config", "--get", "remote.origin.url"],
+            cwd=ROOT, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            env=git_env(g), timeout=30)
+        remote_url = (remote.stdout or "").strip() or "https://github.com/"
+        if remote_url.startswith("git@github.com:"):
+            remote_url = "https://github.com/" + remote_url.split(":", 1)[1]
         r = subprocess.run(
             [g, "credential", "fill"],
-            input="protocol=https\nhost=github.com\n\n",
+            input="url=%s\n\n" % remote_url,
             cwd=ROOT, capture_output=True, text=True,
             encoding="utf-8", errors="replace",
             env=git_env(g), timeout=60)

@@ -64,6 +64,7 @@
 /标注工具/render_cache/
 /标注工具/dist/
 /标注工具/build_exe/
+/标注工具/models/
 /标注工具/annotator_settings.json
 /标注工具/smoke_*.json
 /标注工具/*_annotated.json
